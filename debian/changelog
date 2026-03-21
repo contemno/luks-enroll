@@ -1,0 +1,8 @@
+luks-enroll (0.0.1-1) unstable; urgency=medium
+
+  * Initial release.
+  * GTK4/libadwaita wizard for LUKS FIDO2, TPM2, and recovery key enrollment.
+  * PIN support for both FIDO2 and TPM2 enrollment.
+  * Automatic password keyslot removal after enrollment.
+
+ -- Joshua <joshua@localhost>  Tue, 17 Mar 2026 04:30:00 +0000

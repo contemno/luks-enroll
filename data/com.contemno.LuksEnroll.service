@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=com.contemno.LuksEnroll
+Exec=/usr/sbin/luks-enroll-service
+User=root
+SystemdService=com.contemno.LuksEnroll.service

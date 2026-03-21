@@ -1,0 +1,17 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	@true
+
+override_dh_auto_install:
+	install -Dm755 src/luks-enroll-service.py $(CURDIR)/debian/luks-enroll/usr/sbin/luks-enroll-service
+	install -Dm755 src/luks-enroll.py $(CURDIR)/debian/luks-enroll/usr/bin/luks-enroll
+	install -Dm644 data/com.contemno.luks_enroll.conf $(CURDIR)/debian/luks-enroll/usr/share/dbus-1/system.d/com.contemno.luks_enroll.conf
+	install -Dm644 data/com.contemno.LuksEnroll.service $(CURDIR)/debian/luks-enroll/usr/share/dbus-1/system-services/com.contemno.LuksEnroll.service
+	install -Dm644 data/luks-enroll-firstlogin.desktop $(CURDIR)/debian/luks-enroll/etc/xdg/autostart/luks-enroll-firstlogin.desktop
+	install -Dm644 data/luks-enroll.desktop $(CURDIR)/debian/luks-enroll/usr/share/applications/luks-enroll.desktop
+	install -Dm644 data/com.contemno.luks-enroll.policy $(CURDIR)/debian/luks-enroll/usr/share/polkit-1/actions/com.contemno.luks-enroll.policy
+	install -Dm644 data/com.contemno.LuksEnroll.systemd.service $(CURDIR)/debian/luks-enroll/lib/systemd/system/com.contemno.LuksEnroll.service

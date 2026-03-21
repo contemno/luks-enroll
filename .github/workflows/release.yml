@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Ruff check
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -v
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    container:
+      image: ubuntu:noble
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git dpkg-dev debhelper devscripts \
+            python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
+            libcryptsetup12 systemd
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          # v1.2.3 -> 1.2.3-1 (prod)
+          # v1.2.3-dev.1 -> 1.2.3~dev1-1 (dev, sorts lower in dpkg)
+          if echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            DEB_VERSION="${TAG}-1"
+            PRERELEASE="false"
+          else
+            # Convert v1.2.3-dev.1 -> 1.2.3~dev1
+            DEB_VERSION="$(echo "$TAG" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-(.+)\.([0-9]+)/\1~\2\3/')-1"
+            PRERELEASE="true"
+          fi
+          echo "deb_version=${DEB_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${DEB_VERSION} (prerelease=${PRERELEASE})"
+
+      - name: Stamp debian/changelog with tag version
+        run: |
+          DEBFULLNAME="GitHub Actions" \
+          DEBEMAIL="actions@github.com" \
+          dch --newversion "${{ steps.version.outputs.deb_version }}" \
+              --distribution stable \
+              "Release ${GITHUB_REF#refs/tags/}"
+
+      - name: Build package
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp ../*.deb ../*.buildinfo ../*.changes artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: luks-enroll-noble
+          path: artifacts/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.deb
+          generate_release_notes: true
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}

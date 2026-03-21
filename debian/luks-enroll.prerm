@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+
+# Kill any running service instance so a stale process doesn't linger
+# after uninstall or before an upgrade replaces the binary.
+pkill -f /usr/sbin/luks-enroll-service 2>/dev/null || true
+
+#DEBHELPER#

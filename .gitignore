@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Debian build artifacts
+debian/luks-enroll/
+debian/debhelper-build-stamp
+debian/luks-enroll.substvars
+debian/luks-enroll.*.debhelper
+debian/files
+debian/.debhelper/
+
+# Built packages
+*.deb
+*.buildinfo
+*.changes
+
+# Session Logs
+SESSION_LOG*.md

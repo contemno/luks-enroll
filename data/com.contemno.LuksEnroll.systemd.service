@@ -1,0 +1,30 @@
+[Unit]
+Description=LUKS Enrollment Service
+
+[Service]
+Type=dbus
+BusName=com.contemno.LuksEnroll
+ExecStart=/usr/sbin/luks-enroll-service
+User=root
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER
+DeviceAllow=block-* rw
+DeviceAllow=char-hidraw rw
+DeviceAllow=/dev/tpmrm0 rw
+ReadWritePaths=/etc/luks-enroll.conf
