@@ -11,13 +11,11 @@ import ast
 import base64
 import configparser
 import importlib
-import json
 import os
 import re
 import struct
 import sys
 import tempfile
-import textwrap
 import unittest
 from unittest import mock
 from xml.etree import ElementTree
@@ -26,6 +24,7 @@ from xml.etree import ElementTree
 # ---------------------------------------------------------------------------
 # Import helpers — mock heavy system deps so modules can be imported
 # ---------------------------------------------------------------------------
+
 
 def _import_service():
     """Import luks-enroll-service.py as a module, mocking native libs."""
@@ -36,11 +35,14 @@ def _import_service():
     )
     fake_gi = mock.MagicMock()
     mod = importlib.util.module_from_spec(spec)
-    with mock.patch.dict(sys.modules, {
-        "gi": fake_gi,
-        "gi.repository": fake_gi.repository,
-        mod_name: mod,
-    }):
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "gi": fake_gi,
+            "gi.repository": fake_gi.repository,
+            mod_name: mod,
+        },
+    ):
         spec.loader.exec_module(mod)
     return mod
 
@@ -55,11 +57,14 @@ def _import_gui():
     fake_gi = mock.MagicMock()
     mod = importlib.util.module_from_spec(spec)
     # Register the module before exec so dataclass can resolve __module__
-    with mock.patch.dict(sys.modules, {
-        "gi": fake_gi,
-        "gi.repository": fake_gi.repository,
-        mod_name: mod,
-    }):
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "gi": fake_gi,
+            "gi.repository": fake_gi.repository,
+            mod_name: mod,
+        },
+    ):
         spec.loader.exec_module(mod)
     return mod
 
@@ -73,11 +78,14 @@ gui = _import_gui()
 # Syntax checks
 # ===========================================================================
 
+
 class TestSyntax(unittest.TestCase):
     """Verify both files parse without syntax errors."""
 
     def test_service_syntax(self):
-        path = os.path.join(os.path.dirname(__file__), "..", "src", "luks-enroll-service.py")
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "src", "luks-enroll-service.py"
+        )
         with open(path) as f:
             ast.parse(f.read(), filename=path)
 
@@ -91,6 +99,7 @@ class TestSyntax(unittest.TestCase):
 # D-Bus interface invariants
 # ===========================================================================
 
+
 class TestDBusInvariant(unittest.TestCase):
     """D-Bus introspection XML <-> _handle_* methods must match 1:1."""
 
@@ -103,17 +112,15 @@ class TestDBusInvariant(unittest.TestCase):
         self.handler_methods = set()
         for name in dir(svc.LuksEnrollService):
             if name.startswith("_handle_"):
-                self.handler_methods.add(name[len("_handle_"):])
+                self.handler_methods.add(name[len("_handle_") :])
 
     def test_every_xml_method_has_handler(self):
         missing = self.xml_methods - self.handler_methods
-        self.assertEqual(missing, set(),
-                         f"XML methods without handlers: {missing}")
+        self.assertEqual(missing, set(), f"XML methods without handlers: {missing}")
 
     def test_every_handler_has_xml_method(self):
         extra = self.handler_methods - self.xml_methods
-        self.assertEqual(extra, set(),
-                         f"Handlers without XML methods: {extra}")
+        self.assertEqual(extra, set(), f"Handlers without XML methods: {extra}")
 
     def test_xml_parses_cleanly(self):
         """The introspection XML must be valid XML."""
@@ -130,24 +137,24 @@ class TestProxyServiceConsistency(unittest.TestCase):
         for method in root.iter("method"):
             xml_methods.add(method.attrib["name"])
 
-        # Parse the GUI source to find all .call_sync("MethodName" and .call("MethodName"
-        gui_path = os.path.join(os.path.dirname(__file__), "..", "src", "luks-enroll.py")
+        # Parse GUI source: .call_sync("MethodName" and .call("MethodName"
+        gui_path = os.path.join(
+            os.path.dirname(__file__), "..", "src", "luks-enroll.py"
+        )
         with open(gui_path) as f:
             source = f.read()
 
         # Find all D-Bus method name strings used in proxy calls
-        called_methods = set(re.findall(
-            r'\.(?:call_sync|call)\(\s*"(\w+)"', source
-        ))
+        called_methods = set(re.findall(r'\.(?:call_sync|call)\(\s*"(\w+)"', source))
 
         missing = called_methods - xml_methods
-        self.assertEqual(missing, set(),
-                         f"Proxy calls methods not in XML: {missing}")
+        self.assertEqual(missing, set(), f"Proxy calls methods not in XML: {missing}")
 
 
 # ===========================================================================
 # Recovery key generation
 # ===========================================================================
+
 
 class TestRecoveryKey(unittest.TestCase):
     """Test modhex recovery key generation."""
@@ -180,8 +187,8 @@ class TestRecoveryKey(unittest.TestCase):
 # _format_size helper
 # ===========================================================================
 
-class TestFormatSize(unittest.TestCase):
 
+class TestFormatSize(unittest.TestCase):
     def test_bytes(self):
         self.assertEqual(svc._format_size(500), "500 B")
 
@@ -205,8 +212,8 @@ class TestFormatSize(unittest.TestCase):
 # _get_parent_device helper
 # ===========================================================================
 
-class TestGetParentDevice(unittest.TestCase):
 
+class TestGetParentDevice(unittest.TestCase):
     def test_sd_partition(self):
         self.assertEqual(svc._get_parent_device("/dev/sdb1"), "sdb")
 
@@ -227,8 +234,8 @@ class TestGetParentDevice(unittest.TestCase):
 # TPM2 PCR selection building
 # ===========================================================================
 
-class TestTpm2PcrSelection(unittest.TestCase):
 
+class TestTpm2PcrSelection(unittest.TestCase):
     def test_single_pcr_7(self):
         result = svc._tpm2_build_pcr_selection("7")
         # count=1 (u32 BE), hash=SHA256=0x000B (u16 BE), sizeofSelect=3 (u8), pcrSelect
@@ -256,8 +263,8 @@ class TestTpm2PcrSelection(unittest.TestCase):
 # TPM2 structure building helpers
 # ===========================================================================
 
-class TestTpm2Structures(unittest.TestCase):
 
+class TestTpm2Structures(unittest.TestCase):
     def test_ecc_srk_template_is_tpm2b_public(self):
         template = svc._tpm2_build_ecc_srk_template()
         # First 2 bytes are uint16 size (big-endian) of the public area
@@ -356,7 +363,6 @@ SAMPLE_LUKS_JSON = {
 
 
 class TestListLuksKeyslots(unittest.TestCase):
-
     @mock.patch.object(svc, "_get_luks_json", return_value=SAMPLE_LUKS_JSON)
     def test_returns_all_slots(self, _mock):
         result = svc.list_luks_keyslots("/dev/fake")
@@ -369,7 +375,6 @@ class TestListLuksKeyslots(unittest.TestCase):
 
 
 class TestFindTokensByType(unittest.TestCase):
-
     @mock.patch.object(svc, "_get_luks_json", return_value=SAMPLE_LUKS_JSON)
     def test_find_tpm2_tokens(self, _mock):
         result = svc.find_tokens_by_type("/dev/fake", "systemd-tpm2")
@@ -398,17 +403,20 @@ class TestFindTokensByType(unittest.TestCase):
 
 
 class TestFindPasswordKeyslots(unittest.TestCase):
-
     @mock.patch.object(svc, "_get_luks_json", return_value=SAMPLE_LUKS_JSON)
     def test_finds_unmanaged_slots(self, _mock):
         """Slot 0 is not referenced by any token, so it's a password slot."""
         result = svc.find_password_keyslots("/dev/fake")
         self.assertEqual(result, [0])
 
-    @mock.patch.object(svc, "_get_luks_json", return_value={
-        "keyslots": {"0": {"type": "luks2"}, "1": {"type": "luks2"}},
-        "tokens": {},
-    })
+    @mock.patch.object(
+        svc,
+        "_get_luks_json",
+        return_value={
+            "keyslots": {"0": {"type": "luks2"}, "1": {"type": "luks2"}},
+            "tokens": {},
+        },
+    )
     def test_all_slots_are_password_when_no_tokens(self, _mock):
         result = svc.find_password_keyslots("/dev/fake")
         self.assertEqual(result, [0, 1])
@@ -420,7 +428,6 @@ class TestFindPasswordKeyslots(unittest.TestCase):
 
 
 class TestFindTokenForKeyslot(unittest.TestCase):
-
     @mock.patch.object(svc, "_get_luks_json", return_value=SAMPLE_LUKS_JSON)
     def test_finds_token_for_managed_slot(self, _mock):
         self.assertEqual(svc._find_token_for_keyslot("/dev/fake", 1), 0)
@@ -439,21 +446,22 @@ class TestFindTokenForKeyslot(unittest.TestCase):
 # Settings load/save
 # ===========================================================================
 
-class TestSettings(unittest.TestCase):
 
+class TestSettings(unittest.TestCase):
     def test_load_missing_file(self):
         with mock.patch.object(svc, "SETTINGS_FILE", "/nonexistent/path.conf"):
             result = svc._load_setting("some_key")
             self.assertEqual(result, "")
 
     def test_save_and_load_roundtrip(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf",
-                                          delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
             tmppath = f.name
 
         try:
-            with mock.patch.object(svc, "SETTINGS_FILE", tmppath), \
-                 mock.patch.object(svc, "SETTINGS_ALLOWED_KEYS", {"test_key"}):
+            with (
+                mock.patch.object(svc, "SETTINGS_FILE", tmppath),
+                mock.patch.object(svc, "SETTINGS_ALLOWED_KEYS", {"test_key"}),
+            ):
                 self.assertTrue(svc._save_setting("test_key", "test_value"))
                 result = svc._load_setting("test_key")
                 self.assertEqual(result, "test_value")
@@ -461,13 +469,14 @@ class TestSettings(unittest.TestCase):
             os.unlink(tmppath)
 
     def test_save_creates_section(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf",
-                                          delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as f:
             tmppath = f.name
 
         try:
-            with mock.patch.object(svc, "SETTINGS_FILE", tmppath), \
-                 mock.patch.object(svc, "SETTINGS_ALLOWED_KEYS", {"mykey"}):
+            with (
+                mock.patch.object(svc, "SETTINGS_FILE", tmppath),
+                mock.patch.object(svc, "SETTINGS_ALLOWED_KEYS", {"mykey"}),
+            ):
                 svc._save_setting("mykey", "myval")
                 cp = configparser.ConfigParser()
                 cp.read(tmppath)
@@ -487,8 +496,8 @@ class TestSettings(unittest.TestCase):
 # detect_luks_devices (mocked filesystem)
 # ===========================================================================
 
-class TestDetectLuksDevices(unittest.TestCase):
 
+class TestDetectLuksDevices(unittest.TestCase):
     @mock.patch.object(svc, "_blkid_find_luks_devices", return_value=[])
     @mock.patch("builtins.open", side_effect=FileNotFoundError)
     def test_no_crypttab_no_blkid(self, _open, _blkid):
@@ -513,8 +522,9 @@ class TestDetectLuksDevices(unittest.TestCase):
         # Should have the UUID-resolved device + blkid device (deduped)
         self.assertIn("/dev/disk/by-uuid/abc-123", result)
 
-    @mock.patch.object(svc, "_blkid_find_luks_devices",
-                       return_value=["/dev/sda3", "/dev/sda3"])
+    @mock.patch.object(
+        svc, "_blkid_find_luks_devices", return_value=["/dev/sda3", "/dev/sda3"]
+    )
     @mock.patch("builtins.open", side_effect=FileNotFoundError)
     @mock.patch("os.path.realpath", side_effect=lambda x: x)
     def test_deduplication(self, _real, _open, _blkid):
@@ -526,8 +536,8 @@ class TestDetectLuksDevices(unittest.TestCase):
 # GUI-side hardware detection helpers
 # ===========================================================================
 
-class TestDetectFido2Devices(unittest.TestCase):
 
+class TestDetectFido2Devices(unittest.TestCase):
     def _make_uevent(self, hid_name, hid_phys="usb-0000:00:14.0-1/input0"):
         return f"HID_NAME={hid_name}\nHID_PHYS={hid_phys}\n"
 
@@ -555,7 +565,6 @@ class TestDetectFido2Devices(unittest.TestCase):
 
 
 class TestDetectTpm2Device(unittest.TestCase):
-
     @mock.patch("os.path.isdir", return_value=False)
     def test_no_tpm_sysfs(self, _isdir):
         result = gui.detect_tpm2_device()
@@ -581,8 +590,8 @@ class TestDetectTpm2Device(unittest.TestCase):
 # DeviceContext dataclass
 # ===========================================================================
 
-class TestDeviceContext(unittest.TestCase):
 
+class TestDeviceContext(unittest.TestCase):
     def test_default_values(self):
         ctx = gui.DeviceContext()
         self.assertIsNone(ctx.svc)
@@ -604,8 +613,8 @@ class TestDeviceContext(unittest.TestCase):
 # _is_removable and _is_partition (mocked sysfs)
 # ===========================================================================
 
-class TestIsRemovable(unittest.TestCase):
 
+class TestIsRemovable(unittest.TestCase):
     @mock.patch.object(svc, "_read_sysfs", return_value="1")
     def test_removable_device(self, _read):
         self.assertTrue(svc._is_removable("/dev/sdb"))
@@ -622,7 +631,6 @@ class TestIsRemovable(unittest.TestCase):
 
 
 class TestIsPartition(unittest.TestCase):
-
     @mock.patch("os.path.exists", return_value=True)
     def test_partition(self, _exists):
         self.assertTrue(svc._is_partition("/dev/sdb1"))
@@ -637,8 +645,8 @@ class TestIsPartition(unittest.TestCase):
 # _derive_passphrase_from_token (token type dispatch)
 # ===========================================================================
 
-class TestDerivePassphraseFromToken(unittest.TestCase):
 
+class TestDerivePassphraseFromToken(unittest.TestCase):
     @mock.patch.object(svc, "_fido2_unlock_from_token", return_value=b"raw_secret")
     def test_fido2_base64_encodes(self, _fido2):
         result = svc._derive_passphrase_from_token("/dev/fake", "systemd-fido2", "1234")
@@ -659,8 +667,8 @@ class TestDerivePassphraseFromToken(unittest.TestCase):
 # Modhex encoding
 # ===========================================================================
 
-class TestModhex(unittest.TestCase):
 
+class TestModhex(unittest.TestCase):
     def test_modhex_alphabet_length(self):
         self.assertEqual(len(svc._MODHEX), 16)
 
@@ -669,16 +677,18 @@ class TestModhex(unittest.TestCase):
 
     def test_modhex_chars_are_lowercase_alpha(self):
         for ch in svc._MODHEX:
-            self.assertTrue(ch.isalpha() and ch.islower(),
-                            f"Modhex char '{ch}' is not lowercase alpha")
+            self.assertTrue(
+                ch.isalpha() and ch.islower(),
+                f"Modhex char '{ch}' is not lowercase alpha",
+            )
 
 
 # ===========================================================================
 # Constants and invariants
 # ===========================================================================
 
-class TestConstants(unittest.TestCase):
 
+class TestConstants(unittest.TestCase):
     def test_bus_name(self):
         self.assertEqual(svc.BUS_NAME, "com.contemno.LuksEnroll")
 
@@ -710,11 +720,13 @@ class TestConstants(unittest.TestCase):
 # Handler method signature checks
 # ===========================================================================
 
+
 class TestHandlerSignatures(unittest.TestCase):
     """Verify all _handle_* methods take (self, parameters, invocation)."""
 
     def test_handler_signatures(self):
         import inspect
+
         for name in dir(svc.LuksEnrollService):
             if not name.startswith("_handle_"):
                 continue
@@ -722,7 +734,8 @@ class TestHandlerSignatures(unittest.TestCase):
             sig = inspect.signature(method)
             params = list(sig.parameters.keys())
             self.assertEqual(
-                params, ["self", "parameters", "invocation"],
+                params,
+                ["self", "parameters", "invocation"],
                 f"{name} has unexpected signature: {params}",
             )
 
@@ -731,6 +744,7 @@ class TestHandlerSignatures(unittest.TestCase):
 # Privileged / blocking method sets
 # ===========================================================================
 
+
 class TestMethodSets(unittest.TestCase):
     """Verify the privileged and blocking method sets in handle_method_call
     are consistent with handlers that exist."""
@@ -738,12 +752,11 @@ class TestMethodSets(unittest.TestCase):
     def _get_method_sets(self):
         """Extract method sets from handle_method_call source."""
         import inspect
+
         source = inspect.getsource(svc.LuksEnrollService.handle_method_call)
 
         sets = {}
-        for match in re.finditer(
-            r'(\w+_methods)\s*=\s*\{([^}]+)\}', source
-        ):
+        for match in re.finditer(r"(\w+_methods)\s*=\s*\{([^}]+)\}", source):
             name = match.group(1)
             methods = set(re.findall(r'"(\w+)"', match.group(2)))
             sets[name] = methods
@@ -760,8 +773,9 @@ class TestMethodSets(unittest.TestCase):
         for method in root.iter("method"):
             xml_methods.add(method.attrib["name"])
         for m in privileged:
-            self.assertIn(m, xml_methods,
-                          f"Privileged method '{m}' not in XML interface")
+            self.assertIn(
+                m, xml_methods, f"Privileged method '{m}' not in XML interface"
+            )
 
     def test_blocking_methods_have_handlers(self):
         sets = self._get_method_sets()
@@ -779,8 +793,8 @@ class TestMethodSets(unittest.TestCase):
 # Volume key cache
 # ===========================================================================
 
-class TestVolumeKeyCache(unittest.TestCase):
 
+class TestVolumeKeyCache(unittest.TestCase):
     def test_cache_is_dict(self):
         self.assertIsInstance(svc._volume_key_cache, dict)
 
@@ -789,10 +803,9 @@ class TestVolumeKeyCache(unittest.TestCase):
 # _CryptPbkdfType structure
 # ===========================================================================
 
-class TestCryptPbkdfType(unittest.TestCase):
 
+class TestCryptPbkdfType(unittest.TestCase):
     def test_structure_fields(self):
-        import ctypes
         pbkdf = svc._CryptPbkdfType(
             type=b"pbkdf2",
             hash=b"sha512",
@@ -811,6 +824,7 @@ class TestCryptPbkdfType(unittest.TestCase):
 # Proxy class method existence
 # ===========================================================================
 
+
 class TestProxyMethods(unittest.TestCase):
     """Verify LuksEnrollProxy has methods for all D-Bus operations."""
 
@@ -823,7 +837,9 @@ class TestProxyMethods(unittest.TestCase):
             xml_methods.add(method.attrib["name"])
 
         # Build the set of D-Bus method names that the proxy calls
-        gui_path = os.path.join(os.path.dirname(__file__), "..", "src", "luks-enroll.py")
+        gui_path = os.path.join(
+            os.path.dirname(__file__), "..", "src", "luks-enroll.py"
+        )
         with open(gui_path) as f:
             source = f.read()
 
@@ -833,13 +849,18 @@ class TestProxyMethods(unittest.TestCase):
         # or be an internal-only method (like Authenticate, GetSystemdVersion)
         # At minimum, the core methods must be present
         core_methods = {
-            "DetectDevices", "GetKeyslots", "GetTokensByType",
-            "FindPasswordKeyslots", "VerifyPassphrase", "EnrollFido2",
-            "EnrollTpm2", "EnrollRecoveryKey", "WipeSlot",
+            "DetectDevices",
+            "GetKeyslots",
+            "GetTokensByType",
+            "FindPasswordKeyslots",
+            "VerifyPassphrase",
+            "EnrollFido2",
+            "EnrollTpm2",
+            "EnrollRecoveryKey",
+            "WipeSlot",
         }
         for m in core_methods:
-            self.assertIn(m, called,
-                          f"Core D-Bus method '{m}' not called by proxy")
+            self.assertIn(m, called, f"Core D-Bus method '{m}' not called by proxy")
 
 
 if __name__ == "__main__":

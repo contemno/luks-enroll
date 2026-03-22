@@ -13,7 +13,6 @@ import base64
 import importlib.util
 import json
 import os
-import re
 import sys
 import tempfile
 import time
@@ -25,6 +24,7 @@ from unittest import mock
 # Module import — same approach as test_luks_enroll.py
 # ---------------------------------------------------------------------------
 
+
 def _import_service():
     mod_name = "luks_enroll_service"
     spec = importlib.util.spec_from_file_location(
@@ -33,11 +33,14 @@ def _import_service():
     )
     fake_gi = mock.MagicMock()
     mod = importlib.util.module_from_spec(spec)
-    with mock.patch.dict(sys.modules, {
-        "gi": fake_gi,
-        "gi.repository": fake_gi.repository,
-        mod_name: mod,
-    }):
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "gi": fake_gi,
+            "gi.repository": fake_gi.repository,
+            mod_name: mod,
+        },
+    ):
         spec.loader.exec_module(mod)
     return mod
 
@@ -48,6 +51,7 @@ svc = _import_service()
 # ---------------------------------------------------------------------------
 # Lightweight GLib.Variant replacement
 # ---------------------------------------------------------------------------
+
 
 class SimpleVariant:
     """Drop-in for GLib.Variant that just stores the data tuple."""
@@ -64,14 +68,15 @@ class SimpleVariant:
 # In-memory LUKS2 device
 # ---------------------------------------------------------------------------
 
+
 class FakeLuksDevice:
     """Simulates LUKS2 header state in memory: keyslots, tokens, volume key."""
 
     def __init__(self, passphrase="test"):
         self.volume_key = os.urandom(64)
         self.vk_size = 64
-        self.keyslots = {}          # int slot -> bytes passphrase
-        self.tokens = {}            # int tid  -> dict (parsed token JSON)
+        self.keyslots = {}  # int slot -> bytes passphrase
+        self.tokens = {}  # int tid  -> dict (parsed token JSON)
         self._next_slot = 0
         self._next_token = 0
         if passphrase is not None:
@@ -94,19 +99,16 @@ class FakeLuksDevice:
         """Return LUKS2 JSON metadata matching _get_luks_json() format."""
         return {
             "keyslots": {
-                str(s): {"type": "luks2", "key_size": 64}
-                for s in self.keyslots
+                str(s): {"type": "luks2", "key_size": 64} for s in self.keyslots
             },
-            "tokens": {
-                str(t): tinfo
-                for t, tinfo in self.tokens.items()
-            },
+            "tokens": {str(t): tinfo for t, tinfo in self.tokens.items()},
         }
 
 
 # ---------------------------------------------------------------------------
 # Service test harness
 # ---------------------------------------------------------------------------
+
 
 class ServiceHarness:
     """Patches the service module so handlers operate on FakeLuksDevices.
@@ -120,7 +122,7 @@ class ServiceHarness:
     """
 
     def __init__(self):
-        self.devices = {}       # path -> FakeLuksDevice
+        self.devices = {}  # path -> FakeLuksDevice
         self.service = None
         self._patches = []
         self._settings_file = None
@@ -166,9 +168,7 @@ class ServiceHarness:
         self.service._get_caller_uid = mock.MagicMock(return_value=1000)
 
         # Temp file for settings tests
-        self._settings_file = tempfile.NamedTemporaryFile(
-            suffix=".conf", delete=False
-        )
+        self._settings_file = tempfile.NamedTemporaryFile(suffix=".conf", delete=False)
         self._settings_file.close()
 
         self._patch_all()
@@ -215,7 +215,9 @@ class ServiceHarness:
                     if slots and slots[0] in dev.keyslots:
                         real_dev = os.path.realpath(device)
                         svc._volume_key_cache[real_dev] = (
-                            dev.volume_key, dev.vk_size, time.monotonic()
+                            dev.volume_key,
+                            dev.vk_size,
+                            time.monotonic(),
                         )
                         return True, slots[0]
             return False, "Token unlock failed"
@@ -245,7 +247,9 @@ class ServiceHarness:
                 if token_id in dev.tokens:
                     del dev.tokens[token_id]
                 return token_id
-            parsed = json.loads(token_json) if isinstance(token_json, str) else token_json
+            parsed = (
+                json.loads(token_json) if isinstance(token_json, str) else token_json
+            )
             if token_id < 0:
                 return dev._add_token(parsed)
             dev.tokens[token_id] = parsed
@@ -269,13 +273,23 @@ class ServiceHarness:
 
         def mock_detect_removable():
             return [
-                {"device": "/dev/sdb", "size": "16.0 GB", "label": "USB",
-                 "partitions": []},
+                {
+                    "device": "/dev/sdb",
+                    "size": "16.0 GB",
+                    "label": "USB",
+                    "partitions": [],
+                },
             ]
 
         def mock_get_device_info(device):
-            return {"device": device, "size": "16.0 GB", "label": "",
-                    "removable": True, "mount_point": "", "filesystem": ""}
+            return {
+                "device": device,
+                "size": "16.0 GB",
+                "label": "",
+                "removable": True,
+                "mount_point": "",
+                "filesystem": "",
+            }
 
         def mock_format_partition(device, passphrase):
             part = f"{device}1"
@@ -355,7 +369,6 @@ class TestDeviceDetection(unittest.TestCase):
 
 
 class TestPassphraseVerification(unittest.TestCase):
-
     def test_correct_passphrase(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="secret")
@@ -379,7 +392,6 @@ class TestPassphraseVerification(unittest.TestCase):
 
 
 class TestRecoveryKeyWorkflow(unittest.TestCase):
-
     def test_enroll_recovery_key(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
@@ -404,20 +416,15 @@ class TestRecoveryKeyWorkflow(unittest.TestCase):
             )
             self.assertTrue(ok)
             # Verify the recovery key works as a passphrase
-            ok2, slot = h.call(
-                "VerifyPassphrase", ("/dev/sda3", recovery_key)
-            )
+            ok2, slot = h.call("VerifyPassphrase", ("/dev/sda3", recovery_key))
             self.assertTrue(ok2)
             self.assertEqual(slot, 1)  # slot 0 is the original passphrase
 
     def test_recovery_token_in_metadata(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollRecoveryKey",
-                   ("/dev/sda3", "pw", "passphrase", ""))
-            tokens_json = h.call(
-                "GetTokensByType", ("/dev/sda3", "systemd-recovery")
-            )
+            h.call("EnrollRecoveryKey", ("/dev/sda3", "pw", "passphrase", ""))
+            tokens_json = h.call("GetTokensByType", ("/dev/sda3", "systemd-recovery"))
             tokens = json.loads(tokens_json[0])
             self.assertEqual(len(tokens), 1)
             tid, slots = tokens[0]
@@ -426,15 +433,13 @@ class TestRecoveryKeyWorkflow(unittest.TestCase):
     def test_password_slots_excludes_recovery(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollRecoveryKey",
-                   ("/dev/sda3", "pw", "passphrase", ""))
+            h.call("EnrollRecoveryKey", ("/dev/sda3", "pw", "passphrase", ""))
             # Slot 0 is password, slot 1 is managed by recovery token
             pw_slots = h.call("FindPasswordKeyslots", ("/dev/sda3",))
             self.assertEqual(pw_slots[0], [0])
 
 
 class TestTpm2Workflow(unittest.TestCase):
-
     def test_enroll_tpm2(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
@@ -448,11 +453,8 @@ class TestTpm2Workflow(unittest.TestCase):
     def test_tpm2_token_metadata(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollTpm2",
-                   ("/dev/sda3", "pw", "", "7+11", "passphrase", ""))
-            tokens_json = h.call(
-                "GetTokensByType", ("/dev/sda3", "systemd-tpm2")
-            )
+            h.call("EnrollTpm2", ("/dev/sda3", "pw", "", "7+11", "passphrase", ""))
+            tokens_json = h.call("GetTokensByType", ("/dev/sda3", "systemd-tpm2"))
             tokens = json.loads(tokens_json[0])
             self.assertEqual(len(tokens), 1)
             tid, slots = tokens[0]
@@ -462,8 +464,7 @@ class TestTpm2Workflow(unittest.TestCase):
         """Verify all required systemd-compat fields are present."""
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollTpm2",
-                   ("/dev/sda3", "pw", "1234", "7", "passphrase", ""))
+            h.call("EnrollTpm2", ("/dev/sda3", "pw", "1234", "7", "passphrase", ""))
             token = dev.tokens[0]
             self.assertEqual(token["type"], "systemd-tpm2")
             self.assertIn("tpm2-blob", token)
@@ -477,50 +478,43 @@ class TestTpm2Workflow(unittest.TestCase):
     def test_tpm2_no_pin(self):
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollTpm2",
-                   ("/dev/sda3", "pw", "", "7", "passphrase", ""))
+            h.call("EnrollTpm2", ("/dev/sda3", "pw", "", "7", "passphrase", ""))
             token = dev.tokens[0]
             self.assertFalse(token["tpm2-pin"])
 
     def test_tpm2_token_unlock(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollTpm2",
-                   ("/dev/sda3", "pw", "", "7", "passphrase", ""))
-            ok, keyslot = h.call(
-                "UnlockWithToken", ("/dev/sda3", "systemd-tpm2", "")
-            )
+            h.call("EnrollTpm2", ("/dev/sda3", "pw", "", "7", "passphrase", ""))
+            ok, keyslot = h.call("UnlockWithToken", ("/dev/sda3", "systemd-tpm2", ""))
             self.assertTrue(ok)
             self.assertEqual(keyslot, 1)
 
     def test_tpm2_unlock_fails_when_not_enrolled(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
-            ok, keyslot = h.call(
-                "UnlockWithToken", ("/dev/sda3", "systemd-tpm2", "")
-            )
+            ok, keyslot = h.call("UnlockWithToken", ("/dev/sda3", "systemd-tpm2", ""))
             self.assertFalse(ok)
             self.assertEqual(keyslot, -1)
 
 
 class TestFido2Workflow(unittest.TestCase):
-
     def test_enroll_fido2(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
             ok, stdout, err = h.call(
                 "EnrollFido2",
-                ("/dev/sda3", "pw", "", "/dev/hidraw0",
-                 "passphrase", ""),
+                ("/dev/sda3", "pw", "", "/dev/hidraw0", "passphrase", ""),
             )
             self.assertTrue(ok, f"EnrollFido2 failed: {err}")
 
     def test_fido2_token_metadata(self):
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollFido2",
-                   ("/dev/sda3", "pw", "1234", "/dev/hidraw0",
-                    "passphrase", ""))
+            h.call(
+                "EnrollFido2",
+                ("/dev/sda3", "pw", "1234", "/dev/hidraw0", "passphrase", ""),
+            )
             token = dev.tokens[0]
             self.assertEqual(token["type"], "systemd-fido2")
             self.assertIn("fido2-credential", token)
@@ -533,18 +527,18 @@ class TestFido2Workflow(unittest.TestCase):
     def test_fido2_no_pin(self):
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollFido2",
-                   ("/dev/sda3", "pw", "", "/dev/hidraw0",
-                    "passphrase", ""))
+            h.call(
+                "EnrollFido2", ("/dev/sda3", "pw", "", "/dev/hidraw0", "passphrase", "")
+            )
             token = dev.tokens[0]
             self.assertFalse(token["fido2-clientPin-required"])
 
     def test_fido2_credential_is_valid_base64(self):
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollFido2",
-                   ("/dev/sda3", "pw", "", "/dev/hidraw0",
-                    "passphrase", ""))
+            h.call(
+                "EnrollFido2", ("/dev/sda3", "pw", "", "/dev/hidraw0", "passphrase", "")
+            )
             token = dev.tokens[0]
             # Should not raise
             cred = base64.b64decode(token["fido2-credential"])
@@ -556,9 +550,9 @@ class TestFido2Workflow(unittest.TestCase):
         """Systemd convention: FIDO2 keyslot passphrase is base64(hmac_secret)."""
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollFido2",
-                   ("/dev/sda3", "pw", "", "/dev/hidraw0",
-                    "passphrase", ""))
+            h.call(
+                "EnrollFido2", ("/dev/sda3", "pw", "", "/dev/hidraw0", "passphrase", "")
+            )
             # Slot 1 is the FIDO2 slot; its passphrase must be valid base64
             slot1_pw = dev.keyslots[1]
             decoded = base64.b64decode(slot1_pw)
@@ -566,7 +560,6 @@ class TestFido2Workflow(unittest.TestCase):
 
 
 class TestPassphraseEnrollment(unittest.TestCase):
-
     def test_add_new_passphrase(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="old")
@@ -579,8 +572,7 @@ class TestPassphraseEnrollment(unittest.TestCase):
     def test_both_passphrases_work(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="old")
-            h.call("EnrollPassphrase",
-                   ("/dev/sda3", "old", "new", "passphrase", ""))
+            h.call("EnrollPassphrase", ("/dev/sda3", "old", "new", "passphrase", ""))
             ok_old, _ = h.call("VerifyPassphrase", ("/dev/sda3", "old"))
             ok_new, _ = h.call("VerifyPassphrase", ("/dev/sda3", "new"))
             self.assertTrue(ok_old)
@@ -599,20 +591,17 @@ class TestPassphraseEnrollment(unittest.TestCase):
     def test_password_slots_count_increases(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollPassphrase",
-                   ("/dev/sda3", "pw", "pw2", "passphrase", ""))
+            h.call("EnrollPassphrase", ("/dev/sda3", "pw", "pw2", "passphrase", ""))
             pw_slots = h.call("FindPasswordKeyslots", ("/dev/sda3",))
             # Both slots are unmanaged by tokens → both are password slots
             self.assertEqual(pw_slots[0], [0, 1])
 
 
 class TestSlotWiping(unittest.TestCase):
-
     def test_wipe_recovery_removes_slot_and_token(self):
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollRecoveryKey",
-                   ("/dev/sda3", "pw", "passphrase", ""))
+            h.call("EnrollRecoveryKey", ("/dev/sda3", "pw", "passphrase", ""))
             # Verify slot 1 and token exist
             self.assertIn(1, dev.keyslots)
             self.assertEqual(len(dev.tokens), 1)
@@ -631,8 +620,7 @@ class TestSlotWiping(unittest.TestCase):
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
             # Add a second password slot
-            h.call("EnrollPassphrase",
-                   ("/dev/sda3", "pw", "pw2", "passphrase", ""))
+            h.call("EnrollPassphrase", ("/dev/sda3", "pw", "pw2", "passphrase", ""))
             # Wipe slot 1 (second passphrase, no token)
             ok, _, err = h.call(
                 "WipeSlot",
@@ -645,28 +633,23 @@ class TestSlotWiping(unittest.TestCase):
     def test_wipe_tpm2_cleans_token(self):
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollTpm2",
-                   ("/dev/sda3", "pw", "", "7", "passphrase", ""))
+            h.call("EnrollTpm2", ("/dev/sda3", "pw", "", "7", "passphrase", ""))
             self.assertEqual(len(dev.tokens), 1)
-            h.call("WipeSlot",
-                   ("/dev/sda3", "pw", "passphrase", "", 1))
+            h.call("WipeSlot", ("/dev/sda3", "pw", "passphrase", "", 1))
             self.assertEqual(len(dev.tokens), 0)
             self.assertNotIn(1, dev.keyslots)
 
     def test_keyslots_consistent_after_wipe(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollRecoveryKey",
-                   ("/dev/sda3", "pw", "passphrase", ""))
-            h.call("WipeSlot",
-                   ("/dev/sda3", "pw", "passphrase", "", 1))
+            h.call("EnrollRecoveryKey", ("/dev/sda3", "pw", "passphrase", ""))
+            h.call("WipeSlot", ("/dev/sda3", "pw", "passphrase", "", 1))
             raw = h.call("GetKeyslots", ("/dev/sda3",))
             slots = json.loads(raw[0])
             self.assertEqual(list(slots.keys()), ["0"])
 
 
 class TestEncryptedImageCreation(unittest.TestCase):
-
     def test_create_encrypted_image(self):
         with ServiceHarness() as h:
             ok, keyslot, err = h.call(
@@ -681,23 +664,18 @@ class TestEncryptedImageCreation(unittest.TestCase):
     def test_image_is_functional(self):
         """After creation, keyslots and passphrase should work."""
         with ServiceHarness() as h:
-            h.call("CreateEncryptedImage",
-                   ("/tmp/test.img", 256, "secret"))
-            ok, slot = h.call(
-                "VerifyPassphrase", ("/tmp/test.img", "secret")
-            )
+            h.call("CreateEncryptedImage", ("/tmp/test.img", 256, "secret"))
+            ok, slot = h.call("VerifyPassphrase", ("/tmp/test.img", "secret"))
             self.assertTrue(ok)
 
     def test_image_appears_in_detect(self):
         with ServiceHarness() as h:
-            h.call("CreateEncryptedImage",
-                   ("/tmp/test.img", 256, "pw"))
+            h.call("CreateEncryptedImage", ("/tmp/test.img", 256, "pw"))
             devices = h.call("DetectDevices")
             self.assertIn("/tmp/test.img", devices[0])
 
 
 class TestRemovableDevices(unittest.TestCase):
-
     def test_detect_removable(self):
         with ServiceHarness() as h:
             raw = h.call("DetectRemovableDevices")
@@ -713,9 +691,7 @@ class TestRemovableDevices(unittest.TestCase):
 
     def test_format_partition(self):
         with ServiceHarness() as h:
-            ok, partition, err = h.call(
-                "FormatPartition", ("/dev/sdb", "pw")
-            )
+            ok, partition, err = h.call("FormatPartition", ("/dev/sdb", "pw"))
             self.assertTrue(ok)
             self.assertEqual(partition, "/dev/sdb1")
             # Formatted partition is now a LUKS device
@@ -723,7 +699,6 @@ class TestRemovableDevices(unittest.TestCase):
 
 
 class TestSettingsWorkflow(unittest.TestCase):
-
     def test_get_unset_returns_empty(self):
         with ServiceHarness() as h:
             value = h.call("GetSetting", ("nonexistent_key",))
@@ -745,7 +720,6 @@ class TestSettingsWorkflow(unittest.TestCase):
 
 
 class TestAuthentication(unittest.TestCase):
-
     def test_authenticate_returns_true(self):
         with ServiceHarness() as h:
             result = h.call("Authenticate")
@@ -765,12 +739,9 @@ class TestTokenUnlockBasedEnrollment(unittest.TestCase):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
             # Enroll TPM2 first
-            h.call("EnrollTpm2",
-                   ("/dev/sda3", "pw", "", "7", "passphrase", ""))
+            h.call("EnrollTpm2", ("/dev/sda3", "pw", "", "7", "passphrase", ""))
             # Simulate token unlock (populates volume key cache)
-            ok, _ = h.call(
-                "UnlockWithToken", ("/dev/sda3", "systemd-tpm2", "")
-            )
+            ok, _ = h.call("UnlockWithToken", ("/dev/sda3", "systemd-tpm2", ""))
             self.assertTrue(ok)
             # Now enroll recovery key using token-based unlock
             ok, recovery_key, err = h.call(
@@ -779,21 +750,18 @@ class TestTokenUnlockBasedEnrollment(unittest.TestCase):
             )
             self.assertTrue(ok, f"Recovery enrollment via token failed: {err}")
             # Verify recovery key works
-            ok2, _ = h.call(
-                "VerifyPassphrase", ("/dev/sda3", recovery_key)
-            )
+            ok2, _ = h.call("VerifyPassphrase", ("/dev/sda3", recovery_key))
             self.assertTrue(ok2)
 
     def test_enroll_fido2_then_tpm2_via_token(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
             # Enroll FIDO2
-            h.call("EnrollFido2",
-                   ("/dev/sda3", "pw", "", "/dev/hidraw0",
-                    "passphrase", ""))
+            h.call(
+                "EnrollFido2", ("/dev/sda3", "pw", "", "/dev/hidraw0", "passphrase", "")
+            )
             # Token unlock populates VK cache
-            h.call("UnlockWithToken",
-                   ("/dev/sda3", "systemd-fido2", ""))
+            h.call("UnlockWithToken", ("/dev/sda3", "systemd-fido2", ""))
             # Enroll TPM2 using FIDO2 token
             ok, _, err = h.call(
                 "EnrollTpm2",
@@ -807,24 +775,21 @@ class TestFullWizardFlow(unittest.TestCase):
 
     def test_complete_flow(self):
         with ServiceHarness() as h:
-            dev = h.create_device("/dev/sda3", passphrase="installer-pw")
+            h.create_device("/dev/sda3", passphrase="installer-pw")
 
             # Step 1: Detect devices
             devices = h.call("DetectDevices")[0]
             self.assertIn("/dev/sda3", devices)
 
             # Step 2: Verify passphrase (unlock)
-            ok, keyslot = h.call(
-                "VerifyPassphrase", ("/dev/sda3", "installer-pw")
-            )
+            ok, keyslot = h.call("VerifyPassphrase", ("/dev/sda3", "installer-pw"))
             self.assertTrue(ok)
             self.assertEqual(keyslot, 0)
 
             # Step 3: Enroll TPM2
             ok, _, err = h.call(
                 "EnrollTpm2",
-                ("/dev/sda3", "installer-pw", "", "7",
-                 "passphrase", ""),
+                ("/dev/sda3", "installer-pw", "", "7", "passphrase", ""),
             )
             self.assertTrue(ok, err)
 
@@ -841,14 +806,12 @@ class TestFullWizardFlow(unittest.TestCase):
             self.assertEqual(len(slots), 3)
 
             tpm2_tokens = json.loads(
-                h.call("GetTokensByType",
-                       ("/dev/sda3", "systemd-tpm2"))[0]
+                h.call("GetTokensByType", ("/dev/sda3", "systemd-tpm2"))[0]
             )
             self.assertEqual(len(tpm2_tokens), 1)
 
             recovery_tokens = json.loads(
-                h.call("GetTokensByType",
-                       ("/dev/sda3", "systemd-recovery"))[0]
+                h.call("GetTokensByType", ("/dev/sda3", "systemd-recovery"))[0]
             )
             self.assertEqual(len(recovery_tokens), 1)
 
@@ -864,21 +827,15 @@ class TestFullWizardFlow(unittest.TestCase):
             self.assertTrue(ok, err)
 
             # Step 8: Verify password no longer works
-            ok, _ = h.call(
-                "VerifyPassphrase", ("/dev/sda3", "installer-pw")
-            )
+            ok, _ = h.call("VerifyPassphrase", ("/dev/sda3", "installer-pw"))
             self.assertFalse(ok)
 
             # Step 9: Recovery key still works
-            ok, _ = h.call(
-                "VerifyPassphrase", ("/dev/sda3", recovery_key)
-            )
+            ok, _ = h.call("VerifyPassphrase", ("/dev/sda3", recovery_key))
             self.assertTrue(ok)
 
             # Step 10: TPM2 token unlock still works
-            ok, _ = h.call(
-                "UnlockWithToken", ("/dev/sda3", "systemd-tpm2", "")
-            )
+            ok, _ = h.call("UnlockWithToken", ("/dev/sda3", "systemd-tpm2", ""))
             self.assertTrue(ok)
 
             # Step 11: Final state — 2 keyslots, 0 password slots
@@ -898,24 +855,18 @@ class TestMultipleDevices(unittest.TestCase):
             h.create_device("/dev/sdb1", passphrase="pw2")
 
             # Enroll recovery on first device only
-            h.call("EnrollRecoveryKey",
-                   ("/dev/sda3", "pw1", "passphrase", ""))
+            h.call("EnrollRecoveryKey", ("/dev/sda3", "pw1", "passphrase", ""))
 
             # First device: 2 keyslots, 1 token
-            slots1 = json.loads(
-                h.call("GetKeyslots", ("/dev/sda3",))[0]
-            )
+            slots1 = json.loads(h.call("GetKeyslots", ("/dev/sda3",))[0])
             self.assertEqual(len(slots1), 2)
 
             # Second device: 1 keyslot, 0 tokens
-            slots2 = json.loads(
-                h.call("GetKeyslots", ("/dev/sdb1",))[0]
-            )
+            slots2 = json.loads(h.call("GetKeyslots", ("/dev/sdb1",))[0])
             self.assertEqual(len(slots2), 1)
 
             tokens2 = json.loads(
-                h.call("GetTokensByType",
-                       ("/dev/sdb1", "systemd-recovery"))[0]
+                h.call("GetTokensByType", ("/dev/sdb1", "systemd-recovery"))[0]
             )
             self.assertEqual(len(tokens2), 0)
 
@@ -945,26 +896,22 @@ class TestMultipleEnrollments(unittest.TestCase):
             self.assertTrue(ok)
 
             tokens = json.loads(
-                h.call("GetTokensByType",
-                       ("/dev/sda3", "systemd-recovery"))[0]
+                h.call("GetTokensByType", ("/dev/sda3", "systemd-recovery"))[0]
             )
             self.assertEqual(len(tokens), 2)
 
     def test_tpm2_and_fido2_coexist(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollTpm2",
-                   ("/dev/sda3", "pw", "", "7", "passphrase", ""))
-            h.call("EnrollFido2",
-                   ("/dev/sda3", "pw", "", "/dev/hidraw0",
-                    "passphrase", ""))
+            h.call("EnrollTpm2", ("/dev/sda3", "pw", "", "7", "passphrase", ""))
+            h.call(
+                "EnrollFido2", ("/dev/sda3", "pw", "", "/dev/hidraw0", "passphrase", "")
+            )
             tpm2 = json.loads(
-                h.call("GetTokensByType",
-                       ("/dev/sda3", "systemd-tpm2"))[0]
+                h.call("GetTokensByType", ("/dev/sda3", "systemd-tpm2"))[0]
             )
             fido2 = json.loads(
-                h.call("GetTokensByType",
-                       ("/dev/sda3", "systemd-fido2"))[0]
+                h.call("GetTokensByType", ("/dev/sda3", "systemd-fido2"))[0]
             )
             self.assertEqual(len(tpm2), 1)
             self.assertEqual(len(fido2), 1)
@@ -974,7 +921,6 @@ class TestMultipleEnrollments(unittest.TestCase):
 
 
 class TestErrorPaths(unittest.TestCase):
-
     def test_enroll_with_wrong_passphrase(self):
         with ServiceHarness() as h:
             h.create_device("/dev/sda3", passphrase="correct")
@@ -999,8 +945,7 @@ class TestErrorPaths(unittest.TestCase):
             h.create_device("/dev/sda3", passphrase="correct")
             ok, _, err = h.call(
                 "EnrollFido2",
-                ("/dev/sda3", "wrong", "", "/dev/hidraw0",
-                 "passphrase", ""),
+                ("/dev/sda3", "wrong", "", "/dev/hidraw0", "passphrase", ""),
             )
             self.assertFalse(ok)
 
@@ -1020,16 +965,14 @@ class TestTPM2TokenDualFieldCompat(unittest.TestCase):
     def test_blob_fields_match(self):
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollTpm2",
-                   ("/dev/sda3", "pw", "", "7", "passphrase", ""))
+            h.call("EnrollTpm2", ("/dev/sda3", "pw", "", "7", "passphrase", ""))
             token = dev.tokens[0]
             self.assertEqual(token["tpm2-blob"], token["tpm2_blob"])
 
     def test_pcr_hash_fields(self):
         with ServiceHarness() as h:
             dev = h.create_device("/dev/sda3", passphrase="pw")
-            h.call("EnrollTpm2",
-                   ("/dev/sda3", "pw", "", "7", "passphrase", ""))
+            h.call("EnrollTpm2", ("/dev/sda3", "pw", "", "7", "passphrase", ""))
             token = dev.tokens[0]
             self.assertEqual(token["tpm2-pcr-bank"], "sha256")
             self.assertEqual(token["tpm2_pcr_hash"], "sha256")

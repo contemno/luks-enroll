@@ -6,7 +6,7 @@ This is an unprivileged GUI client that talks to the luks-enroll-service
 D-Bus system service for all privileged operations."""
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import gi
 import glob
 import json
@@ -150,36 +150,47 @@ class LuksEnrollProxy:
             callback,
         )
 
-    def enroll_fido2(self, device, passphrase, pin, fido2_device,
-                     unlock_method="passphrase", unlock_pin=""):
+    def enroll_fido2(
+        self,
+        device,
+        passphrase,
+        pin,
+        fido2_device,
+        unlock_method="passphrase",
+        unlock_pin="",
+    ):
         result = self.proxy.call_sync(
             "EnrollFido2",
-            GLib.Variant("(ssssss)", (device, passphrase, pin, fido2_device,
-                                      unlock_method, unlock_pin)),
+            GLib.Variant(
+                "(ssssss)",
+                (device, passphrase, pin, fido2_device, unlock_method, unlock_pin),
+            ),
             Gio.DBusCallFlags.NONE,
             120000,
             None,
         )
         return result.unpack()  # (bool, str, str)
 
-    def enroll_tpm2(self, device, passphrase, pin, pcrs,
-                    unlock_method="passphrase", unlock_pin=""):
+    def enroll_tpm2(
+        self, device, passphrase, pin, pcrs, unlock_method="passphrase", unlock_pin=""
+    ):
         result = self.proxy.call_sync(
             "EnrollTpm2",
-            GLib.Variant("(ssssss)", (device, passphrase, pin, pcrs,
-                                      unlock_method, unlock_pin)),
+            GLib.Variant(
+                "(ssssss)", (device, passphrase, pin, pcrs, unlock_method, unlock_pin)
+            ),
             Gio.DBusCallFlags.NONE,
             120000,
             None,
         )
         return result.unpack()  # (bool, str, str)
 
-    def enroll_recovery_key(self, device, passphrase,
-                            unlock_method="passphrase", unlock_pin=""):
+    def enroll_recovery_key(
+        self, device, passphrase, unlock_method="passphrase", unlock_pin=""
+    ):
         result = self.proxy.call_sync(
             "EnrollRecoveryKey",
-            GLib.Variant("(ssss)", (device, passphrase, unlock_method,
-                                    unlock_pin)),
+            GLib.Variant("(ssss)", (device, passphrase, unlock_method, unlock_pin)),
             Gio.DBusCallFlags.NONE,
             120000,
             None,
@@ -258,12 +269,26 @@ class LuksEnrollProxy:
         )
         return result.unpack()  # (bool, str, str)
 
-    def enroll_passphrase(self, device, existing_passphrase, new_passphrase,
-                          unlock_method="passphrase", unlock_pin=""):
+    def enroll_passphrase(
+        self,
+        device,
+        existing_passphrase,
+        new_passphrase,
+        unlock_method="passphrase",
+        unlock_pin="",
+    ):
         result = self.proxy.call_sync(
             "EnrollPassphrase",
-            GLib.Variant("(sssss)", (device, existing_passphrase, new_passphrase,
-                                     unlock_method, unlock_pin)),
+            GLib.Variant(
+                "(sssss)",
+                (
+                    device,
+                    existing_passphrase,
+                    new_passphrase,
+                    unlock_method,
+                    unlock_pin,
+                ),
+            ),
             Gio.DBusCallFlags.NONE,
             120000,
             None,
@@ -307,7 +332,7 @@ class LuksEnrollProxy:
 
 
 def detect_fido2_devices():
-    """Return list of detected FIDO2 device (hidraw_name, hid_name) from /sys/class/hidraw.
+    """Return list of detected FIDO2 device tuples from /sys/class/hidraw.
 
     Each physical token may expose multiple hidraw interfaces (OTP, FIDO).
     We deduplicate by HID_PHYS (USB physical path) so each physical device
@@ -486,9 +511,7 @@ class WelcomePage(Gtk.ScrolledWindow):
         opts_box.append(self._fido2_box)
 
         self._udev_client = GUdev.Client(subsystems=["hidraw"])
-        self._udev_signal_id = self._udev_client.connect(
-            "uevent", self._on_udev_event
-        )
+        self._udev_signal_id = self._udev_client.connect("uevent", self._on_udev_event)
         self._poll_fido2()
 
         # TPM2 option
@@ -852,7 +875,7 @@ class EnrollStepPage(Gtk.Box):
         self._populate_existing(device_path)
 
     def _populate_existing(self, device_path):
-        """Scan for existing enrollments of this token type and show them with Wipe buttons."""
+        """Scan for existing enrollments and show them with Wipe buttons."""
         self._device_path = device_path
         self._clear_existing_box()
 
@@ -933,8 +956,7 @@ class EnrollStepPage(Gtk.Box):
             for slot in slots:
                 try:
                     ok, _out, _err = win.svc.wipe_slot(
-                        win.device, win.luks_passphrase,
-                        "passphrase", "", slot
+                        win.device, win.luks_passphrase, "passphrase", "", slot
                     )
                     if not ok:
                         all_ok = False
@@ -987,7 +1009,7 @@ class EnrollStepPage(Gtk.Box):
         parent_overlay.remove_overlay(self._touch_banner_frame)
 
     def validate_pin(self):
-        """Check PIN fields match and are non-empty (unless optional). Returns (ok, pin)."""
+        """Check PIN fields match and are non-empty. Returns (ok, pin)."""
         if not self.needs_pin:
             return True, None
         pin = self.pin_entry.get_text()
@@ -1042,8 +1064,10 @@ class RecoveryKeyPage(EnrollStepPage):
     def __init__(self):
         super().__init__(
             "Recovery Key",
-            "A recovery key will be generated. You MUST write it down and store it safely.\n"
-            "This is your last resort if both your FIDO2 key and TPM are unavailable.",
+            "A recovery key will be generated. You MUST write it down"
+            " and store it safely.\n"
+            "This is your last resort if both your FIDO2 key and TPM"
+            " are unavailable.",
             icon_name="dialog-warning-symbolic",
             needs_pin=False,
             token_type="systemd-recovery",
@@ -1109,7 +1133,9 @@ class FIDO2Page(EnrollStepPage):
 
     def refresh_fido2_devices(self, devices=None):
         """Re-scan FIDO2 devices and update the dropdown."""
-        self._all_fido2_devices = devices if devices is not None else detect_fido2_devices()
+        self._all_fido2_devices = (
+            devices if devices is not None else detect_fido2_devices()
+        )
         all_enrolled = self._enrolled_devs | self._server_enrolled_devs
         self._fido2_devices = [
             d for d in self._all_fido2_devices if d[0] not in all_enrolled
@@ -1137,7 +1163,7 @@ class FIDO2Page(EnrollStepPage):
 
     def _fetch_enrolled_status(self):
         """Query the service for which connected tokens are already enrolled."""
-        if not self.svc or not hasattr(self, '_device_path'):
+        if not self.svc or not hasattr(self, "_device_path"):
             return
         dev_paths = [f"/dev/{d[0]}" for d in self._all_fido2_devices]
         if not dev_paths:
@@ -1145,11 +1171,10 @@ class FIDO2Page(EnrollStepPage):
         self.btn_enroll.set_sensitive(False)
         if self.needs_pin:
             self.pin_box.set_sensitive(False)
+
         def fetch():
             try:
-                paths = self.svc.check_fido2_enrolled(
-                    self._device_path, dev_paths
-                )
+                paths = self.svc.check_fido2_enrolled(self._device_path, dev_paths)
                 # paths are like "/dev/hidraw3" — extract hidraw name
                 names = set()
                 for p in paths:
@@ -1159,6 +1184,7 @@ class FIDO2Page(EnrollStepPage):
                 GLib.idle_add(self._apply_enrolled_status, names)
             except GLib.Error:
                 GLib.idle_add(self._apply_enrolled_status, set())
+
         threading.Thread(target=fetch, daemon=True).start()
 
     def _apply_enrolled_status(self, server_enrolled):
@@ -1218,7 +1244,7 @@ class FIDO2Page(EnrollStepPage):
         return t[0] if t else None
 
     def mark_enrolled_and_reset(self):
-        """After a successful enrollment, mark the device as done and reset for the next."""
+        """Mark device as done after enrollment and reset for next."""
         hidraw = self.get_selected_fido2_hidraw()
         if hidraw:
             self._enrolled_devs.add(hidraw)
@@ -1236,8 +1262,7 @@ class FIDO2Page(EnrollStepPage):
         return len(self._fido2_devices) > 0
 
     def _update_pin_enrolled_hint(self):
-        """Show 'Already enrolled' in PIN placeholder when selected device is enrolled."""
-        all_enrolled = self._enrolled_devs | self._server_enrolled_devs
+        """Show 'Already enrolled' in PIN placeholder when enrolled."""
         selected = self._get_selected_device_tuple()
         if selected is None and self._all_fido2_devices:
             # All devices enrolled or single enrolled device
@@ -1261,8 +1286,7 @@ class FIDO2Page(EnrollStepPage):
             if self.needs_pin:
                 if is_enrolled:
                     self.pin_entry.set_text("")
-                    self.pin_entry.set_property(
-                        "placeholder-text", "Already enrolled")
+                    self.pin_entry.set_property("placeholder-text", "Already enrolled")
                     self.pin_box.set_sensitive(False)
                 else:
                     self.pin_entry.set_property("placeholder-text", "PIN")
@@ -1336,7 +1360,8 @@ class PasswordDeletePage(EnrollStepPage):
         super().__init__(
             "Remove Password Keyslot",
             "Remove the original password keyslot.\n"
-            "After removal, only your enrolled methods and recovery key can unlock the volume.",
+            "After removal, only your enrolled methods and recovery key"
+            " can unlock the volume.",
             icon_name="user-trash-symbolic",
         )
         # Inline "Remove" button
@@ -1398,7 +1423,10 @@ class DonePage(Gtk.Box):
         if lines:
             text = "Your disk encryption has been updated:\n\n" + "\n".join(lines)
             if enrolled.get("recovery"):
-                text += "\n\nMake sure you have your recovery key written down before rebooting."
+                text += (
+                    "\n\nMake sure you have your recovery key"
+                    " written down before rebooting."
+                )
         else:
             text = "No changes were made to the volume."
         self.summary_label.set_text(text)
@@ -1728,7 +1756,7 @@ class WizardWindow(Adw.ApplicationWindow):
             def do_verify():
                 try:
                     ok, keyslot = self.svc.verify_passphrase(page.device, passphrase)
-                except GLib.Error as e:
+                except GLib.Error:
                     ok, keyslot = False, -1
                 GLib.idle_add(
                     self._on_passphrase_verified, page, ok, keyslot, passphrase
@@ -1874,8 +1902,7 @@ class WizardWindow(Adw.ApplicationWindow):
             for slot in slots:
                 try:
                     ok, stdout, stderr = self.svc.wipe_slot(
-                        self.device, self.luks_passphrase,
-                        "passphrase", "", slot
+                        self.device, self.luks_passphrase, "passphrase", "", slot
                     )
                 except GLib.Error as e:
                     ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
@@ -2638,7 +2665,9 @@ class DeviceDetailPage(Adw.NavigationPage):
         self._tpm2_pin_entry.set_valign(Gtk.Align.CENTER)
         self._tpm2_pin_entry.set_hexpand(True)
         self._tpm2_pin_entry.set_property("placeholder-text", "PIN (if required)")
-        self._tpm2_pin_entry.connect("activate", lambda _: self._do_token_unlock("systemd-tpm2"))
+        self._tpm2_pin_entry.connect(
+            "activate", lambda _: self._do_token_unlock("systemd-tpm2")
+        )
         self._tpm2_row.add_suffix(self._tpm2_pin_entry)
         tpm2_btn = Gtk.Button(icon_name="go-next-symbolic")
         tpm2_btn.set_valign(Gtk.Align.CENTER)
@@ -2652,13 +2681,17 @@ class DeviceDetailPage(Adw.NavigationPage):
             title="Unlock with FIDO2",
             subtitle="Touch your security key to unlock",
         )
-        self._fido2_row.add_prefix(Gtk.Image.new_from_icon_name("media-removable-symbolic"))
+        self._fido2_row.add_prefix(
+            Gtk.Image.new_from_icon_name("media-removable-symbolic")
+        )
         self._fido2_pin_entry = Gtk.PasswordEntry()
         self._fido2_pin_entry.set_show_peek_icon(True)
         self._fido2_pin_entry.set_valign(Gtk.Align.CENTER)
         self._fido2_pin_entry.set_hexpand(True)
         self._fido2_pin_entry.set_property("placeholder-text", "PIN")
-        self._fido2_pin_entry.connect("activate", lambda _: self._do_token_unlock("systemd-fido2"))
+        self._fido2_pin_entry.connect(
+            "activate", lambda _: self._do_token_unlock("systemd-fido2")
+        )
         self._fido2_row.add_suffix(self._fido2_pin_entry)
         fido2_btn = Gtk.Button(icon_name="go-next-symbolic")
         fido2_btn.set_valign(Gtk.Align.CENTER)
@@ -2782,11 +2815,19 @@ class DeviceDetailPage(Adw.NavigationPage):
 
     def _fetch_enrolled_methods(self):
         """Fetch enrolled token/keyslot info in background (no unlock needed)."""
+
         def fetch():
-            data = {"fido2": [], "tpm2": [], "recovery": [], "pw_slots": [],
-                    "systemd_version": 0}
+            data = {
+                "fido2": [],
+                "tpm2": [],
+                "recovery": [],
+                "pw_slots": [],
+                "systemd_version": 0,
+            }
             try:
-                data["fido2"] = self.svc.get_tokens_by_type(self.device, "systemd-fido2")
+                data["fido2"] = self.svc.get_tokens_by_type(
+                    self.device, "systemd-fido2"
+                )
             except GLib.Error:
                 pass
             try:
@@ -2794,7 +2835,9 @@ class DeviceDetailPage(Adw.NavigationPage):
             except GLib.Error:
                 pass
             try:
-                data["recovery"] = self.svc.get_tokens_by_type(self.device, "systemd-recovery")
+                data["recovery"] = self.svc.get_tokens_by_type(
+                    self.device, "systemd-recovery"
+                )
             except GLib.Error:
                 pass
             try:
@@ -3038,7 +3081,6 @@ class DeviceDetailPage(Adw.NavigationPage):
             row_fs = Adw.ActionRow(title="Filesystem", subtitle=info["filesystem"])
             self._add_row(self._info_group, row_fs, "info:fs")
 
-
     def _apply_enrollments(self, tokens, pw_slots):
         """List all current enrollments from pre-fetched data."""
         self._clear_dynamic_rows("enroll:")
@@ -3095,7 +3137,10 @@ class DeviceDetailPage(Adw.NavigationPage):
         slot_str = ", ".join(str(s) for s in slots)
         dialog = Adw.AlertDialog(
             heading="Wipe Enrollment",
-            body=f"Remove keyslot(s) {slot_str} from {self.device}?\n\nThis cannot be undone.",
+            body=(
+                f"Remove keyslot(s) {slot_str} from {self.device}?"
+                "\n\nThis cannot be undone."
+            ),
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("wipe", "Wipe")
@@ -3116,8 +3161,11 @@ class DeviceDetailPage(Adw.NavigationPage):
             for slot in slots:
                 try:
                     ok, _out, _err = self.svc.wipe_slot(
-                        self.device, self.passphrase or "",
-                        self.unlock_method, self.unlock_pin, slot
+                        self.device,
+                        self.passphrase or "",
+                        self.unlock_method,
+                        self.unlock_pin,
+                        slot,
                     )
                     if not ok:
                         all_ok = False
@@ -3182,8 +3230,14 @@ class DeviceDetailPage(Adw.NavigationPage):
     def _push_enroll_page(self, page_class):
         nav = self.get_ancestor(Adw.NavigationView)
         if nav:
-            page = page_class(self.svc, self.device, self.passphrase, self,
-                              self.unlock_method, self.unlock_pin)
+            page = page_class(
+                self.svc,
+                self.device,
+                self.passphrase,
+                self,
+                self.unlock_method,
+                self.unlock_pin,
+            )
             nav.push(page)
 
     def refresh_after_enroll(self):
@@ -3195,8 +3249,15 @@ class DeviceDetailPage(Adw.NavigationPage):
 class ManageFido2EnrollPage(Adw.NavigationPage):
     """FIDO2 enrollment page for the management view."""
 
-    def __init__(self, svc, device, passphrase, detail_page,
-                 unlock_method="passphrase", unlock_pin=""):
+    def __init__(
+        self,
+        svc,
+        device,
+        passphrase,
+        detail_page,
+        unlock_method="passphrase",
+        unlock_pin="",
+    ):
         super().__init__(title="Add FIDO2 Key")
         self.svc = svc
         self.device = device
@@ -3238,8 +3299,9 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
         self._group.add(self._fido2_row)
 
         # Single-device / no-device status row
-        self._det_row = Adw.ActionRow(title="No FIDO2 device detected",
-                                      subtitle="Plug in a FIDO2 security key")
+        self._det_row = Adw.ActionRow(
+            title="No FIDO2 device detected", subtitle="Plug in a FIDO2 security key"
+        )
         self._group.add(self._det_row)
 
         # PIN entry
@@ -3278,9 +3340,7 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
         self._refresh_devices()
         self._fetch_enrolled_status()
         self._udev_client = GUdev.Client(subsystems=["hidraw"])
-        self._udev_signal_id = self._udev_client.connect(
-            "uevent", self._on_udev_event
-        )
+        self._udev_signal_id = self._udev_client.connect("uevent", self._on_udev_event)
 
     def _on_udev_event(self, _client, action, _device):
         """Handle hidraw device add/remove via udev."""
@@ -3302,6 +3362,7 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
         self._status_label.remove_css_class("error")
         self._status_label.remove_css_class("success")
         self._spinner.start()
+
         def fetch():
             try:
                 paths = self.svc.check_fido2_enrolled(self.device, dev_paths)
@@ -3309,6 +3370,7 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
                 GLib.idle_add(self._apply_enrolled_status, names)
             except GLib.Error:
                 GLib.idle_add(self._apply_enrolled_status, set())
+
         threading.Thread(target=fetch, daemon=True).start()
 
     def _apply_enrolled_status(self, server_enrolled):
@@ -3324,8 +3386,7 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
 
     def _update_device_ui(self):
         """Update the device selector and button sensitivity."""
-        unenrolled = [d for d in self._fido2_devices
-                      if d[0] not in self._enrolled_devs]
+        unenrolled = [d for d in self._fido2_devices if d[0] not in self._enrolled_devs]
 
         if self._fido2_devices:
             self._fido2_row.set_visible(True)
@@ -3355,7 +3416,7 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
         self._update_pin_enrolled_hint()
 
     def _update_pin_enrolled_hint(self):
-        """Show 'Already enrolled' in PIN placeholder when selected device is enrolled."""
+        """Show 'Already enrolled' in PIN placeholder when enrolled."""
         is_enrolled = False
         if self._fido2_devices:
             idx = self._fido2_dropdown.get_selected()
@@ -3366,8 +3427,8 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
         if is_enrolled or not self._fido2_devices:
             self._pin_entry.set_text("")
             self._pin_entry.set_property(
-                "placeholder-text", "Already enrolled"
-                if is_enrolled else "")
+                "placeholder-text", "Already enrolled" if is_enrolled else ""
+            )
         else:
             self._pin_entry.set_property("placeholder-text", "PIN")
 
@@ -3382,14 +3443,12 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
             self._pin_row.set_sensitive(not is_enrolled)
             if is_enrolled:
                 self._pin_entry.set_text("")
-                self._pin_entry.set_property(
-                    "placeholder-text", "Already enrolled")
+                self._pin_entry.set_property("placeholder-text", "Already enrolled")
             else:
                 self._pin_entry.set_property("placeholder-text", "PIN")
 
     def _get_selected_fido2_device(self):
-        unenrolled = [d for d in self._fido2_devices
-                      if d[0] not in self._enrolled_devs]
+        unenrolled = [d for d in self._fido2_devices if d[0] not in self._enrolled_devs]
         if self._fido2_devices:
             idx = self._fido2_dropdown.get_selected()
             if idx is not None and idx < len(self._fido2_devices):
@@ -3420,8 +3479,12 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
         def do_enroll():
             try:
                 ok, stdout, stderr = self.svc.enroll_fido2(
-                    self.device, self.passphrase or "", pin, fido2_dev,
-                    self.unlock_method, self.unlock_pin
+                    self.device,
+                    self.passphrase or "",
+                    pin,
+                    fido2_dev,
+                    self.unlock_method,
+                    self.unlock_pin,
                 )
             except GLib.Error as e:
                 ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
@@ -3453,8 +3516,15 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
 class ManageTpm2EnrollPage(Adw.NavigationPage):
     """TPM2 enrollment page for the management view (PIN optional)."""
 
-    def __init__(self, svc, device, passphrase, detail_page,
-                 unlock_method="passphrase", unlock_pin=""):
+    def __init__(
+        self,
+        svc,
+        device,
+        passphrase,
+        detail_page,
+        unlock_method="passphrase",
+        unlock_pin="",
+    ):
         super().__init__(title="Add TPM2")
         self.svc = svc
         self.device = device
@@ -3579,8 +3649,12 @@ class ManageTpm2EnrollPage(Adw.NavigationPage):
         def do_enroll():
             try:
                 ok, stdout, stderr = self.svc.enroll_tpm2(
-                    self.device, self.passphrase or "", pin, pcrs,
-                    self.unlock_method, self.unlock_pin
+                    self.device,
+                    self.passphrase or "",
+                    pin,
+                    pcrs,
+                    self.unlock_method,
+                    self.unlock_pin,
                 )
             except GLib.Error as e:
                 ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
@@ -3608,8 +3682,15 @@ class ManageTpm2EnrollPage(Adw.NavigationPage):
 class ManageRecoveryEnrollPage(Adw.NavigationPage):
     """Recovery key enrollment page for the management view."""
 
-    def __init__(self, svc, device, passphrase, detail_page,
-                 unlock_method="passphrase", unlock_pin=""):
+    def __init__(
+        self,
+        svc,
+        device,
+        passphrase,
+        detail_page,
+        unlock_method="passphrase",
+        unlock_pin="",
+    ):
         super().__init__(title="Add Recovery Key")
         self.svc = svc
         self.device = device
@@ -3680,8 +3761,10 @@ class ManageRecoveryEnrollPage(Adw.NavigationPage):
         def do_enroll():
             try:
                 ok, stdout, stderr = self.svc.enroll_recovery_key(
-                    self.device, self.passphrase or "",
-                    self.unlock_method, self.unlock_pin
+                    self.device,
+                    self.passphrase or "",
+                    self.unlock_method,
+                    self.unlock_pin,
                 )
             except GLib.Error as e:
                 ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
@@ -3714,8 +3797,15 @@ class ManageRecoveryEnrollPage(Adw.NavigationPage):
 class ManagePassphraseEnrollPage(Adw.NavigationPage):
     """Passphrase enrollment page for the management view."""
 
-    def __init__(self, svc, device, passphrase, detail_page,
-                 unlock_method="passphrase", unlock_pin=""):
+    def __init__(
+        self,
+        svc,
+        device,
+        passphrase,
+        detail_page,
+        unlock_method="passphrase",
+        unlock_pin="",
+    ):
         super().__init__(title="Add Password")
         self.svc = svc
         self.device = device
@@ -3804,8 +3894,11 @@ class ManagePassphraseEnrollPage(Adw.NavigationPage):
         def do_enroll():
             try:
                 ok, stdout, stderr = self.svc.enroll_passphrase(
-                    self.device, self.passphrase or "", pw,
-                    self.unlock_method, self.unlock_pin
+                    self.device,
+                    self.passphrase or "",
+                    pw,
+                    self.unlock_method,
+                    self.unlock_pin,
                 )
             except GLib.Error as e:
                 ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"

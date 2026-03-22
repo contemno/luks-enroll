@@ -110,17 +110,17 @@ def _load_libblkid():
 
     lib.blkid_probe_lookup_value.restype = ctypes.c_int
     lib.blkid_probe_lookup_value.argtypes = [
-        ctypes.c_void_p,                    # probe
-        ctypes.c_char_p,                    # name
-        ctypes.POINTER(ctypes.c_char_p),    # data (out)
-        ctypes.POINTER(ctypes.c_size_t),    # len (out, may be NULL)
+        ctypes.c_void_p,  # probe
+        ctypes.c_char_p,  # name
+        ctypes.POINTER(ctypes.c_char_p),  # data (out)
+        ctypes.POINTER(ctypes.c_size_t),  # len (out, may be NULL)
     ]
 
     # Cache/iterate API (system-wide LUKS device discovery)
     lib.blkid_get_cache.restype = ctypes.c_int
     lib.blkid_get_cache.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),    # cache (out)
-        ctypes.c_char_p,                    # filename (NULL = default)
+        ctypes.POINTER(ctypes.c_void_p),  # cache (out)
+        ctypes.c_char_p,  # filename (NULL = default)
     ]
 
     lib.blkid_put_cache.restype = None
@@ -137,15 +137,15 @@ def _load_libblkid():
 
     lib.blkid_dev_set_search.restype = ctypes.c_int
     lib.blkid_dev_set_search.argtypes = [
-        ctypes.c_void_p,    # iter
-        ctypes.c_char_p,    # search_type
-        ctypes.c_char_p,    # search_value
+        ctypes.c_void_p,  # iter
+        ctypes.c_char_p,  # search_type
+        ctypes.c_char_p,  # search_value
     ]
 
     lib.blkid_dev_next.restype = ctypes.c_int
     lib.blkid_dev_next.argtypes = [
-        ctypes.c_void_p,                    # iter
-        ctypes.POINTER(ctypes.c_void_p),    # dev (out)
+        ctypes.c_void_p,  # iter
+        ctypes.POINTER(ctypes.c_void_p),  # dev (out)
     ]
 
     lib.blkid_dev_devname.restype = ctypes.c_char_p
@@ -167,10 +167,10 @@ def _load_libblkid():
 
 
 # BLKID_SUBLKS flags for blkid_probe_set_superblocks_flags
-_BLKID_SUBLKS_LABEL = (1 << 1)
-_BLKID_SUBLKS_TYPE = (1 << 5)
-_BLKID_SUBLKS_MAGIC = (1 << 9)
-_BLKID_PARTS_MAGIC = (1 << 1)
+_BLKID_SUBLKS_LABEL = 1 << 1
+_BLKID_SUBLKS_TYPE = 1 << 5
+_BLKID_SUBLKS_MAGIC = 1 << 9
+_BLKID_PARTS_MAGIC = 1 << 1
 
 
 def _wipefs(device):
@@ -204,13 +204,19 @@ def _wipefs(device):
             mag_val = ctypes.c_char_p()
             mag_len = ctypes.c_size_t()
 
-            if lib.blkid_probe_lookup_value(
-                    probe, b"SBMAGIC_OFFSET",
-                    ctypes.byref(offset_val), None) != 0:
+            if (
+                lib.blkid_probe_lookup_value(
+                    probe, b"SBMAGIC_OFFSET", ctypes.byref(offset_val), None
+                )
+                != 0
+            ):
                 continue
-            if lib.blkid_probe_lookup_value(
-                    probe, b"SBMAGIC",
-                    ctypes.byref(mag_val), ctypes.byref(mag_len)) != 0:
+            if (
+                lib.blkid_probe_lookup_value(
+                    probe, b"SBMAGIC", ctypes.byref(mag_val), ctypes.byref(mag_len)
+                )
+                != 0
+            ):
                 continue
 
             offset = int(offset_val.value)
@@ -273,21 +279,21 @@ def _load_libfdisk():
 
     lib.fdisk_assign_device.restype = ctypes.c_int
     lib.fdisk_assign_device.argtypes = [
-        ctypes.c_void_p,    # ctx
-        ctypes.c_char_p,    # fname
-        ctypes.c_int,       # readonly
+        ctypes.c_void_p,  # ctx
+        ctypes.c_char_p,  # fname
+        ctypes.c_int,  # readonly
     ]
 
     lib.fdisk_deassign_device.restype = ctypes.c_int
     lib.fdisk_deassign_device.argtypes = [
-        ctypes.c_void_p,    # ctx
-        ctypes.c_int,       # nosync
+        ctypes.c_void_p,  # ctx
+        ctypes.c_int,  # nosync
     ]
 
     lib.fdisk_create_disklabel.restype = ctypes.c_int
     lib.fdisk_create_disklabel.argtypes = [
-        ctypes.c_void_p,    # ctx
-        ctypes.c_char_p,    # name (e.g. b"gpt")
+        ctypes.c_void_p,  # ctx
+        ctypes.c_char_p,  # name (e.g. b"gpt")
     ]
 
     lib.fdisk_write_disklabel.restype = ctypes.c_int
@@ -304,20 +310,20 @@ def _load_libfdisk():
 
     lib.fdisk_partition_start_follow_default.restype = ctypes.c_int
     lib.fdisk_partition_start_follow_default.argtypes = [
-        ctypes.c_void_p,    # pa
-        ctypes.c_int,       # enable
+        ctypes.c_void_p,  # pa
+        ctypes.c_int,  # enable
     ]
 
     lib.fdisk_partition_end_follow_default.restype = ctypes.c_int
     lib.fdisk_partition_end_follow_default.argtypes = [
-        ctypes.c_void_p,    # pa
-        ctypes.c_int,       # enable
+        ctypes.c_void_p,  # pa
+        ctypes.c_int,  # enable
     ]
 
     lib.fdisk_partition_set_type.restype = ctypes.c_int
     lib.fdisk_partition_set_type.argtypes = [
-        ctypes.c_void_p,    # pa
-        ctypes.c_void_p,    # type
+        ctypes.c_void_p,  # pa
+        ctypes.c_void_p,  # type
     ]
 
     lib.fdisk_new_parttype.restype = ctypes.c_void_p
@@ -328,15 +334,15 @@ def _load_libfdisk():
 
     lib.fdisk_parttype_set_typestr.restype = ctypes.c_int
     lib.fdisk_parttype_set_typestr.argtypes = [
-        ctypes.c_void_p,    # type
-        ctypes.c_char_p,    # str (GUID)
+        ctypes.c_void_p,  # type
+        ctypes.c_char_p,  # str (GUID)
     ]
 
     lib.fdisk_add_partition.restype = ctypes.c_int
     lib.fdisk_add_partition.argtypes = [
-        ctypes.c_void_p,                    # ctx
-        ctypes.c_void_p,                    # pa
-        ctypes.POINTER(ctypes.c_size_t),    # partno (out, may be NULL)
+        ctypes.c_void_p,  # ctx
+        ctypes.c_void_p,  # pa
+        ctypes.POINTER(ctypes.c_size_t),  # partno (out, may be NULL)
     ]
 
     return lib
@@ -384,9 +390,7 @@ def _sgdisk_zap_and_partition(device):
         pt = lib.fdisk_new_parttype()
         if not pt:
             return False, "fdisk_new_parttype() failed"
-        rc = lib.fdisk_parttype_set_typestr(
-            pt, _LUKS_PARTITION_TYPE_GUID.encode()
-        )
+        rc = lib.fdisk_parttype_set_typestr(pt, _LUKS_PARTITION_TYPE_GUID.encode())
         if rc != 0:
             return False, f"fdisk_parttype_set_typestr() failed: rc={rc}"
 
@@ -479,7 +483,7 @@ def _load_libcryptsetup():
         ctypes.c_void_p,  # cd
         ctypes.c_char_p,  # name (NULL = verify only)
         ctypes.c_char_p,  # type (token type filter, NULL = any)
-        ctypes.c_int,     # token (-1 = any)
+        ctypes.c_int,  # token (-1 = any)
         ctypes.c_char_p,  # pin
         ctypes.c_size_t,  # pin_size
         ctypes.c_void_p,  # usrptr
@@ -490,7 +494,7 @@ def _load_libcryptsetup():
     lib.crypt_activate_by_passphrase.argtypes = [
         ctypes.c_void_p,  # cd
         ctypes.c_char_p,  # name (NULL = just verify)
-        ctypes.c_int,     # keyslot (-1 = any)
+        ctypes.c_int,  # keyslot (-1 = any)
         ctypes.c_char_p,  # passphrase
         ctypes.c_size_t,  # passphrase_size
         ctypes.c_uint32,  # flags
@@ -499,7 +503,7 @@ def _load_libcryptsetup():
     lib.crypt_keyslot_add_by_passphrase.restype = ctypes.c_int
     lib.crypt_keyslot_add_by_passphrase.argtypes = [
         ctypes.c_void_p,  # cd
-        ctypes.c_int,     # keyslot
+        ctypes.c_int,  # keyslot
         ctypes.c_char_p,  # existing passphrase
         ctypes.c_size_t,  # existing passphrase size
         ctypes.c_char_p,  # new passphrase
@@ -511,32 +515,32 @@ def _load_libcryptsetup():
 
     lib.crypt_volume_key_get.restype = ctypes.c_int
     lib.crypt_volume_key_get.argtypes = [
-        ctypes.c_void_p,                    # cd
-        ctypes.c_int,                       # keyslot
-        ctypes.c_char_p,                    # volume_key (output buffer)
-        ctypes.POINTER(ctypes.c_size_t),    # volume_key_size (in/out)
-        ctypes.c_char_p,                    # passphrase
-        ctypes.c_size_t,                    # passphrase_size
+        ctypes.c_void_p,  # cd
+        ctypes.c_int,  # keyslot
+        ctypes.c_char_p,  # volume_key (output buffer)
+        ctypes.POINTER(ctypes.c_size_t),  # volume_key_size (in/out)
+        ctypes.c_char_p,  # passphrase
+        ctypes.c_size_t,  # passphrase_size
     ]
 
     lib.crypt_keyslot_destroy.restype = ctypes.c_int
     lib.crypt_keyslot_destroy.argtypes = [
         ctypes.c_void_p,  # cd
-        ctypes.c_int,     # keyslot
+        ctypes.c_int,  # keyslot
     ]
 
     lib.crypt_token_json_set.restype = ctypes.c_int
     lib.crypt_token_json_set.argtypes = [
         ctypes.c_void_p,  # cd
-        ctypes.c_int,     # token (-1 = auto-allocate)
+        ctypes.c_int,  # token (-1 = auto-allocate)
         ctypes.c_char_p,  # json (NULL = remove token)
     ]
 
     lib.crypt_token_json_get.restype = ctypes.c_int
     lib.crypt_token_json_get.argtypes = [
-        ctypes.c_void_p,                    # cd
-        ctypes.c_int,                       # token
-        ctypes.POINTER(ctypes.c_char_p),    # json (output)
+        ctypes.c_void_p,  # cd
+        ctypes.c_int,  # token
+        ctypes.POINTER(ctypes.c_char_p),  # json (output)
     ]
 
     return lib
@@ -685,13 +689,20 @@ def verify_luks_token(device, token_type, pin=""):
         key_size = ctypes.c_size_t(lib.crypt_get_volume_key_size(cd))
         vk_buf = ctypes.create_string_buffer(key_size.value)
         ret = lib.crypt_volume_key_get(
-            cd, -1, vk_buf, ctypes.byref(key_size), pw, len(pw),
+            cd,
+            -1,
+            vk_buf,
+            ctypes.byref(key_size),
+            pw,
+            len(pw),
         )
         if ret >= 0:
             real_dev = os.path.realpath(device)
             with _volume_key_cache_lock:
                 _volume_key_cache[real_dev] = (
-                    vk_buf.raw[:key_size.value], key_size.value, time.monotonic()
+                    vk_buf.raw[: key_size.value],
+                    key_size.value,
+                    time.monotonic(),
                 )
             return True, ret  # ret is the keyslot number
         return False, f"Token unlock failed (error {ret})"
@@ -752,12 +763,13 @@ def _make_recovery_key():
     for byte in raw:
         chars.append(_MODHEX[byte >> 4])
         chars.append(_MODHEX[byte & 0x0F])
-    return "-".join("".join(chars[i:i + 8]) for i in range(0, 64, 8))
+    return "-".join("".join(chars[i : i + 8]) for i in range(0, 64, 8))
 
 
 # ---------------------------------------------------------------------------
 # Volume key extraction (centralized unlock helper)
 # ---------------------------------------------------------------------------
+
 
 def _get_volume_key(device, unlock_method, passphrase, unlock_pin=""):
     """Get the volume key for a LUKS2 device.
@@ -802,7 +814,7 @@ def _get_volume_key(device, unlock_method, passphrase, unlock_pin=""):
         )
         if ret < 0:
             raise RuntimeError(f"Failed to get volume key (error {ret})")
-        return vk_buf.raw[:key_size.value], key_size.value
+        return vk_buf.raw[: key_size.value], key_size.value
     finally:
         lib.crypt_free(cd)
 
@@ -827,8 +839,10 @@ def _derive_passphrase_from_token(device, token_type, pin=""):
 # Keyslot / token helpers via libcryptsetup
 # ---------------------------------------------------------------------------
 
+
 class _CryptPbkdfType(ctypes.Structure):
     """struct crypt_pbkdf_type for libcryptsetup."""
+
     _fields_ = [
         ("type", ctypes.c_char_p),
         ("hash", ctypes.c_char_p),
@@ -840,8 +854,9 @@ class _CryptPbkdfType(ctypes.Structure):
     ]
 
 
-def _add_keyslot_by_volume_key(device, volume_key, vk_size, new_passphrase,
-                                minimal_pbkdf=False):
+def _add_keyslot_by_volume_key(
+    device, volume_key, vk_size, new_passphrase, minimal_pbkdf=False
+):
     """Add a new keyslot using the volume key. Returns the keyslot number.
 
     If minimal_pbkdf is True, use pbkdf2 with minimal iterations (for
@@ -867,7 +882,11 @@ def _add_keyslot_by_volume_key(device, volume_key, vk_size, new_passphrase,
             ret = lib.crypt_set_pbkdf_type(cd, ctypes.byref(pbkdf))
             if ret < 0:
                 raise RuntimeError(f"crypt_set_pbkdf_type failed: {ret}")
-        pw = new_passphrase if isinstance(new_passphrase, bytes) else new_passphrase.encode()
+        pw = (
+            new_passphrase
+            if isinstance(new_passphrase, bytes)
+            else new_passphrase.encode()
+        )
         vk = volume_key if isinstance(volume_key, bytes) else volume_key.encode()
         ret = lib.crypt_keyslot_add_by_volume_key(cd, -1, vk, vk_size, pw, len(pw))
         if ret < 0:
@@ -987,17 +1006,19 @@ def _load_libfido2():
 
     lib.fido_cred_set_user.restype = ctypes.c_int
     lib.fido_cred_set_user.argtypes = [
-        ctypes.c_void_p,   # cred
-        ctypes.c_char_p,   # user_id
-        ctypes.c_size_t,   # user_id_len
-        ctypes.c_char_p,   # name
-        ctypes.c_char_p,   # display_name
-        ctypes.c_char_p,   # icon
+        ctypes.c_void_p,  # cred
+        ctypes.c_char_p,  # user_id
+        ctypes.c_size_t,  # user_id_len
+        ctypes.c_char_p,  # name
+        ctypes.c_char_p,  # display_name
+        ctypes.c_char_p,  # icon
     ]
 
     lib.fido_cred_set_clientdata_hash.restype = ctypes.c_int
     lib.fido_cred_set_clientdata_hash.argtypes = [
-        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
     ]
 
     lib.fido_cred_set_extensions.restype = ctypes.c_int
@@ -1011,7 +1032,9 @@ def _load_libfido2():
 
     lib.fido_dev_make_cred.restype = ctypes.c_int
     lib.fido_dev_make_cred.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_char_p,
     ]
 
     lib.fido_cred_id_ptr.restype = ctypes.POINTER(ctypes.c_uint8)
@@ -1032,7 +1055,9 @@ def _load_libfido2():
 
     lib.fido_assert_set_clientdata_hash.restype = ctypes.c_int
     lib.fido_assert_set_clientdata_hash.argtypes = [
-        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
     ]
 
     lib.fido_assert_set_extensions.restype = ctypes.c_int
@@ -1040,12 +1065,16 @@ def _load_libfido2():
 
     lib.fido_assert_set_hmac_salt.restype = ctypes.c_int
     lib.fido_assert_set_hmac_salt.argtypes = [
-        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
     ]
 
     lib.fido_assert_allow_cred.restype = ctypes.c_int
     lib.fido_assert_allow_cred.argtypes = [
-        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
     ]
 
     lib.fido_assert_set_up.restype = ctypes.c_int
@@ -1056,7 +1085,9 @@ def _load_libfido2():
 
     lib.fido_dev_get_assert.restype = ctypes.c_int
     lib.fido_dev_get_assert.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_char_p,
     ]
 
     lib.fido_assert_hmac_secret_ptr.restype = ctypes.POINTER(ctypes.c_uint8)
@@ -1074,9 +1105,9 @@ def _load_libfido2():
 
     lib.fido_dev_info_manifest.restype = ctypes.c_int
     lib.fido_dev_info_manifest.argtypes = [
-        ctypes.c_void_p,                    # devlist
-        ctypes.c_size_t,                    # ilen (max entries)
-        ctypes.POINTER(ctypes.c_size_t),    # olen (actual count, output)
+        ctypes.c_void_p,  # devlist
+        ctypes.c_size_t,  # ilen (max entries)
+        ctypes.POINTER(ctypes.c_size_t),  # olen (actual count, output)
     ]
 
     lib.fido_dev_info_ptr.restype = ctypes.c_void_p
@@ -1091,9 +1122,9 @@ def _load_libfido2():
 
     lib.fido_dev_get_touch_status.restype = ctypes.c_int
     lib.fido_dev_get_touch_status.argtypes = [
-        ctypes.c_void_p,             # dev
+        ctypes.c_void_p,  # dev
         ctypes.POINTER(ctypes.c_int),  # touched (output)
-        ctypes.c_int,                # ms (poll timeout)
+        ctypes.c_int,  # ms (poll timeout)
     ]
 
     return lib
@@ -1116,7 +1147,9 @@ def _fido2_list_devices(fido2_lib):
     try:
         found = ctypes.c_size_t(0)
         rc = fido2_lib.fido_dev_info_manifest(
-            devlist, max_devs, ctypes.byref(found),
+            devlist,
+            max_devs,
+            ctypes.byref(found),
         )
         if rc != FIDO_OK or found.value == 0:
             raise RuntimeError("No FIDO2 device found")
@@ -1148,9 +1181,7 @@ def _fido2_get_hmac_secret(fido2_lib, dev, cred_id_bytes, salt_bytes, pin=None):
         fido2_lib.fido_assert_set_clientdata_hash(assert_ptr, zeroes, 32)
         fido2_lib.fido_assert_set_extensions(assert_ptr, FIDO_EXT_HMAC_SECRET)
         fido2_lib.fido_assert_set_hmac_salt(assert_ptr, salt_bytes, len(salt_bytes))
-        fido2_lib.fido_assert_allow_cred(
-            assert_ptr, cred_id_bytes, len(cred_id_bytes)
-        )
+        fido2_lib.fido_assert_allow_cred(assert_ptr, cred_id_bytes, len(cred_id_bytes))
         fido2_lib.fido_assert_set_up(assert_ptr, FIDO_OPT_TRUE)
         fido2_lib.fido_assert_set_uv(assert_ptr, FIDO_OPT_FALSE)
 
@@ -1192,20 +1223,21 @@ def _fido2_probe_credential(fido2_lib, dev, cred_id):
         zeroes = b"\x00" * 32
         fido2_lib.fido_assert_set_rp(assert_ptr, _FIDO2_RP_ID.encode())
         fido2_lib.fido_assert_set_clientdata_hash(assert_ptr, zeroes, 32)
-        fido2_lib.fido_assert_allow_cred(
-            assert_ptr, cred_id, len(cred_id)
-        )
+        fido2_lib.fido_assert_allow_cred(assert_ptr, cred_id, len(cred_id))
         fido2_lib.fido_assert_set_up(assert_ptr, FIDO_OPT_FALSE)
         fido2_lib.fido_assert_set_uv(assert_ptr, FIDO_OPT_OMIT)
 
         ret = fido2_lib.fido_dev_get_assert(dev, assert_ptr, None)
-        print(f"    _fido2_probe_credential: ret={ret:#x}",
-              file=sys.stderr)
+        print(f"    _fido2_probe_credential: ret={ret:#x}", file=sys.stderr)
         if ret == FIDO_ERR_NO_CREDENTIALS:
             return False
-        if ret in (FIDO_OK, FIDO_ERR_UP_REQUIRED,
-                   FIDO_ERR_PIN_NOT_SET, FIDO_ERR_PIN_REQUIRED,
-                   FIDO_ERR_PIN_INVALID):
+        if ret in (
+            FIDO_OK,
+            FIDO_ERR_UP_REQUIRED,
+            FIDO_ERR_PIN_NOT_SET,
+            FIDO_ERR_PIN_REQUIRED,
+            FIDO_ERR_PIN_INVALID,
+        ):
             return True
         return None
     finally:
@@ -1225,7 +1257,9 @@ def _fido2_touch_select(fido2_lib, devs):
         for path, dev in devs.items():
             touched = ctypes.c_int(0)
             ret = fido2_lib.fido_dev_get_touch_status(
-                dev, ctypes.byref(touched), 200,
+                dev,
+                ctypes.byref(touched),
+                200,
             )
             if ret == FIDO_OK and touched.value:
                 for other_path, other_dev in devs.items():
@@ -1259,13 +1293,10 @@ def _fido2_enroll(fido2_device, pin):
             raise RuntimeError("fido_cred_new failed")
         try:
             fido2_lib.fido_cred_set_type(cred, COSE_ES256)
-            fido2_lib.fido_cred_set_rp(
-                cred, _FIDO2_RP_ID.encode(), b"Encrypted Volume"
-            )
+            fido2_lib.fido_cred_set_rp(cred, _FIDO2_RP_ID.encode(), b"Encrypted Volume")
             user_id = os.urandom(32)
             fido2_lib.fido_cred_set_user(
-                cred, user_id, len(user_id),
-                b"user", b"user", None
+                cred, user_id, len(user_id), b"user", b"user", None
             )
             zeroes = b"\x00" * 32
             fido2_lib.fido_cred_set_clientdata_hash(cred, zeroes, 32)
@@ -1325,10 +1356,12 @@ def _fido2_unlock_from_token(device, pin=""):
     fido2_tokens = []
     for _tid, tinfo in meta.get("tokens", {}).items():
         if tinfo.get("type") == "systemd-fido2":
-            fido2_tokens.append((
-                base64.b64decode(tinfo["fido2-credential"]),
-                base64.b64decode(tinfo["fido2-salt"]),
-            ))
+            fido2_tokens.append(
+                (
+                    base64.b64decode(tinfo["fido2-credential"]),
+                    base64.b64decode(tinfo["fido2-salt"]),
+                )
+            )
     if not fido2_tokens:
         raise RuntimeError("No systemd-fido2 token found")
 
@@ -1371,7 +1404,8 @@ def _fido2_unlock_from_token(device, pin=""):
             selected_path = next(iter(dev_creds))
         else:
             selected_path = _fido2_touch_select(
-                fido2_lib, {p: open_devs[p] for p in dev_creds},
+                fido2_lib,
+                {p: open_devs[p] for p in dev_creds},
             )
 
         # --- Phase 3: Unlock with PIN on selected device only ---
@@ -1382,7 +1416,11 @@ def _fido2_unlock_from_token(device, pin=""):
         for cred_id, salt in dev_creds[selected_path]:
             try:
                 secret = _fido2_get_hmac_secret(
-                    fido2_lib, selected_dev, cred_id, salt, pin or None,
+                    fido2_lib,
+                    selected_dev,
+                    cred_id,
+                    salt,
+                    pin or None,
                 )
                 return secret
             except RuntimeError as e:
@@ -1448,8 +1486,8 @@ def _load_libtss2():
     esys.Esys_Initialize.restype = ctypes.c_uint32
     esys.Esys_Initialize.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),  # esys_context
-        ctypes.c_void_p,                  # tcti (NULL = auto)
-        ctypes.c_void_p,                  # abiVersion (NULL = default)
+        ctypes.c_void_p,  # tcti (NULL = auto)
+        ctypes.c_void_p,  # abiVersion (NULL = default)
     ]
 
     esys.Esys_Finalize.restype = None
@@ -1467,15 +1505,15 @@ def _load_libtss2():
 
     esys.Esys_CreatePrimary.restype = ctypes.c_uint32
     esys.Esys_CreatePrimary.argtypes = [
-        ctypes.c_void_p,                  # esys_context
-        ctypes.c_uint32,                  # primaryHandle (ESYS_TR)
-        ctypes.c_uint32,                  # shandle1
-        ctypes.c_uint32,                  # shandle2
-        ctypes.c_uint32,                  # shandle3
-        ctypes.c_void_p,                  # inSensitive (TPM2B_SENSITIVE_CREATE*)
-        ctypes.c_void_p,                  # inPublic (TPM2B_PUBLIC*)
-        ctypes.c_void_p,                  # outsideInfo (TPM2B_DATA*)
-        ctypes.c_void_p,                  # creationPCR (TPML_PCR_SELECTION*)
+        ctypes.c_void_p,  # esys_context
+        ctypes.c_uint32,  # primaryHandle (ESYS_TR)
+        ctypes.c_uint32,  # shandle1
+        ctypes.c_uint32,  # shandle2
+        ctypes.c_uint32,  # shandle3
+        ctypes.c_void_p,  # inSensitive (TPM2B_SENSITIVE_CREATE*)
+        ctypes.c_void_p,  # inPublic (TPM2B_PUBLIC*)
+        ctypes.c_void_p,  # outsideInfo (TPM2B_DATA*)
+        ctypes.c_void_p,  # creationPCR (TPML_PCR_SELECTION*)
         ctypes.POINTER(ctypes.c_uint32),  # objectHandle (ESYS_TR*)
         ctypes.POINTER(ctypes.c_void_p),  # outPublic (TPM2B_PUBLIC**)
         ctypes.POINTER(ctypes.c_void_p),  # creationData
@@ -1485,16 +1523,16 @@ def _load_libtss2():
 
     esys.Esys_StartAuthSession.restype = ctypes.c_uint32
     esys.Esys_StartAuthSession.argtypes = [
-        ctypes.c_void_p,                  # esys_context
-        ctypes.c_uint32,                  # tpmKey (ESYS_TR)
-        ctypes.c_uint32,                  # bind (ESYS_TR)
-        ctypes.c_uint32,                  # shandle1
-        ctypes.c_uint32,                  # shandle2
-        ctypes.c_uint32,                  # shandle3
-        ctypes.c_void_p,                  # nonceCaller (TPM2B_NONCE*)
-        ctypes.c_uint8,                   # sessionType (TPM2_SE)
-        ctypes.c_void_p,                  # symmetric (TPMT_SYM_DEF*)
-        ctypes.c_uint16,                  # authHash (TPMI_ALG_HASH)
+        ctypes.c_void_p,  # esys_context
+        ctypes.c_uint32,  # tpmKey (ESYS_TR)
+        ctypes.c_uint32,  # bind (ESYS_TR)
+        ctypes.c_uint32,  # shandle1
+        ctypes.c_uint32,  # shandle2
+        ctypes.c_uint32,  # shandle3
+        ctypes.c_void_p,  # nonceCaller (TPM2B_NONCE*)
+        ctypes.c_uint8,  # sessionType (TPM2_SE)
+        ctypes.c_void_p,  # symmetric (TPMT_SYM_DEF*)
+        ctypes.c_uint16,  # authHash (TPMI_ALG_HASH)
         ctypes.POINTER(ctypes.c_uint32),  # sessionHandle (ESYS_TR*)
     ]
 
@@ -1520,25 +1558,25 @@ def _load_libtss2():
 
     esys.Esys_PolicyGetDigest.restype = ctypes.c_uint32
     esys.Esys_PolicyGetDigest.argtypes = [
-        ctypes.c_void_p,                  # esys_context
-        ctypes.c_uint32,                  # policySession
-        ctypes.c_uint32,                  # shandle1
-        ctypes.c_uint32,                  # shandle2
-        ctypes.c_uint32,                  # shandle3
+        ctypes.c_void_p,  # esys_context
+        ctypes.c_uint32,  # policySession
+        ctypes.c_uint32,  # shandle1
+        ctypes.c_uint32,  # shandle2
+        ctypes.c_uint32,  # shandle3
         ctypes.POINTER(ctypes.c_void_p),  # policyDigest (TPM2B_DIGEST**)
     ]
 
     esys.Esys_Create.restype = ctypes.c_uint32
     esys.Esys_Create.argtypes = [
-        ctypes.c_void_p,                  # esys_context
-        ctypes.c_uint32,                  # parentHandle (ESYS_TR)
-        ctypes.c_uint32,                  # shandle1
-        ctypes.c_uint32,                  # shandle2
-        ctypes.c_uint32,                  # shandle3
-        ctypes.c_void_p,                  # inSensitive (TPM2B_SENSITIVE_CREATE*)
-        ctypes.c_void_p,                  # inPublic (TPM2B_PUBLIC*)
-        ctypes.c_void_p,                  # outsideInfo (TPM2B_DATA*)
-        ctypes.c_void_p,                  # creationPCR (TPML_PCR_SELECTION*)
+        ctypes.c_void_p,  # esys_context
+        ctypes.c_uint32,  # parentHandle (ESYS_TR)
+        ctypes.c_uint32,  # shandle1
+        ctypes.c_uint32,  # shandle2
+        ctypes.c_uint32,  # shandle3
+        ctypes.c_void_p,  # inSensitive (TPM2B_SENSITIVE_CREATE*)
+        ctypes.c_void_p,  # inPublic (TPM2B_PUBLIC*)
+        ctypes.c_void_p,  # outsideInfo (TPM2B_DATA*)
+        ctypes.c_void_p,  # creationPCR (TPML_PCR_SELECTION*)
         ctypes.POINTER(ctypes.c_void_p),  # outPrivate (TPM2B_PRIVATE**)
         ctypes.POINTER(ctypes.c_void_p),  # outPublic (TPM2B_PUBLIC**)
         ctypes.POINTER(ctypes.c_void_p),  # creationData
@@ -1548,23 +1586,23 @@ def _load_libtss2():
 
     esys.Esys_Load.restype = ctypes.c_uint32
     esys.Esys_Load.argtypes = [
-        ctypes.c_void_p,                  # esys_context
-        ctypes.c_uint32,                  # parentHandle (ESYS_TR)
-        ctypes.c_uint32,                  # shandle1
-        ctypes.c_uint32,                  # shandle2
-        ctypes.c_uint32,                  # shandle3
-        ctypes.c_void_p,                  # inPrivate (TPM2B_PRIVATE*)
-        ctypes.c_void_p,                  # inPublic (TPM2B_PUBLIC*)
+        ctypes.c_void_p,  # esys_context
+        ctypes.c_uint32,  # parentHandle (ESYS_TR)
+        ctypes.c_uint32,  # shandle1
+        ctypes.c_uint32,  # shandle2
+        ctypes.c_uint32,  # shandle3
+        ctypes.c_void_p,  # inPrivate (TPM2B_PRIVATE*)
+        ctypes.c_void_p,  # inPublic (TPM2B_PUBLIC*)
         ctypes.POINTER(ctypes.c_uint32),  # objectHandle (ESYS_TR*)
     ]
 
     esys.Esys_Unseal.restype = ctypes.c_uint32
     esys.Esys_Unseal.argtypes = [
-        ctypes.c_void_p,                  # esys_context
-        ctypes.c_uint32,                  # itemHandle (ESYS_TR)
-        ctypes.c_uint32,                  # shandle1 (policy session)
-        ctypes.c_uint32,                  # shandle2
-        ctypes.c_uint32,                  # shandle3
+        ctypes.c_void_p,  # esys_context
+        ctypes.c_uint32,  # itemHandle (ESYS_TR)
+        ctypes.c_uint32,  # shandle1 (policy session)
+        ctypes.c_uint32,  # shandle2
+        ctypes.c_uint32,  # shandle3
         ctypes.POINTER(ctypes.c_void_p),  # outData (TPM2B_SENSITIVE_DATA**)
     ]
 
@@ -1576,29 +1614,29 @@ def _load_libtss2():
 
     esys.Esys_TR_FromTPMPublic.restype = ctypes.c_uint32
     esys.Esys_TR_FromTPMPublic.argtypes = [
-        ctypes.c_void_p,                  # esys_context
-        ctypes.c_uint32,                  # tpm_handle
-        ctypes.c_uint32,                  # shandle1
-        ctypes.c_uint32,                  # shandle2
-        ctypes.c_uint32,                  # shandle3
+        ctypes.c_void_p,  # esys_context
+        ctypes.c_uint32,  # tpm_handle
+        ctypes.c_uint32,  # shandle1
+        ctypes.c_uint32,  # shandle2
+        ctypes.c_uint32,  # shandle3
         ctypes.POINTER(ctypes.c_uint32),  # object (ESYS_TR*)
     ]
 
     esys.Esys_TR_Serialize.restype = ctypes.c_uint32
     esys.Esys_TR_Serialize.argtypes = [
-        ctypes.c_void_p,                  # esys_context
-        ctypes.c_uint32,                  # object (ESYS_TR)
+        ctypes.c_void_p,  # esys_context
+        ctypes.c_uint32,  # object (ESYS_TR)
         ctypes.POINTER(ctypes.c_void_p),  # buffer (uint8_t**)
         ctypes.POINTER(ctypes.c_size_t),  # buffer_size (size_t*)
     ]
 
     esys.Esys_ReadPublic.restype = ctypes.c_uint32
     esys.Esys_ReadPublic.argtypes = [
-        ctypes.c_void_p,                  # esys_context
-        ctypes.c_uint32,                  # objectHandle
-        ctypes.c_uint32,                  # shandle1
-        ctypes.c_uint32,                  # shandle2
-        ctypes.c_uint32,                  # shandle3
+        ctypes.c_void_p,  # esys_context
+        ctypes.c_uint32,  # objectHandle
+        ctypes.c_uint32,  # shandle1
+        ctypes.c_uint32,  # shandle2
+        ctypes.c_uint32,  # shandle3
         ctypes.POINTER(ctypes.c_void_p),  # outPublic (TPM2B_PUBLIC**)
         ctypes.POINTER(ctypes.c_void_p),  # name
         ctypes.POINTER(ctypes.c_void_p),  # qualifiedName
@@ -1607,18 +1645,18 @@ def _load_libtss2():
     # Marshaling functions
     mu.Tss2_MU_TPM2B_PUBLIC_Marshal.restype = ctypes.c_uint32
     mu.Tss2_MU_TPM2B_PUBLIC_Marshal.argtypes = [
-        ctypes.c_void_p,                  # src (TPM2B_PUBLIC*)
-        ctypes.c_char_p,                  # buffer
-        ctypes.c_size_t,                  # buffer_size
+        ctypes.c_void_p,  # src (TPM2B_PUBLIC*)
+        ctypes.c_char_p,  # buffer
+        ctypes.c_size_t,  # buffer_size
         ctypes.POINTER(ctypes.c_size_t),  # offset
     ]
 
     mu.Tss2_MU_TPM2B_PUBLIC_Unmarshal.restype = ctypes.c_uint32
     mu.Tss2_MU_TPM2B_PUBLIC_Unmarshal.argtypes = [
-        ctypes.c_char_p,                  # buffer
-        ctypes.c_size_t,                  # buffer_size
+        ctypes.c_char_p,  # buffer
+        ctypes.c_size_t,  # buffer_size
         ctypes.POINTER(ctypes.c_size_t),  # offset
-        ctypes.c_void_p,                  # dest (TPM2B_PUBLIC*)
+        ctypes.c_void_p,  # dest (TPM2B_PUBLIC*)
     ]
 
     mu.Tss2_MU_TPM2B_PRIVATE_Marshal.restype = ctypes.c_uint32
@@ -1686,13 +1724,16 @@ def _tpm2_build_pcr_selection(pcrs_str, bank=TPM2_ALG_SHA256):
     # Build the pcrSelect bitmask (3 bytes = 24 PCRs)
     pcr_select = [0, 0, 0]
     for pcr in pcr_nums:
-        pcr_select[pcr // 8] |= (1 << (pcr % 8))
-    # TPML_PCR_SELECTION: count(u32) + TPMS_PCR_SELECTION(hash(u16) + sizeofSelect(u8) + pcrSelect)
-    return struct.pack(">I H B 3s",
-                       1,           # count = 1 bank
-                       bank,        # hash algorithm
-                       3,           # sizeofSelect
-                       bytes(pcr_select))
+        pcr_select[pcr // 8] |= 1 << (pcr % 8)
+    # TPML_PCR_SELECTION: count(u32)
+    # + TPMS_PCR_SELECTION(hash(u16) + sizeofSelect(u8) + pcrSelect)
+    return struct.pack(
+        ">I H B 3s",
+        1,  # count = 1 bank
+        bank,  # hash algorithm
+        3,  # sizeofSelect
+        bytes(pcr_select),
+    )
 
 
 def _tpm2_build_ecc_srk_template():
@@ -1701,21 +1742,31 @@ def _tpm2_build_ecc_srk_template():
     Matches the TCG TPM2 ECC SRK template used by systemd.
     """
 
-    obj_attrs = (TPMA_OBJECT_FIXEDTPM | TPMA_OBJECT_FIXEDPARENT |
-                 TPMA_OBJECT_SENSITIVEDATAORIGIN | TPMA_OBJECT_USERWITHAUTH |
-                 TPMA_OBJECT_NODA | TPMA_OBJECT_RESTRICTED | TPMA_OBJECT_DECRYPT)
+    obj_attrs = (
+        TPMA_OBJECT_FIXEDTPM
+        | TPMA_OBJECT_FIXEDPARENT
+        | TPMA_OBJECT_SENSITIVEDATAORIGIN
+        | TPMA_OBJECT_USERWITHAUTH
+        | TPMA_OBJECT_NODA
+        | TPMA_OBJECT_RESTRICTED
+        | TPMA_OBJECT_DECRYPT
+    )
 
     # TPMT_PUBLIC in wire format for ECC SRK
-    public_area = struct.pack(">HH I H",
-                              TPM2_ALG_ECC,      # type
-                              TPM2_ALG_SHA256,    # nameAlg
-                              obj_attrs,          # objectAttributes
-                              0)                  # authPolicy.size = 0
+    public_area = struct.pack(
+        ">HH I H",
+        TPM2_ALG_ECC,  # type
+        TPM2_ALG_SHA256,  # nameAlg
+        obj_attrs,  # objectAttributes
+        0,
+    )  # authPolicy.size = 0
     # TPMS_ECC_PARMS: symmetric + scheme + curveID + kdf
-    public_area += struct.pack(">HHH",
-                               TPM2_ALG_AES,     # symmetric.algorithm
-                               128,              # symmetric.keyBits
-                               TPM2_ALG_CFB)     # symmetric.mode
+    public_area += struct.pack(
+        ">HHH",
+        TPM2_ALG_AES,  # symmetric.algorithm
+        128,  # symmetric.keyBits
+        TPM2_ALG_CFB,
+    )  # symmetric.mode
     public_area += struct.pack(">H", TPM2_ALG_NULL)  # scheme
     public_area += struct.pack(">H", TPM2_ECC_NIST_P256)  # curveID
     public_area += struct.pack(">H", TPM2_ALG_NULL)  # kdf
@@ -1735,10 +1786,12 @@ def _tpm2_build_seal_template(policy_digest, use_pin=False):
         obj_attrs |= TPMA_OBJECT_USERWITHAUTH
 
     # TPMT_PUBLIC for KEYEDHASH sealed object
-    public_area = struct.pack(">HH I",
-                              TPM2_ALG_KEYEDHASH,  # type
-                              TPM2_ALG_SHA256,      # nameAlg
-                              obj_attrs)            # objectAttributes
+    public_area = struct.pack(
+        ">HH I",
+        TPM2_ALG_KEYEDHASH,  # type
+        TPM2_ALG_SHA256,  # nameAlg
+        obj_attrs,
+    )  # objectAttributes
     # authPolicy (the computed policy digest)
     public_area += struct.pack(">H", len(policy_digest)) + policy_digest
     # TPMS_KEYEDHASH_PARMS: scheme = NULL
@@ -1809,7 +1862,7 @@ def _tpm2_marshal_from_ptr(mu_lib, marshal_func, struct_ptr):
     rc = marshal_func(struct_ptr, buf, _MARSHAL_BUF_MAX, ctypes.byref(offset))
     if rc != 0:
         raise RuntimeError(f"Marshal failed: 0x{rc:08x}")
-    return buf.raw[:offset.value]
+    return buf.raw[: offset.value]
 
 
 def _tpm2_read_tpm2b_size(ptr):
@@ -1825,7 +1878,7 @@ def _tpm2_read_sensitive_data(ptr):
     """
     size = _tpm2_read_tpm2b_size(ptr)
     raw = ctypes.string_at(ptr, 2 + size)
-    return raw[2:2 + size]
+    return raw[2 : 2 + size]
 
 
 def _tpm2_serialize_tr(esys, ctx, handle):
@@ -1836,7 +1889,10 @@ def _tpm2_serialize_tr(esys, ctx, handle):
     buf_ptr = ctypes.c_void_p()
     buf_size = ctypes.c_size_t()
     rc = esys.Esys_TR_Serialize(
-        ctx, handle, ctypes.byref(buf_ptr), ctypes.byref(buf_size),
+        ctx,
+        handle,
+        ctypes.byref(buf_ptr),
+        ctypes.byref(buf_size),
     )
     if rc != 0:
         raise RuntimeError(f"Esys_TR_Serialize failed: 0x{rc:08x}")
@@ -1859,8 +1915,11 @@ def _tpm2_get_srk(esys, mu, ctx):
 
     # Try persistent SRK first (standard TCG handle)
     rc = esys.Esys_TR_FromTPMPublic(
-        ctx, TPM2_PERSISTENT_SRK,
-        ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+        ctx,
+        TPM2_PERSISTENT_SRK,
+        ESYS_TR_NONE,
+        ESYS_TR_NONE,
+        ESYS_TR_NONE,
         ctypes.byref(srk_handle),
     )
     if rc == 0:
@@ -1869,26 +1928,36 @@ def _tpm2_get_srk(esys, mu, ctx):
 
     # No persistent SRK — create a transient one
     empty_auth_buf = _tpm2_unmarshal_to_buf(
-        mu, mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
-        _tpm2_build_empty_digest(), _TPM2B_DIGEST_MAX
+        mu,
+        mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
+        _tpm2_build_empty_digest(),
+        _TPM2B_DIGEST_MAX,
     )
     esys.Esys_TR_SetAuth(ctx, ESYS_TR_RH_OWNER, empty_auth_buf)
 
     srk_pub_in = _tpm2_unmarshal_to_buf(
-        mu, mu.Tss2_MU_TPM2B_PUBLIC_Unmarshal,
-        _tpm2_build_ecc_srk_template(), _TPM2B_PUBLIC_MAX
+        mu,
+        mu.Tss2_MU_TPM2B_PUBLIC_Unmarshal,
+        _tpm2_build_ecc_srk_template(),
+        _TPM2B_PUBLIC_MAX,
     )
     empty_sens_buf = _tpm2_unmarshal_to_buf(
-        mu, mu.Tss2_MU_TPM2B_SENSITIVE_CREATE_Unmarshal,
-        _tpm2_build_empty_sensitive_create(), _TPM2B_SENSITIVE_CREATE_MAX
+        mu,
+        mu.Tss2_MU_TPM2B_SENSITIVE_CREATE_Unmarshal,
+        _tpm2_build_empty_sensitive_create(),
+        _TPM2B_SENSITIVE_CREATE_MAX,
     )
     empty_data_buf = _tpm2_unmarshal_to_buf(
-        mu, mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
-        _tpm2_build_empty_data(), _TPM2B_DIGEST_MAX
+        mu,
+        mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
+        _tpm2_build_empty_data(),
+        _TPM2B_DIGEST_MAX,
     )
     empty_pcr_buf = _tpm2_unmarshal_to_buf(
-        mu, mu.Tss2_MU_TPML_PCR_SELECTION_Unmarshal,
-        _tpm2_build_empty_pcr_selection(), _TPML_PCR_SELECTION_MAX
+        mu,
+        mu.Tss2_MU_TPML_PCR_SELECTION_Unmarshal,
+        _tpm2_build_empty_pcr_selection(),
+        _TPML_PCR_SELECTION_MAX,
     )
 
     srk_out_pub = ctypes.c_void_p()
@@ -1897,9 +1966,15 @@ def _tpm2_get_srk(esys, mu, ctx):
     creation_ticket = ctypes.c_void_p()
 
     rc = esys.Esys_CreatePrimary(
-        ctx, ESYS_TR_RH_OWNER,
-        ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-        empty_sens_buf, srk_pub_in, empty_data_buf, empty_pcr_buf,
+        ctx,
+        ESYS_TR_RH_OWNER,
+        ESYS_TR_PASSWORD,
+        ESYS_TR_NONE,
+        ESYS_TR_NONE,
+        empty_sens_buf,
+        srk_pub_in,
+        empty_data_buf,
+        empty_pcr_buf,
         ctypes.byref(srk_handle),
         ctypes.byref(srk_out_pub),
         ctypes.byref(creation_data),
@@ -1943,13 +2018,19 @@ def _tpm2_seal(secret, pcrs_str, pin=""):
 
         # --- Compute policy digest via trial session ---
         sym_def_buf = _tpm2_unmarshal_to_buf(
-            mu, mu.Tss2_MU_TPMT_SYM_DEF_Unmarshal,
-            _tpm2_build_sym_def_null(), _TPMT_SYM_DEF_MAX
+            mu,
+            mu.Tss2_MU_TPMT_SYM_DEF_Unmarshal,
+            _tpm2_build_sym_def_null(),
+            _TPMT_SYM_DEF_MAX,
         )
 
         rc = esys.Esys_StartAuthSession(
-            ctx, ESYS_TR_NONE, ESYS_TR_NONE,
-            ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+            ctx,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
             None,  # nonceCaller
             TPM2_SE_TRIAL,
             sym_def_buf,
@@ -1962,19 +2043,27 @@ def _tpm2_seal(secret, pcrs_str, pin=""):
 
         # PolicyPCR
         pcr_sel_buf = _tpm2_unmarshal_to_buf(
-            mu, mu.Tss2_MU_TPML_PCR_SELECTION_Unmarshal,
-            _tpm2_build_pcr_selection(pcrs_str), _TPML_PCR_SELECTION_MAX
+            mu,
+            mu.Tss2_MU_TPML_PCR_SELECTION_Unmarshal,
+            _tpm2_build_pcr_selection(pcrs_str),
+            _TPML_PCR_SELECTION_MAX,
         )
 
         empty_digest_buf = _tpm2_unmarshal_to_buf(
-            mu, mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
-            _tpm2_build_empty_digest(), _TPM2B_DIGEST_MAX
+            mu,
+            mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
+            _tpm2_build_empty_digest(),
+            _TPM2B_DIGEST_MAX,
         )
 
         rc = esys.Esys_PolicyPCR(
-            ctx, trial_session.value,
-            ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-            empty_digest_buf, pcr_sel_buf,
+            ctx,
+            trial_session.value,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
+            empty_digest_buf,
+            pcr_sel_buf,
         )
         if rc != 0:
             raise RuntimeError(f"Esys_PolicyPCR failed: 0x{rc:08x}")
@@ -1982,8 +2071,11 @@ def _tpm2_seal(secret, pcrs_str, pin=""):
         # PolicyAuthValue (if PIN is used)
         if pin:
             rc = esys.Esys_PolicyAuthValue(
-                ctx, trial_session.value,
-                ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                ctx,
+                trial_session.value,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
             )
             if rc != 0:
                 raise RuntimeError(f"Esys_PolicyAuthValue failed: 0x{rc:08x}")
@@ -1991,8 +2083,11 @@ def _tpm2_seal(secret, pcrs_str, pin=""):
         # Get the policy digest
         policy_digest_ptr = ctypes.c_void_p()
         rc = esys.Esys_PolicyGetDigest(
-            ctx, trial_session.value,
-            ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+            ctx,
+            trial_session.value,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
             ctypes.byref(policy_digest_ptr),
         )
         if rc != 0:
@@ -2000,9 +2095,7 @@ def _tpm2_seal(secret, pcrs_str, pin=""):
 
         # Read the policy hash bytes from TPM2B_DIGEST
         policy_size = _tpm2_read_tpm2b_size(policy_digest_ptr.value)
-        policy_hash = ctypes.string_at(
-            policy_digest_ptr.value + 2, policy_size
-        )
+        policy_hash = ctypes.string_at(policy_digest_ptr.value + 2, policy_size)
         esys.Esys_Free(policy_digest_ptr)
 
         # Flush trial session
@@ -2012,14 +2105,14 @@ def _tpm2_seal(secret, pcrs_str, pin=""):
         # --- Seal the secret ---
         seal_template_wire = _tpm2_build_seal_template(policy_hash, bool(pin))
         seal_pub_in = _tpm2_unmarshal_to_buf(
-            mu, mu.Tss2_MU_TPM2B_PUBLIC_Unmarshal,
-            seal_template_wire, _TPM2B_PUBLIC_MAX
+            mu, mu.Tss2_MU_TPM2B_PUBLIC_Unmarshal, seal_template_wire, _TPM2B_PUBLIC_MAX
         )
 
         seal_sens_buf = _tpm2_unmarshal_to_buf(
-            mu, mu.Tss2_MU_TPM2B_SENSITIVE_CREATE_Unmarshal,
+            mu,
+            mu.Tss2_MU_TPM2B_SENSITIVE_CREATE_Unmarshal,
             _tpm2_build_sensitive_create(secret, pin),
-            _TPM2B_SENSITIVE_CREATE_MAX
+            _TPM2B_SENSITIVE_CREATE_MAX,
         )
 
         seal_out_priv = ctypes.c_void_p()
@@ -2029,18 +2122,28 @@ def _tpm2_seal(secret, pcrs_str, pin=""):
         seal_creation_ticket = ctypes.c_void_p()
 
         empty_data_buf = _tpm2_unmarshal_to_buf(
-            mu, mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
-            _tpm2_build_empty_data(), _TPM2B_DIGEST_MAX
+            mu,
+            mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
+            _tpm2_build_empty_data(),
+            _TPM2B_DIGEST_MAX,
         )
         empty_pcr_buf = _tpm2_unmarshal_to_buf(
-            mu, mu.Tss2_MU_TPML_PCR_SELECTION_Unmarshal,
-            _tpm2_build_empty_pcr_selection(), _TPML_PCR_SELECTION_MAX
+            mu,
+            mu.Tss2_MU_TPML_PCR_SELECTION_Unmarshal,
+            _tpm2_build_empty_pcr_selection(),
+            _TPML_PCR_SELECTION_MAX,
         )
 
         rc = esys.Esys_Create(
-            ctx, srk_handle_val,
-            ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-            seal_sens_buf, seal_pub_in, empty_data_buf, empty_pcr_buf,
+            ctx,
+            srk_handle_val,
+            ESYS_TR_PASSWORD,
+            ESYS_TR_NONE,
+            ESYS_TR_NONE,
+            seal_sens_buf,
+            seal_pub_in,
+            empty_data_buf,
+            empty_pcr_buf,
             ctypes.byref(seal_out_priv),
             ctypes.byref(seal_out_pub),
             ctypes.byref(seal_creation_data),
@@ -2060,8 +2163,13 @@ def _tpm2_seal(secret, pcrs_str, pin=""):
         blob = priv_wire + pub_wire
 
         # Free ESYS outputs
-        for p in [seal_out_priv, seal_out_pub, seal_creation_data,
-                  seal_creation_hash, seal_creation_ticket]:
+        for p in [
+            seal_out_priv,
+            seal_out_pub,
+            seal_creation_data,
+            seal_creation_hash,
+            seal_creation_ticket,
+        ]:
             if p:
                 esys.Esys_Free(p)
 
@@ -2122,7 +2230,6 @@ def _tpm2_unseal_from_token(device, pin=""):
         blob_b64 = tinfo.get("tpm2_blob") or tinfo["tpm2-blob"]
         pcrs = tinfo.get("tpm2-pcrs", [])
         pcr_bank_name = tinfo.get("tpm2-pcr-bank", "sha256")
-        primary_alg_name = tinfo.get("tpm2-primary-alg", "ecc")
 
         # Decode blob
         if isinstance(blob_b64, list):
@@ -2136,8 +2243,12 @@ def _tpm2_unseal_from_token(device, pin=""):
         else:
             pcrs_str = str(pcrs)
 
-        pcr_bank = {"sha1": 0x0004, "sha256": 0x000B, "sha384": 0x000C,
-                    "sha512": 0x000D}.get(pcr_bank_name, TPM2_ALG_SHA256)
+        pcr_bank = {
+            "sha1": 0x0004,
+            "sha256": 0x000B,
+            "sha384": 0x000C,
+            "sha512": 0x000D,
+        }.get(pcr_bank_name, TPM2_ALG_SHA256)
 
         esys, mu = _load_libtss2()
 
@@ -2175,9 +2286,13 @@ def _tpm2_unseal_from_token(device, pin=""):
             # Load the sealed object
             loaded_handle = ctypes.c_uint32()
             rc = esys.Esys_Load(
-                ctx, srk_handle_val,
-                ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-                seal_priv_buf, seal_pub_buf,
+                ctx,
+                srk_handle_val,
+                ESYS_TR_PASSWORD,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
+                seal_priv_buf,
+                seal_pub_buf,
                 ctypes.byref(loaded_handle),
             )
             if rc != 0:
@@ -2190,44 +2305,61 @@ def _tpm2_unseal_from_token(device, pin=""):
                 pin_auth = hashlib.sha256(pin.encode()).digest()
                 auth_buf2 = ctypes.create_string_buffer(_TPM2B_DIGEST_MAX)
                 struct.pack_into("=H", auth_buf2, 0, len(pin_auth))
-                ctypes.memmove(
-                    ctypes.addressof(auth_buf2) + 2, pin_auth, len(pin_auth)
-                )
+                ctypes.memmove(ctypes.addressof(auth_buf2) + 2, pin_auth, len(pin_auth))
                 esys.Esys_TR_SetAuth(ctx, loaded_handle.value, auth_buf2)
 
             # Start policy session
             sym_def_buf = _tpm2_unmarshal_to_buf(
-                mu, mu.Tss2_MU_TPMT_SYM_DEF_Unmarshal,
-                _tpm2_build_sym_def_null(), _TPMT_SYM_DEF_MAX
+                mu,
+                mu.Tss2_MU_TPMT_SYM_DEF_Unmarshal,
+                _tpm2_build_sym_def_null(),
+                _TPMT_SYM_DEF_MAX,
             )
 
             policy_session = ctypes.c_uint32()
             rc = esys.Esys_StartAuthSession(
-                ctx, ESYS_TR_NONE, ESYS_TR_NONE,
-                ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-                None, TPM2_SE_POLICY, sym_def_buf, TPM2_ALG_SHA256,
+                ctx,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
+                None,
+                TPM2_SE_POLICY,
+                sym_def_buf,
+                TPM2_ALG_SHA256,
                 ctypes.byref(policy_session),
             )
             if rc != 0:
-                last_error = f"Token {tid}: Esys_StartAuthSession (policy) failed: 0x{rc:08x}"
+                last_error = (
+                    f"Token {tid}: Esys_StartAuthSession (policy) failed: 0x{rc:08x}"
+                )
                 continue
             to_flush.append(policy_session.value)
 
             # Replay PolicyPCR
             pcr_sel_buf = _tpm2_unmarshal_to_buf(
-                mu, mu.Tss2_MU_TPML_PCR_SELECTION_Unmarshal,
-                _tpm2_build_pcr_selection(pcrs_str, pcr_bank), _TPML_PCR_SELECTION_MAX
+                mu,
+                mu.Tss2_MU_TPML_PCR_SELECTION_Unmarshal,
+                _tpm2_build_pcr_selection(pcrs_str, pcr_bank),
+                _TPML_PCR_SELECTION_MAX,
             )
 
             empty_digest_buf = _tpm2_unmarshal_to_buf(
-                mu, mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
-                _tpm2_build_empty_digest(), _TPM2B_DIGEST_MAX
+                mu,
+                mu.Tss2_MU_TPM2B_DIGEST_Unmarshal,
+                _tpm2_build_empty_digest(),
+                _TPM2B_DIGEST_MAX,
             )
 
             rc = esys.Esys_PolicyPCR(
-                ctx, policy_session.value,
-                ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-                empty_digest_buf, pcr_sel_buf,
+                ctx,
+                policy_session.value,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
+                empty_digest_buf,
+                pcr_sel_buf,
             )
             if rc != 0:
                 last_error = f"Token {tid}: Esys_PolicyPCR failed: 0x{rc:08x}"
@@ -2236,8 +2368,11 @@ def _tpm2_unseal_from_token(device, pin=""):
             # PolicyAuthValue if PIN was used
             if has_pin:
                 rc = esys.Esys_PolicyAuthValue(
-                    ctx, policy_session.value,
-                    ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                    ctx,
+                    policy_session.value,
+                    ESYS_TR_NONE,
+                    ESYS_TR_NONE,
+                    ESYS_TR_NONE,
                 )
                 if rc != 0:
                     last_error = f"Token {tid}: Esys_PolicyAuthValue failed: 0x{rc:08x}"
@@ -2246,8 +2381,11 @@ def _tpm2_unseal_from_token(device, pin=""):
             # Unseal
             out_data = ctypes.c_void_p()
             rc = esys.Esys_Unseal(
-                ctx, loaded_handle.value,
-                policy_session.value, ESYS_TR_NONE, ESYS_TR_NONE,
+                ctx,
+                loaded_handle.value,
+                policy_session.value,
+                ESYS_TR_NONE,
+                ESYS_TR_NONE,
                 ctypes.byref(out_data),
             )
             if rc != 0:
@@ -2273,8 +2411,7 @@ def _tpm2_unseal_from_token(device, pin=""):
 
 SETTINGS_FILE = "/etc/luks-enroll.conf"
 SETTINGS_ALLOWED_KEYS = set()  # Add valid keys here as features are added
-SETTINGS_DEFAULTS = {
-}
+SETTINGS_DEFAULTS = {}
 
 
 def _format_size(size_bytes):
@@ -2311,12 +2448,15 @@ def _get_blkid_tag(device, tag):
         return None
     try:
         lib.blkid_probe_set_superblocks_flags(
-            probe, _BLKID_SUBLKS_LABEL | _BLKID_SUBLKS_TYPE)
+            probe, _BLKID_SUBLKS_LABEL | _BLKID_SUBLKS_TYPE
+        )
         if lib.blkid_do_safeprobe(probe) != 0:
             return None
         value = ctypes.c_char_p()
-        if lib.blkid_probe_lookup_value(
-                probe, tag.encode(), ctypes.byref(value), None) != 0:
+        if (
+            lib.blkid_probe_lookup_value(probe, tag.encode(), ctypes.byref(value), None)
+            != 0
+        ):
             return None
         return value.value.decode() if value.value else None
     finally:
@@ -2377,10 +2517,10 @@ def detect_removable_devices():
                 if not entry.startswith(dev_name):
                     continue
                 part_path = f"/dev/{entry}"
-                part_size_sectors = _read_sysfs(
-                    f"/sys/block/{dev_name}/{entry}/size"
+                part_size_sectors = _read_sysfs(f"/sys/block/{dev_name}/{entry}/size")
+                part_size_bytes = (
+                    int(part_size_sectors) * 512 if part_size_sectors else 0
                 )
-                part_size_bytes = int(part_size_sectors) * 512 if part_size_sectors else 0
                 part_label = _get_blkid_tag(part_path, "LABEL") or ""
                 part_encrypted = part_path in luks_devices
                 part_info = {
@@ -2609,13 +2749,16 @@ def check_polkit(connection, invocation, action=POLKIT_ACTION_MANAGE):
 
         # Build the CheckAuthorization parameters manually to ensure
         # correct GVariant types throughout.
-        subject = GLib.Variant("(sa{sv})", (
-            "unix-process",
-            {
-                "pid": GLib.Variant("u", caller_pid),
-                "start-time": GLib.Variant("t", 0),
-            },
-        ))
+        subject = GLib.Variant(
+            "(sa{sv})",
+            (
+                "unix-process",
+                {
+                    "pid": GLib.Variant("u", caller_pid),
+                    "start-time": GLib.Variant("t", 0),
+                },
+            ),
+        )
         action_id = GLib.Variant("s", action)
         details = GLib.Variant("a{ss}", {})
         flags = GLib.Variant("u", 1)  # AllowUserInteraction
@@ -2791,14 +2934,20 @@ class LuksEnrollService:
     def _get_caller_uid(self, connection, sender):
         """Get the UID of the D-Bus caller."""
         dbus_proxy = Gio.DBusProxy.new_sync(
-            connection, Gio.DBusProxyFlags.NONE, None,
-            "org.freedesktop.DBus", "/org/freedesktop/DBus",
-            "org.freedesktop.DBus", None,
+            connection,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            None,
         )
         result = dbus_proxy.call_sync(
             "GetConnectionUnixUser",
             GLib.Variant("(s)", (sender,)),
-            Gio.DBusCallFlags.NONE, -1, None,
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
         )
         return result.unpack()[0]
 
@@ -2816,55 +2965,91 @@ class LuksEnrollService:
         self._loop.quit()
         return GLib.SOURCE_REMOVE
 
-    def handle_method_call(self, connection, sender, object_path, interface_name,
-                           method_name, parameters, invocation):
+    def handle_method_call(
+        self,
+        connection,
+        sender,
+        object_path,
+        interface_name,
+        method_name,
+        parameters,
+        invocation,
+    ):
         """Handle incoming D-Bus method calls."""
 
         # Read-only methods (use POLKIT_ACTION_READ, auth may be cached)
         read_methods = {
-            "DetectDevices", "DetectRemovableDevices",
-            "GetKeyslots", "GetTokensByType", "FindPasswordKeyslots",
-            "GetDeviceInfo", "GetSetting", "CheckFido2Enrolled",
+            "DetectDevices",
+            "DetectRemovableDevices",
+            "GetKeyslots",
+            "GetTokensByType",
+            "FindPasswordKeyslots",
+            "GetDeviceInfo",
+            "GetSetting",
+            "CheckFido2Enrolled",
         }
 
         # Destructive/write methods (use POLKIT_ACTION_MANAGE, never cached)
         write_methods = {
-            "VerifyPassphrase", "UnlockWithToken", "EnrollFido2",
-            "EnrollTpm2", "EnrollRecoveryKey", "WipeSlot",
-            "CreateEncryptedImage", "FormatPartition", "EnrollPassphrase",
-            "SetSetting", "Authenticate",
+            "VerifyPassphrase",
+            "UnlockWithToken",
+            "EnrollFido2",
+            "EnrollTpm2",
+            "EnrollRecoveryKey",
+            "WipeSlot",
+            "CreateEncryptedImage",
+            "FormatPartition",
+            "EnrollPassphrase",
+            "SetSetting",
+            "Authenticate",
         }
 
         privileged_methods = read_methods | write_methods
 
         # Methods whose first parameter is a device/file path
         device_param_methods = {
-            "VerifyPassphrase", "UnlockWithToken", "EnrollFido2",
-            "EnrollTpm2", "EnrollRecoveryKey", "WipeSlot",
-            "EnrollPassphrase", "FormatPartition",
-            "GetKeyslots", "GetTokensByType", "FindPasswordKeyslots",
-            "GetDeviceInfo", "CheckFido2Enrolled",
+            "VerifyPassphrase",
+            "UnlockWithToken",
+            "EnrollFido2",
+            "EnrollTpm2",
+            "EnrollRecoveryKey",
+            "WipeSlot",
+            "EnrollPassphrase",
+            "FormatPartition",
+            "GetKeyslots",
+            "GetTokensByType",
+            "FindPasswordKeyslots",
+            "GetDeviceInfo",
+            "CheckFido2Enrolled",
         }
 
         sender = invocation.get_message().get_sender()
         if method_name in privileged_methods:
-            polkit_action = (POLKIT_ACTION_READ if method_name in read_methods
-                             else POLKIT_ACTION_MANAGE)
+            polkit_action = (
+                POLKIT_ACTION_READ
+                if method_name in read_methods
+                else POLKIT_ACTION_MANAGE
+            )
 
             # Only use auth cache for read methods
             is_cached = False
             if method_name in read_methods:
                 with self._auth_lock:
                     cached_time = self._authorized_senders.get(sender)
-                    is_cached = (cached_time is not None
-                                 and (time.monotonic() - cached_time) < AUTH_CACHE_TTL)
+                    is_cached = (
+                        cached_time is not None
+                        and (time.monotonic() - cached_time) < AUTH_CACHE_TTL
+                    )
 
             if not is_cached:
                 # Skip polkit if the caller owns the file they're operating on.
                 # Resolve symlinks to prevent a user from tricking the service
                 # into operating on files they don't actually own.
                 needs_polkit = True
-                if method_name in device_param_methods or method_name == "CreateEncryptedImage":
+                if (
+                    method_name in device_param_methods
+                    or method_name == "CreateEncryptedImage"
+                ):
                     try:
                         caller_uid = self._get_caller_uid(connection, sender)
                         path = os.path.realpath(parameters.unpack()[0])
@@ -2873,18 +3058,16 @@ class LuksEnrollService:
                             parent = os.path.realpath(os.path.dirname(path) or ".")
                             is_dir = os.path.isdir(parent)
                             owner_uid = os.stat(parent).st_uid if is_dir else -1
-                            needs_polkit = not (
-                                is_dir and owner_uid == caller_uid
-                            )
+                            needs_polkit = not (is_dir and owner_uid == caller_uid)
                         else:
                             is_file = os.path.isfile(path)
                             owner_uid = os.stat(path).st_uid if is_file else -1
-                            needs_polkit = not (
-                                is_file and owner_uid == caller_uid
-                            )
+                            needs_polkit = not (is_file and owner_uid == caller_uid)
                     except Exception as e:
-                        print(f"Ownership check failed for {method_name}: {e}",
-                              file=sys.stderr)
+                        print(
+                            f"Ownership check failed for {method_name}: {e}",
+                            file=sys.stderr,
+                        )
 
                 if needs_polkit:
                     if not check_polkit(connection, invocation, polkit_action):
@@ -2948,13 +3131,20 @@ class LuksEnrollService:
         # Methods that may block (crypto ops, FIDO2 touch, TPM2, disk I/O)
         # must run off the main loop so D-Bus stays responsive.
         blocking_methods = {
-            "VerifyPassphrase", "UnlockWithToken", "EnrollFido2",
-            "EnrollTpm2", "EnrollRecoveryKey", "EnrollPassphrase",
-            "WipeSlot", "CreateEncryptedImage", "FormatPartition",
+            "VerifyPassphrase",
+            "UnlockWithToken",
+            "EnrollFido2",
+            "EnrollTpm2",
+            "EnrollRecoveryKey",
+            "EnrollPassphrase",
+            "WipeSlot",
+            "CreateEncryptedImage",
+            "FormatPartition",
             "CheckFido2Enrolled",
         }
 
         if method_name in blocking_methods:
+
             def _run():
                 try:
                     handler(parameters, invocation)
@@ -2964,6 +3154,7 @@ class LuksEnrollService:
                         "org.freedesktop.DBus.Error.Failed",
                         "Operation failed",
                     )
+
             threading.Thread(target=_run, daemon=True).start()
         else:
             try:
@@ -3029,20 +3220,26 @@ class LuksEnrollService:
                 probe_dev = ctypes.c_void_p(fido2_lib.fido_dev_new())
                 if probe_dev:
                     try:
-                        ret = fido2_lib.fido_dev_open(
-                            probe_dev, real_path.encode()
-                        )
+                        ret = fido2_lib.fido_dev_open(probe_dev, real_path.encode())
                         if ret == FIDO_OK:
                             for cred_id in existing_creds:
-                                if _fido2_probe_credential(
-                                    fido2_lib, probe_dev, cred_id
-                                ) is True:
-                                    invocation.return_value(GLib.Variant(
-                                        "(bss)",
-                                        (False, "",
-                                         "This FIDO2 token is already "
-                                         "enrolled on this volume"),
-                                    ))
+                                if (
+                                    _fido2_probe_credential(
+                                        fido2_lib, probe_dev, cred_id
+                                    )
+                                    is True
+                                ):
+                                    invocation.return_value(
+                                        GLib.Variant(
+                                            "(bss)",
+                                            (
+                                                False,
+                                                "",
+                                                "This FIDO2 token is already "
+                                                "enrolled on this volume",
+                                            ),
+                                        )
+                                    )
                                     return
                     finally:
                         fido2_lib.fido_dev_close(probe_dev)
@@ -3052,9 +3249,7 @@ class LuksEnrollService:
             cred_id, salt, hmac_secret = _fido2_enroll(fido2_device, pin or None)
 
             # Get volume key to add new keyslot
-            vk, vk_size = _get_volume_key(
-                device, unlock_method, passphrase, unlock_pin
-            )
+            vk, vk_size = _get_volume_key(device, unlock_method, passphrase, unlock_pin)
 
             # Add keyslot using base64-encoded hmac-secret as the passphrase
             # (systemd convention: token plugin base64-encodes secret)
@@ -3064,22 +3259,22 @@ class LuksEnrollService:
             )
 
             # Store FIDO2 token metadata in LUKS2 header
-            token_json = json.dumps({
-                "type": "systemd-fido2",
-                "keyslots": [str(keyslot)],
-                "fido2-credential": base64.b64encode(cred_id).decode(),
-                "fido2-salt": base64.b64encode(salt).decode(),
-                "fido2-rp": _FIDO2_RP_ID,
-                "fido2-clientPin-required": bool(pin),
-                "fido2-up-required": True,
-                "fido2-uv-required": False,
-            })
+            token_json = json.dumps(
+                {
+                    "type": "systemd-fido2",
+                    "keyslots": [str(keyslot)],
+                    "fido2-credential": base64.b64encode(cred_id).decode(),
+                    "fido2-salt": base64.b64encode(salt).decode(),
+                    "fido2-rp": _FIDO2_RP_ID,
+                    "fido2-clientPin-required": bool(pin),
+                    "fido2-up-required": True,
+                    "fido2-uv-required": False,
+                }
+            )
             _set_luks_token(device, -1, token_json)
             _clear_volume_key_cache(device)
 
-            invocation.return_value(
-                GLib.Variant("(bss)", (True, "", ""))
-            )
+            invocation.return_value(GLib.Variant("(bss)", (True, "", "")))
         except Exception as e:
             print(f"EnrollFido2 failed: {e}", file=sys.stderr)
             invocation.return_value(
@@ -3098,10 +3293,12 @@ class LuksEnrollService:
                         existing_creds.append(
                             base64.b64decode(tinfo["fido2-credential"])
                         )
-            print(f"CheckFido2Enrolled: device={device}, "
-                  f"fido2_paths={fido2_dev_paths}, "
-                  f"existing_creds={len(existing_creds)}",
-                  file=sys.stderr)
+            print(
+                f"CheckFido2Enrolled: device={device}, "
+                f"fido2_paths={fido2_dev_paths}, "
+                f"existing_creds={len(existing_creds)}",
+                file=sys.stderr,
+            )
             if existing_creds and fido2_dev_paths:
                 fido2_lib = _load_libfido2()
                 fido2_lib.fido_init(0)
@@ -3109,25 +3306,21 @@ class LuksEnrollService:
                     real_path = os.path.realpath(dev_path)
                     dev = ctypes.c_void_p(fido2_lib.fido_dev_new())
                     if not dev:
-                        print(f"  {dev_path}: fido_dev_new failed",
-                              file=sys.stderr)
+                        print(f"  {dev_path}: fido_dev_new failed", file=sys.stderr)
                         continue
                     try:
-                        ret = fido2_lib.fido_dev_open(
-                            dev, real_path.encode()
-                        )
+                        ret = fido2_lib.fido_dev_open(dev, real_path.encode())
                         if ret != FIDO_OK:
-                            print(f"  {dev_path}: fido_dev_open "
-                                  f"failed ret={ret:#x}",
-                                  file=sys.stderr)
+                            print(
+                                f"  {dev_path}: fido_dev_open failed ret={ret:#x}",
+                                file=sys.stderr,
+                            )
                             continue
                         for cred_id in existing_creds:
-                            result = _fido2_probe_credential(
-                                fido2_lib, dev, cred_id
+                            result = _fido2_probe_credential(fido2_lib, dev, cred_id)
+                            print(
+                                f"  {dev_path}: probe result={result}", file=sys.stderr
                             )
-                            print(f"  {dev_path}: probe result="
-                                  f"{result}",
-                                  file=sys.stderr)
                             if result is True:
                                 enrolled_paths.append(dev_path)
                                 break
@@ -3136,28 +3329,20 @@ class LuksEnrollService:
                         fido2_lib.fido_dev_free(ctypes.byref(dev))
         except Exception as e:
             print(f"CheckFido2Enrolled failed: {e}", file=sys.stderr)
-        print(f"CheckFido2Enrolled result: {enrolled_paths}",
-              file=sys.stderr)
+        print(f"CheckFido2Enrolled result: {enrolled_paths}", file=sys.stderr)
         invocation.return_value(GLib.Variant("(as)", (enrolled_paths,)))
 
     def _handle_EnrollTpm2(self, parameters, invocation):
-        device, passphrase, pin, pcrs, unlock_method, unlock_pin = (
-            parameters.unpack()
-        )
+        device, passphrase, pin, pcrs, unlock_method, unlock_pin = parameters.unpack()
         try:
-
             # Generate random 32-byte secret to seal
             secret = os.urandom(32)
 
             # Seal the secret to TPM2 bound to PCRs
-            blob, policy_hash, primary_alg, srk_blob = _tpm2_seal(
-                secret, pcrs, pin
-            )
+            blob, policy_hash, primary_alg, srk_blob = _tpm2_seal(secret, pcrs, pin)
 
             # Get volume key to add new keyslot
-            vk, vk_size = _get_volume_key(
-                device, unlock_method, passphrase, unlock_pin
-            )
+            vk, vk_size = _get_volume_key(device, unlock_method, passphrase, unlock_pin)
 
             # Add keyslot using the base64-encoded sealed secret as passphrase
             # (systemd convention: token plugin base64-encodes unsealed bytes)
@@ -3170,27 +3355,27 @@ class LuksEnrollService:
             pcr_list = [int(p.strip()) for p in pcrs.split("+") if p.strip()]
 
             # Store TPM2 token metadata in LUKS2 header
-            token_json = json.dumps({
-                "type": "systemd-tpm2",
-                "keyslots": [str(keyslot)],
-                "tpm2-blob": base64.b64encode(blob).decode(),
-                "tpm2_blob": base64.b64encode(blob).decode(),
-                "tpm2-pcrs": pcr_list,
-                "tpm2-pcr-bank": "sha256",
-                "tpm2-primary-alg": "ecc",
-                "tpm2-policy-hash": policy_hash.hex(),
-                "tpm2-pin": bool(pin),
-                "tpm2_pubkey_pcrs": [],
-                "tpm2_pcr_hash": "sha256",
-                "tpm2_pcrlock": False,
-                "tpm2_srk": base64.b64encode(srk_blob).decode(),
-            })
+            token_json = json.dumps(
+                {
+                    "type": "systemd-tpm2",
+                    "keyslots": [str(keyslot)],
+                    "tpm2-blob": base64.b64encode(blob).decode(),
+                    "tpm2_blob": base64.b64encode(blob).decode(),
+                    "tpm2-pcrs": pcr_list,
+                    "tpm2-pcr-bank": "sha256",
+                    "tpm2-primary-alg": "ecc",
+                    "tpm2-policy-hash": policy_hash.hex(),
+                    "tpm2-pin": bool(pin),
+                    "tpm2_pubkey_pcrs": [],
+                    "tpm2_pcr_hash": "sha256",
+                    "tpm2_pcrlock": False,
+                    "tpm2_srk": base64.b64encode(srk_blob).decode(),
+                }
+            )
             _set_luks_token(device, -1, token_json)
             _clear_volume_key_cache(device)
 
-            invocation.return_value(
-                GLib.Variant("(bss)", (True, "", ""))
-            )
+            invocation.return_value(GLib.Variant("(bss)", (True, "", "")))
         except Exception as e:
             print(f"EnrollTpm2 failed: {e}", file=sys.stderr)
             invocation.return_value(
@@ -3204,27 +3389,23 @@ class LuksEnrollService:
             recovery_key = _make_recovery_key()
 
             # Get volume key to add new keyslot
-            vk, vk_size = _get_volume_key(
-                device, unlock_method, passphrase, unlock_pin
-            )
+            vk, vk_size = _get_volume_key(device, unlock_method, passphrase, unlock_pin)
 
             # Add keyslot using the recovery key as the passphrase
-            keyslot = _add_keyslot_by_volume_key(
-                device, vk, vk_size, recovery_key
-            )
+            keyslot = _add_keyslot_by_volume_key(device, vk, vk_size, recovery_key)
 
             # Store recovery token metadata in LUKS2 header
-            token_json = json.dumps({
-                "type": "systemd-recovery",
-                "keyslots": [str(keyslot)],
-            })
+            token_json = json.dumps(
+                {
+                    "type": "systemd-recovery",
+                    "keyslots": [str(keyslot)],
+                }
+            )
             _set_luks_token(device, -1, token_json)
             _clear_volume_key_cache(device)
 
             # Return recovery key in stdout (GUI parses it from there)
-            invocation.return_value(
-                GLib.Variant("(bss)", (True, recovery_key, ""))
-            )
+            invocation.return_value(GLib.Variant("(bss)", (True, recovery_key, "")))
         except Exception as e:
             print(f"EnrollRecoveryKey failed: {e}", file=sys.stderr)
             invocation.return_value(
@@ -3241,7 +3422,10 @@ class LuksEnrollService:
             slots = list_luks_keyslots(device)
             if len(slots) <= 1 and slot in slots:
                 invocation.return_value(
-                    GLib.Variant("(bss)", (False, "", "Cannot wipe the last remaining keyslot"))
+                    GLib.Variant(
+                        "(bss)",
+                        (False, "", "Cannot wipe the last remaining keyslot"),
+                    )
                 )
                 return
 
@@ -3254,9 +3438,7 @@ class LuksEnrollService:
             _destroy_keyslot(device, slot)
             _clear_volume_key_cache(device)
 
-            invocation.return_value(
-                GLib.Variant("(bss)", (True, "", ""))
-            )
+            invocation.return_value(GLib.Variant("(bss)", (True, "", "")))
         except Exception as e:
             print(f"WipeSlot failed: {e}", file=sys.stderr)
             invocation.return_value(
@@ -3268,12 +3450,22 @@ class LuksEnrollService:
         real_path = os.path.realpath(path)
         # Reject block devices and paths outside caller-owned directories
         if os.path.exists(real_path) and not os.path.isfile(real_path):
-            invocation.return_value(GLib.Variant("(bis)", (False, -1, "Path must be a regular file")))
+            invocation.return_value(
+                GLib.Variant(
+                    "(bis)",
+                    (False, -1, "Path must be a regular file"),
+                )
+            )
             return
         # Allowlist: only permit paths under /home/ or /tmp/
         _ALLOWED_PREFIXES = ("/home/", "/tmp/")
         if not any(real_path.startswith(p) for p in _ALLOWED_PREFIXES):
-            invocation.return_value(GLib.Variant("(bis)", (False, -1, "Path must be under /home/ or /tmp/")))
+            invocation.return_value(
+                GLib.Variant(
+                    "(bis)",
+                    (False, -1, "Path must be under /home/ or /tmp/"),
+                )
+            )
             return
         try:
             # Get caller UID/GID to set file ownership
@@ -3286,7 +3478,12 @@ class LuksEnrollService:
             invocation.return_value(GLib.Variant("(bis)", (True, keyslot, "")))
         except Exception as e:
             print(f"CreateEncryptedImage failed: {e}", file=sys.stderr)
-            invocation.return_value(GLib.Variant("(bis)", (False, -1, "Operation failed")))
+            invocation.return_value(
+                GLib.Variant(
+                    "(bis)",
+                    (False, -1, "Operation failed"),
+                )
+            )
 
     def _handle_DetectRemovableDevices(self, parameters, invocation):
         devices = detect_removable_devices()
@@ -3319,9 +3516,7 @@ class LuksEnrollService:
             _add_keyslot_by_volume_key(device, vk, vk_size, new_passphrase)
             _clear_volume_key_cache(device)
 
-            invocation.return_value(
-                GLib.Variant("(bss)", (True, "", ""))
-            )
+            invocation.return_value(GLib.Variant("(bss)", (True, "", "")))
         except Exception as e:
             print(f"EnrollPassphrase failed: {e}", file=sys.stderr)
             invocation.return_value(
@@ -3352,6 +3547,7 @@ class LuksEnrollService:
 # Bus acquisition
 # ---------------------------------------------------------------------------
 
+
 def on_bus_acquired(connection, name, service):
     """Register the service object on the bus."""
     node_info = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION_XML)
@@ -3377,6 +3573,7 @@ def on_name_lost(connection, name, loop):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(
