@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Disk Encryption
+Comment=Manage LUKS disk encryption enrollments
+Exec=/usr/bin/luks-enroll
+Icon=security-high-symbolic
+Terminal=false
+Categories=System;Security;
+Keywords=luks;encryption;fido2;tpm2;security;

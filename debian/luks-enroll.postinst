@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+# Reload D-Bus so it picks up the new/updated activation file.
+if [ -d /run/dbus ]; then
+    systemctl reload dbus 2>/dev/null || true
+fi
+
+#DEBHELPER#
