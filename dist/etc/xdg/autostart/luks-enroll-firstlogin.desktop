@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LUKS Enroll Wizard
+Comment=First-login enrollment of FIDO2, TPM2, and recovery key
+Exec=/usr/bin/luks-enroll --first-login
+Icon=security-high-symbolic
+Terminal=false
+Categories=System;Security;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Phase=Application

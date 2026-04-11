@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # GitHub Actions: pinned to commit SHAs in workflow files. Dependabot
+  # rewrites the SHA and updates the trailing version comment in lockstep.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Dev tooling (ruff, pytest + transitive deps) hash-pinned in
+  # requirements-dev.txt. Dependabot regenerates the file with new hashes.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      dev-tools:
+        patterns: ["*"]

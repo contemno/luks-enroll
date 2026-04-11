@@ -1,0 +1,39 @@
+Source: luks-enroll
+Section: admin
+Priority: optional
+Maintainer: Josh <josh@contemno.net>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/contemno/luks-enroll
+Vcs-Git: https://github.com/contemno/luks-enroll.git
+Vcs-Browser: https://github.com/contemno/luks-enroll
+
+Package: luks-enroll
+Architecture: all
+Depends: python3,
+         python3-gi,
+         gir1.2-gtk-4.0,
+         gir1.2-adw-1,
+         systemd (>= 248),
+         libcryptsetup12,
+         libblkid1,
+         libfdisk1,
+         polkitd | policykit-1,
+         ${misc:Depends}
+Suggests: dracut
+Recommends: libfido2-1,
+            tpm2-tools,
+            libtss2-esys-3.0.2-0 | libtss2-esys0,
+            libtss2-mu-4.0.1-0 | libtss2-mu0
+Description: LUKS Enroll Wizard for LUKS disk encryption
+ A GTK4 wizard that guides users through enrolling FIDO2 tokens,
+ TPM2 chips, and recovery keys into a LUKS-encrypted root volume,
+ then removes the original password keyslot.
+ .
+ Designed to run on first login or inside a chroot environment.
+ .
+ FIDO2 token support requires libfido2. TPM2 support requires
+ libtss2-esys and libtss2-mu. These are listed as Recommends
+ and installed by default on most systems.
+ 

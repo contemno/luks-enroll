@@ -1,0 +1,3941 @@
+#!/usr/bin/env python3
+"""LUKS Enroll Wizard — guides first-login enrollment of FIDO2, TPM2, and
+recovery key into the LUKS root volume, then removes the password keyslot.
+
+This is an unprivileged GUI client that talks to the luks-enroll-service
+D-Bus system service for all privileged operations."""
+
+import argparse
+from dataclasses import dataclass, field
+import gi
+import glob
+import json
+import os
+import sys
+import threading
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("GUdev", "1.0")
+from gi.repository import Adw, Gio, GLib, GUdev, Gtk  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Shared context
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DeviceContext:
+    svc: "LuksEnrollProxy" = None
+    device: str = None
+    passphrase: str = None
+    auth_keyslot: int = None
+
+
+# ---------------------------------------------------------------------------
+# D-Bus proxy for the privileged service
+# ---------------------------------------------------------------------------
+
+
+class LuksEnrollProxy:
+    """Thin wrapper around the net.contemno.LuksEnroll1 D-Bus system service."""
+
+    def __init__(self):
+        self.proxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SYSTEM,
+            Gio.DBusProxyFlags.NONE,
+            None,
+            "net.contemno.LuksEnroll",
+            "/net/contemno/LuksEnroll",
+            "net.contemno.LuksEnroll1",
+            None,
+        )
+        self._vanished_callbacks = []
+        self.proxy.connect("notify::g-name-owner", self._on_name_owner_changed)
+
+    def _on_name_owner_changed(self, proxy, _pspec):
+        if proxy.get_name_owner() is None:
+            for cb in list(self._vanished_callbacks):
+                cb()
+
+    def on_service_vanished(self, callback):
+        """Register a callback to be invoked when the D-Bus service disappears."""
+        self._vanished_callbacks.append(callback)
+
+    def detect_devices(self):
+        result = self.proxy.call_sync(
+            "DetectDevices",
+            None,
+            Gio.DBusCallFlags.NONE,
+            30000,
+            None,
+        )
+        return result.unpack()[0]
+
+    def get_keyslots(self, device):
+        result = self.proxy.call_sync(
+            "GetKeyslots",
+            GLib.Variant("(s)", (device,)),
+            Gio.DBusCallFlags.NONE,
+            30000,
+            None,
+        )
+        # Service returns JSON with string keys; convert to {int: str}
+        raw = json.loads(result.unpack()[0])
+        return {int(k): v for k, v in raw.items()}
+
+    def get_tokens_by_type(self, device, token_type):
+        result = self.proxy.call_sync(
+            "GetTokensByType",
+            GLib.Variant("(ss)", (device, token_type)),
+            Gio.DBusCallFlags.NONE,
+            30000,
+            None,
+        )
+        # Service returns JSON list of [token_id, [keyslot_ids]]
+        raw = json.loads(result.unpack()[0])
+        return [(int(tid), [int(s) for s in slots]) for tid, slots in raw]
+
+    def check_fido2_enrolled(self, device, fido2_dev_paths):
+        """Return list of /dev/hidrawN paths already enrolled on this volume."""
+        result = self.proxy.call_sync(
+            "CheckFido2Enrolled",
+            GLib.Variant("(sas)", (device, fido2_dev_paths)),
+            Gio.DBusCallFlags.NONE,
+            30000,
+            None,
+        )
+        return result.unpack()[0]
+
+    def find_password_keyslots(self, device):
+        result = self.proxy.call_sync(
+            "FindPasswordKeyslots",
+            GLib.Variant("(s)", (device,)),
+            Gio.DBusCallFlags.NONE,
+            30000,
+            None,
+        )
+        return result.unpack()[0]
+
+    def verify_passphrase(self, device, passphrase):
+        result = self.proxy.call_sync(
+            "VerifyPassphrase",
+            GLib.Variant("(ss)", (device, passphrase)),
+            Gio.DBusCallFlags.NONE,
+            30000,
+            None,
+        )
+        return result.unpack()  # (bool, int)
+
+    def verify_passphrase_async(self, device, passphrase, callback):
+        """Async version — safe for polkit interaction on the main loop."""
+        self.proxy.call(
+            "VerifyPassphrase",
+            GLib.Variant("(ss)", (device, passphrase)),
+            Gio.DBusCallFlags.NONE,
+            60000,
+            None,
+            callback,
+        )
+
+    def unlock_with_token_async(self, device, token_type, pin, callback):
+        """Async token unlock — TPM2 or FIDO2."""
+        self.proxy.call(
+            "UnlockWithToken",
+            GLib.Variant("(sss)", (device, token_type, pin)),
+            Gio.DBusCallFlags.NONE,
+            60000,
+            None,
+            callback,
+        )
+
+    def enroll_fido2(self, device, passphrase, pin, fido2_device,
+                     unlock_method="passphrase", unlock_pin=""):
+        result = self.proxy.call_sync(
+            "EnrollFido2",
+            GLib.Variant("(ssssss)", (device, passphrase, pin, fido2_device,
+                                      unlock_method, unlock_pin)),
+            Gio.DBusCallFlags.NONE,
+            120000,
+            None,
+        )
+        return result.unpack()  # (bool, str, str)
+
+    def enroll_tpm2(self, device, passphrase, pin, pcrs,
+                    unlock_method="passphrase", unlock_pin=""):
+        result = self.proxy.call_sync(
+            "EnrollTpm2",
+            GLib.Variant("(ssssss)", (device, passphrase, pin, pcrs,
+                                      unlock_method, unlock_pin)),
+            Gio.DBusCallFlags.NONE,
+            120000,
+            None,
+        )
+        return result.unpack()  # (bool, str, str)
+
+    def enroll_recovery_key(self, device, passphrase,
+                            unlock_method="passphrase", unlock_pin=""):
+        result = self.proxy.call_sync(
+            "EnrollRecoveryKey",
+            GLib.Variant("(ssss)", (device, passphrase, unlock_method,
+                                    unlock_pin)),
+            Gio.DBusCallFlags.NONE,
+            120000,
+            None,
+        )
+        return result.unpack()  # (bool, str, str)
+
+    def wipe_slot(self, device, passphrase, unlock_method, pin, slot):
+        result = self.proxy.call_sync(
+            "WipeSlot",
+            GLib.Variant("(ssssi)", (device, passphrase, unlock_method, pin, slot)),
+            Gio.DBusCallFlags.NONE,
+            30000,
+            None,
+        )
+        return result.unpack()  # (bool, str, str)
+
+    def create_encrypted_image(self, path, size_mb, passphrase):
+        result = self.proxy.call_sync(
+            "CreateEncryptedImage",
+            GLib.Variant("(sis)", (path, size_mb, passphrase)),
+            Gio.DBusCallFlags.NONE,
+            60000,
+            None,
+        )
+        return result.unpack()  # (bool, int, str)
+
+    def create_encrypted_image_async(self, path, size_mb, passphrase, callback):
+        """Async version — runs on main loop so polkit can show its auth dialog."""
+        self.proxy.call(
+            "CreateEncryptedImage",
+            GLib.Variant("(sis)", (path, size_mb, passphrase)),
+            Gio.DBusCallFlags.NONE,
+            120000,
+            None,
+            callback,
+        )
+
+    def authenticate_async(self, callback):
+        """Trigger polkit auth asynchronously. Callback receives (proxy, result)."""
+        self.proxy.call(
+            "Authenticate",
+            None,
+            Gio.DBusCallFlags.NONE,
+            120000,
+            None,
+            callback,
+        )
+
+    def detect_removable_devices(self):
+        result = self.proxy.call_sync(
+            "DetectRemovableDevices",
+            None,
+            Gio.DBusCallFlags.NONE,
+            30000,
+            None,
+        )
+        return json.loads(result.unpack()[0])
+
+    def get_device_info(self, device):
+        result = self.proxy.call_sync(
+            "GetDeviceInfo",
+            GLib.Variant("(s)", (device,)),
+            Gio.DBusCallFlags.NONE,
+            30000,
+            None,
+        )
+        return json.loads(result.unpack()[0])
+
+    def format_partition(self, device, passphrase):
+        result = self.proxy.call_sync(
+            "FormatPartition",
+            GLib.Variant("(ss)", (device, passphrase)),
+            Gio.DBusCallFlags.NONE,
+            120000,
+            None,
+        )
+        return result.unpack()  # (bool, str, str)
+
+    def enroll_passphrase(self, device, existing_passphrase, new_passphrase,
+                          unlock_method="passphrase", unlock_pin=""):
+        result = self.proxy.call_sync(
+            "EnrollPassphrase",
+            GLib.Variant("(sssss)", (device, existing_passphrase, new_passphrase,
+                                     unlock_method, unlock_pin)),
+            Gio.DBusCallFlags.NONE,
+            120000,
+            None,
+        )
+        return result.unpack()  # (bool, str, str)
+
+    def get_setting(self, key):
+        result = self.proxy.call_sync(
+            "GetSetting",
+            GLib.Variant("(s)", (key,)),
+            Gio.DBusCallFlags.NONE,
+            10000,
+            None,
+        )
+        return result.unpack()[0]
+
+    def set_setting(self, key, value):
+        result = self.proxy.call_sync(
+            "SetSetting",
+            GLib.Variant("(ss)", (key, value)),
+            Gio.DBusCallFlags.NONE,
+            10000,
+            None,
+        )
+        return result.unpack()[0]
+
+    def get_systemd_version(self):
+        result = self.proxy.call_sync(
+            "GetSystemdVersion",
+            None,
+            Gio.DBusCallFlags.NONE,
+            10000,
+            None,
+        )
+        return result.unpack()[0]
+
+
+# ---------------------------------------------------------------------------
+# Unprivileged hardware detection helpers
+# ---------------------------------------------------------------------------
+
+
+def detect_fido2_devices():
+    """Return list of detected FIDO2 device (hidraw_name, hid_name) from /sys/class/hidraw.
+
+    Each physical token may expose multiple hidraw interfaces (OTP, FIDO).
+    We deduplicate by HID_PHYS (USB physical path) so each physical device
+    appears once, and we prefer the FIDO-named interface.
+    """
+    candidates = []  # (dev_name, hid_name, hid_phys)
+    for hidraw in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        uevent = os.path.join(hidraw, "device", "uevent")
+        try:
+            with open(uevent) as f:
+                data = f.read()
+            hid_name = ""
+            hid_phys = ""
+            for line in data.splitlines():
+                if line.startswith("HID_NAME="):
+                    hid_name = line.split("=", 1)[1]
+                elif line.startswith("HID_PHYS="):
+                    hid_phys = line.split("=", 1)[1]
+            name_lower = hid_name.lower()
+            if any(
+                k in name_lower
+                for k in ("yubi", "fido", "u2f", "nitro", "solo", "titan", "onlykey")
+            ):
+                dev_name = os.path.basename(hidraw)
+                candidates.append((dev_name, hid_name, hid_phys))
+        except (OSError, IOError):
+            continue
+
+    # Deduplicate by USB physical path — keep one hidraw per physical device.
+    seen_phys = {}  # base_phys -> (dev_name, hid_name)
+    for dev_name, hid_name, hid_phys in candidates:
+        base_phys = hid_phys.rsplit("/", 1)[0] if "/" in hid_phys else hid_phys
+        if base_phys not in seen_phys:
+            seen_phys[base_phys] = (dev_name, hid_name)
+        else:
+            if "input1" in hid_phys:
+                seen_phys[base_phys] = (dev_name, hid_name)
+
+    return list(seen_phys.values())
+
+
+def detect_tpm2_device():
+    """Return TPM2 device info string, or None if not found."""
+    tpm_path = "/sys/class/tpm/tpm0"
+    if not os.path.isdir(tpm_path):
+        return None
+    try:
+        desc_parts = []
+        caps_file = os.path.join(tpm_path, "tpm_version_major")
+        if os.path.isfile(caps_file):
+            with open(caps_file) as f:
+                ver = f.read().strip()
+            if ver != "2":
+                return None
+            desc_parts.append(f"TPM {ver}.0")
+        else:
+            desc_parts.append("TPM")
+        mfr_file = os.path.join(tpm_path, "device", "description")
+        if os.path.isfile(mfr_file):
+            with open(mfr_file) as f:
+                desc_parts.append(f.read().strip())
+        return " — ".join(desc_parts) if desc_parts else "TPM2 detected"
+    except (OSError, IOError):
+        return "TPM2 detected"
+
+
+# ---------------------------------------------------------------------------
+# Wizard Pages
+# ---------------------------------------------------------------------------
+
+
+class WelcomePage(Gtk.ScrolledWindow):
+    """Combined intro + device detection page."""
+
+    def __init__(self):
+        super().__init__()
+        self.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.device = None
+        self._on_submit = None  # callback for Enter key
+        self._empty_pw_result = None  # set if empty passphrase unlocks the device
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        inner.set_margin_top(24)
+        inner.set_margin_bottom(24)
+        inner.set_margin_start(32)
+        inner.set_margin_end(32)
+        self.set_child(inner)
+
+        icon = Gtk.Image.new_from_icon_name("security-high-symbolic")
+        icon.set_pixel_size(48)
+        inner.append(icon)
+
+        title = Gtk.Label(label="Full Disk Encryption Setup")
+        title.add_css_class("title-1")
+        inner.append(title)
+
+        # --- Device detection section ---
+        self._detected_devices = []  # list of device paths
+        self.device_status_label = Gtk.Label(
+            label="Detecting LUKS devices…", wrap=True, xalign=0
+        )
+        inner.append(self.device_status_label)
+
+        self._device_dropdown_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=4
+        )
+        self._device_dropdown = Gtk.DropDown()
+        self._device_dropdown.connect("notify::selected", self._on_device_selected)
+        self._device_dropdown_box.append(self._device_dropdown)
+        self._device_dropdown_box.set_visible(False)
+        inner.append(self._device_dropdown_box)
+
+        self.slots_label = Gtk.Label(label="", wrap=True, xalign=0)
+        inner.append(self.slots_label)
+
+        # Unlock credentials
+        self._unlock_label = Gtk.Label(label="Unlock the volume to proceed:", xalign=0)
+        self._unlock_label.set_margin_top(4)
+        self._unlock_label.add_css_class("dim-label")
+        inner.append(self._unlock_label)
+
+        self._pw_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        pw_label = Gtk.Label(label="LUKS passphrase:", xalign=0)
+        self._pw_box.append(pw_label)
+        self.passphrase_entry = Gtk.PasswordEntry()
+        self.passphrase_entry.set_show_peek_icon(True)
+        self.passphrase_entry.connect(
+            "activate", lambda _: self._on_submit() if self._on_submit else None
+        )
+        self._pw_box.append(self.passphrase_entry)
+        inner.append(self._pw_box)
+
+        self._rk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        rk_label = Gtk.Label(label="Recovery key:", xalign=0)
+        self._rk_box.append(rk_label)
+        self.recovery_entry = Gtk.PasswordEntry()
+        self.recovery_entry.set_show_peek_icon(True)
+        self.recovery_entry.connect(
+            "activate", lambda _: self._on_submit() if self._on_submit else None
+        )
+        self._rk_box.append(self.recovery_entry)
+        inner.append(self._rk_box)
+
+        self.pw_error_label = Gtk.Label(label="", xalign=0)
+        self.pw_error_label.add_css_class("error")
+        inner.append(self.pw_error_label)
+
+        self._verify_spinner = Gtk.Spinner()
+        inner.append(self._verify_spinner)
+
+        # --- Enrollment options ---
+        opts_label = Gtk.Label(
+            label="Select which enrollment methods to configure:", xalign=0
+        )
+        opts_label.set_margin_top(4)
+        inner.append(opts_label)
+
+        opts_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        # FIDO2 option with detected devices (live-updating)
+        self._fido2_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.chk_fido2 = Gtk.CheckButton(
+            label="FIDO2 security key with PIN (e.g. YubiKey)"
+        )
+        self._fido2_box.append(self.chk_fido2)
+
+        self._fido2_det_label = Gtk.Label(
+            label="    No FIDO2 device detected — plug one in", xalign=0
+        )
+        self._fido2_det_label.add_css_class("dim-label")
+        self._fido2_box.append(self._fido2_det_label)
+        self.chk_fido2.set_active(False)
+        self.chk_fido2.set_sensitive(False)
+        self._fido2_known = []
+
+        opts_box.append(self._fido2_box)
+
+        self._udev_client = GUdev.Client(subsystems=["hidraw"])
+        self._udev_signal_id = self._udev_client.connect(
+            "uevent", self._on_udev_event
+        )
+        self._poll_fido2()
+
+        # TPM2 option
+        tpm2_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.chk_tpm2 = Gtk.CheckButton(label="TPM2 chip (boot unlock, optional PIN)")
+        self.chk_tpm2.set_active(True)
+        tpm2_box.append(self.chk_tpm2)
+
+        tpm2_info = detect_tpm2_device()
+        if tpm2_info:
+            det_label = Gtk.Label(label=f"    Detected: {tpm2_info}", xalign=0)
+            det_label.add_css_class("dim-label")
+            tpm2_box.append(det_label)
+        else:
+            det_label = Gtk.Label(label="    No TPM2 device detected", xalign=0)
+            det_label.add_css_class("dim-label")
+            self.chk_tpm2.set_active(False)
+            tpm2_box.append(det_label)
+        opts_box.append(tpm2_box)
+
+        self.chk_recovery = Gtk.CheckButton(label="Recovery key (write it down!)")
+        self.chk_recovery.set_active(True)
+        opts_box.append(self.chk_recovery)
+
+        # Delete password option with detected slots
+        pw_opt_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.chk_delete_pw = Gtk.CheckButton(
+            label="Remove original password keyslot after enrollment"
+        )
+        pw_opt_box.append(self.chk_delete_pw)
+
+        self._pw_det_label = Gtk.Label(label="", xalign=0)
+        self._pw_det_label.add_css_class("dim-label")
+        pw_opt_box.append(self._pw_det_label)
+
+        # Password slot state depends on device — will be updated by _update_device_info
+        self.chk_delete_pw.set_active(False)
+        self.chk_delete_pw.set_sensitive(False)
+        self._pw_det_label.set_text(
+            "    Unlock device first to detect password keyslots"
+        )
+
+        opts_box.append(pw_opt_box)
+        inner.append(opts_box)
+
+    def get_passphrase(self):
+        """Return whichever unlock credential was provided."""
+        pw = self.passphrase_entry.get_text()
+        rk = self.recovery_entry.get_text()
+        return pw or rk
+
+    def _get_svc(self):
+        """Get the D-Bus proxy from the window."""
+        win = self.get_root()
+        return win.svc if win and hasattr(win, "svc") else None
+
+    def _update_unlock_fields(self, device):
+        """Show/hide passphrase and recovery key fields based on LUKS header."""
+        svc = self._get_svc()
+        if not svc:
+            # Fallback: show both fields
+            self._pw_box.set_visible(True)
+            self._rk_box.set_visible(True)
+            self._unlock_label.set_visible(True)
+            return
+        try:
+            has_password = bool(svc.find_password_keyslots(device))
+            has_recovery = bool(svc.get_tokens_by_type(device, "systemd-recovery"))
+        except GLib.Error:
+            has_password = True
+            has_recovery = False
+        self._unlock_label.set_text("Unlock the volume to proceed:")
+        self._unlock_label.set_visible(True)
+        self._pw_box.set_visible(has_password)
+        self._rk_box.set_visible(has_recovery)
+        if not has_password and not has_recovery:
+            self._pw_box.set_visible(True)
+
+    def _update_device_info(self, device):
+        """Update device display and password slot detection."""
+        self.device = device
+        self._empty_pw_result = None
+        svc = self._get_svc()
+        if not svc:
+            return
+        try:
+            slots = svc.get_keyslots(device)
+        except GLib.Error:
+            slots = {}
+        if slots:
+            lines = [f"  Slot {s}: {t}" for s, t in sorted(slots.items())]
+            self.slots_label.set_text("Current keyslots:\n" + "\n".join(lines))
+        else:
+            self.slots_label.set_text("")
+        # Update password slot checkbox
+        try:
+            pw_slots = svc.find_password_keyslots(device)
+        except GLib.Error:
+            pw_slots = []
+        if pw_slots:
+            slot_str = ", ".join(str(s) for s in pw_slots)
+            self._pw_det_label.set_text(f"    Password keyslot(s) found: {slot_str}")
+            self.chk_delete_pw.set_sensitive(True)
+            self.chk_delete_pw.set_active(True)
+        else:
+            self._pw_det_label.set_text("    No password keyslots found")
+            self.chk_delete_pw.set_sensitive(False)
+            self.chk_delete_pw.set_active(False)
+        # Try empty passphrase in background before showing unlock fields
+        self._pw_box.set_visible(False)
+        self._rk_box.set_visible(False)
+        self._unlock_label.set_visible(False)
+        self._verify_spinner.start()
+
+        def try_empty():
+            try:
+                ok, keyslot = svc.verify_passphrase(device, "")
+            except GLib.Error:
+                ok, keyslot = False, -1
+            GLib.idle_add(self._on_empty_pw_checked, device, ok, keyslot)
+
+        threading.Thread(target=try_empty, daemon=True).start()
+
+    def _on_empty_pw_checked(self, device, ok, result):
+        """Handle result of empty passphrase test."""
+        self._verify_spinner.stop()
+        if device != self.device:
+            return  # device changed while checking
+        if ok:
+            self._empty_pw_result = (ok, result)
+            self._unlock_label.set_text("Volume unlocked (empty passphrase).")
+            self._unlock_label.set_visible(True)
+            self._pw_box.set_visible(False)
+            self._rk_box.set_visible(False)
+        else:
+            self._empty_pw_result = None
+            self._update_unlock_fields(device)
+
+    def detect(self):
+        """Detect all LUKS devices."""
+        svc = self._get_svc()
+        if svc:
+            try:
+                devices = svc.detect_devices()
+            except GLib.Error as e:
+                self.device_status_label.set_text(
+                    f"Error detecting LUKS devices: {e.message}"
+                )
+                self._device_dropdown_box.set_visible(False)
+                devices = []
+        else:
+            devices = []
+        self._detected_devices = devices
+        if not devices:
+            self.device_status_label.set_text(
+                "Could not detect a LUKS device.\n\n"
+                "Make sure /dev is bind-mounted in the chroot and /etc/crypttab exists."
+            )
+            self._device_dropdown_box.set_visible(False)
+            return False
+        if len(devices) == 1:
+            self.device_status_label.set_text("LUKS device:")
+        else:
+            self.device_status_label.set_text("Select LUKS device:")
+        self._device_dropdown.set_model(Gtk.StringList.new(devices))
+        self._device_dropdown_box.set_visible(True)
+        self._device_dropdown.set_selected(0)
+        self._update_device_info(devices[0])
+        return True
+
+    def _on_device_selected(self, dropdown, _pspec):
+        """Handle user selecting a different LUKS device from the dropdown."""
+        idx = dropdown.get_selected()
+        if idx < len(self._detected_devices):
+            self._update_device_info(self._detected_devices[idx])
+            # Clear any previous passphrase/error
+            self.passphrase_entry.set_text("")
+            self.recovery_entry.set_text("")
+            self.pw_error_label.set_text("")
+
+    def _poll_fido2(self):
+        """Scan for FIDO2 devices and update the UI."""
+        devices = detect_fido2_devices()
+        names = [d[1] for d in devices]
+        if names != self._fido2_known:
+            self._fido2_known = names
+            if devices:
+                label_text = "\n".join(f"    Detected: {name}" for name in names)
+                self._fido2_det_label.set_text(label_text)
+                self.chk_fido2.set_sensitive(True)
+                self.chk_fido2.set_active(True)
+            else:
+                self._fido2_det_label.set_text(
+                    "    No FIDO2 device detected \u2014 plug one in"
+                )
+                self.chk_fido2.set_sensitive(False)
+                self.chk_fido2.set_active(False)
+
+    def _on_udev_event(self, _client, action, _device):
+        """Handle hidraw device add/remove via udev."""
+        if action in ("add", "remove"):
+            self._poll_fido2()
+
+    def stop_polling(self):
+        """Disconnect the udev event subscription."""
+        if self._udev_signal_id and self._udev_client:
+            self._udev_client.disconnect(self._udev_signal_id)
+            self._udev_signal_id = None
+        self._udev_client = None
+
+    @property
+    def selections(self):
+        return {
+            "fido2": self.chk_fido2.get_active(),
+            "tpm2": self.chk_tpm2.get_active(),
+            "recovery": self.chk_recovery.get_active(),
+            "delete_pw": self.chk_delete_pw.get_active(),
+        }
+
+
+class EnrollStepPage(Gtk.Box):
+    """Generic page for running a systemd-cryptenroll step."""
+
+    def __init__(
+        self,
+        step_title,
+        step_description,
+        icon_name="dialog-password-symbolic",
+        needs_pin=False,
+        single_pin=False,
+        pin_optional=False,
+        token_type=None,
+    ):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.set_margin_top(32)
+        self.set_margin_bottom(32)
+        self.set_margin_start(32)
+        self.set_margin_end(32)
+        self.needs_pin = needs_pin
+        self.single_pin = single_pin
+        self.pin_optional = pin_optional
+        self.token_type = (
+            token_type  # e.g. "systemd-fido2", "systemd-tpm2", "systemd-recovery"
+        )
+        self._on_submit = None  # callback set by window for Enter key
+        self._existing_wipe_checks = []  # list of (keyslot, CheckButton)
+        self._is_running = False
+
+        # Device path label (set by window after device is known)
+        self.device_label = Gtk.Label(label="", xalign=0, wrap=True)
+        self.device_label.add_css_class("monospace")
+        self.device_label.add_css_class("dim-label")
+        self.append(self.device_label)
+
+        icon = Gtk.Image.new_from_icon_name(icon_name)
+        icon.set_pixel_size(48)
+        self.append(icon)
+
+        title = Gtk.Label(label=step_title)
+        title.add_css_class("title-2")
+        self.append(title)
+
+        desc = Gtk.Label(label=step_description, wrap=True, xalign=0)
+        desc.set_max_width_chars(60)
+        self.append(desc)
+
+        # Existing enrollments section (populated when device is set)
+        self.existing_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.existing_box.set_margin_top(4)
+        self.append(self.existing_box)
+
+        # PIN entry fields (shown only when needs_pin is True)
+        self.pin_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        if needs_pin:
+            pin_text = "Enter PIN (optional):" if pin_optional else "Enter PIN:"
+            pin_label = Gtk.Label(label=pin_text, xalign=0)
+            self.pin_box.append(pin_label)
+            self.pin_entry = Gtk.PasswordEntry()
+            self.pin_entry.set_show_peek_icon(True)
+            self.pin_box.append(self.pin_entry)
+
+            if not single_pin:
+                confirm_label = Gtk.Label(label="Confirm PIN:", xalign=0)
+                self.pin_box.append(confirm_label)
+                self.pin_confirm_entry = Gtk.PasswordEntry()
+                self.pin_confirm_entry.set_show_peek_icon(True)
+                self.pin_box.append(self.pin_confirm_entry)
+
+                # Enter in first PIN field focuses confirm field
+                self.pin_entry.connect(
+                    "activate", lambda _: self.pin_confirm_entry.grab_focus()
+                )
+                # Enter in confirm field triggers submit
+                self.pin_confirm_entry.connect("activate", self._on_pin_activate)
+            else:
+                # Single PIN: Enter triggers submit directly
+                self.pin_entry.connect("activate", self._on_pin_activate)
+
+            self.pin_error_label = Gtk.Label(label="", xalign=0)
+            self.pin_error_label.add_css_class("error")
+            self.pin_box.append(self.pin_error_label)
+
+        # Inline Enroll button (right under PIN fields)
+        self.btn_enroll = Gtk.Button(label="Enroll")
+        self.btn_enroll.add_css_class("suggested-action")
+        self.btn_enroll.set_halign(Gtk.Align.START)
+        self.btn_enroll.set_visible(False)  # shown by subclasses or window
+        self.btn_enroll.connect(
+            "clicked", lambda _: self._on_submit() if self._on_submit else None
+        )
+        self.pin_box.append(self.btn_enroll)
+
+        self.append(self.pin_box)
+
+        self.spinner = Gtk.Spinner()
+        self.append(self.spinner)
+
+        self.status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
+        self.append(self.status_label)
+
+        # Scrolled window for command output
+        self.output_view = Gtk.TextView()
+        self.output_view.set_editable(False)
+        self.output_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.output_view.set_monospace(True)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_min_content_height(120)
+        scroll.set_vexpand(True)
+        scroll.set_child(self.output_view)
+        self.append(scroll)
+
+        # Overlay for "touch your token" (used by FIDO2)
+        self.touch_overlay = Gtk.Overlay()
+        self._touch_banner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self._touch_banner.set_halign(Gtk.Align.CENTER)
+        self._touch_banner.set_valign(Gtk.Align.CENTER)
+        self._touch_banner_frame = Gtk.Frame()
+        self._touch_banner_frame.set_child(self._touch_banner)
+        self._touch_banner_frame.add_css_class("touch-overlay")
+        self._touch_banner_frame.set_visible(False)
+
+        touch_icon = Gtk.Image.new_from_icon_name("auth-fingerprint-symbolic")
+        touch_icon.set_pixel_size(64)
+        self._touch_banner.append(touch_icon)
+        touch_label = Gtk.Label(label="Touch your FIDO2 security key now")
+        touch_label.add_css_class("title-2")
+        self._touch_banner.append(touch_label)
+        self._touch_progress = Gtk.ProgressBar()
+        self._touch_progress.set_size_request(250, -1)
+        self._touch_banner.append(self._touch_progress)
+        self._touch_pulse_id = None
+
+        self.success = False
+
+    def _on_pin_activate(self, _widget):
+        if self._on_submit:
+            self._on_submit()
+
+    def set_device(self, device_path):
+        self.device_label.set_text(f"Device: {device_path}")
+        self._populate_existing(device_path)
+
+    def _populate_existing(self, device_path):
+        """Scan for existing enrollments of this token type and show them with Wipe buttons."""
+        self._device_path = device_path
+        self._clear_existing_box()
+
+        if not self.token_type:
+            return
+
+        win = self.get_root()
+        if not win or not hasattr(win, "svc"):
+            return
+
+        try:
+            existing = win.svc.get_tokens_by_type(device_path, self.token_type)
+        except GLib.Error:
+            return
+        if not existing:
+            return
+
+        type_label_map = {
+            "systemd-fido2": "FIDO2",
+            "systemd-tpm2": "TPM2",
+            "systemd-recovery": "Recovery key",
+        }
+        type_name = type_label_map.get(self.token_type, self.token_type)
+
+        header = Gtk.Label(
+            label=f"Existing {type_name} enrollment(s):",
+            xalign=0,
+        )
+        header.add_css_class("dim-label")
+        self.existing_box.append(header)
+
+        # Check which keyslot was used to authenticate
+        auth_keyslot = getattr(win, "auth_keyslot", None) if win else None
+
+        for token_id, slots in existing:
+            slot_str = ", ".join(str(s) for s in slots)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            is_auth_slot = auth_keyslot is not None and auth_keyslot in slots
+            label_text = f"Token {token_id} (keyslot {slot_str})"
+            if is_auth_slot:
+                label_text += "  — in use for authentication"
+            label = Gtk.Label(label=label_text, xalign=0, hexpand=True)
+            row.append(label)
+            wipe_btn = Gtk.Button(label="Wipe")
+            wipe_btn.add_css_class("destructive-action")
+            if is_auth_slot:
+                wipe_btn.set_sensitive(False)
+                wipe_btn.set_tooltip_text(
+                    "Cannot wipe the keyslot used to authenticate this session"
+                )
+            else:
+                wipe_btn.connect("clicked", self._on_wipe_clicked, slots, row)
+            row.append(wipe_btn)
+            self.existing_box.append(row)
+
+    def _clear_existing_box(self):
+        child = self.existing_box.get_first_child()
+        while child:
+            next_child = child.get_next_sibling()
+            self.existing_box.remove(child)
+            child = next_child
+
+    def _on_wipe_clicked(self, btn, slots, row):
+        """Wipe the given keyslots via the D-Bus service."""
+        win = self.get_root()
+        if not isinstance(win, WizardWindow):
+            return
+        # Safety check: never wipe the authentication keyslot
+        if win.auth_keyslot is not None and win.auth_keyslot in slots:
+            btn.set_label("Protected")
+            btn.set_sensitive(False)
+            return
+        btn.set_sensitive(False)
+        btn.set_label("Wiping…")
+
+        def do_wipe():
+            all_ok = True
+            for slot in slots:
+                try:
+                    ok, _out, _err = win.svc.wipe_slot(
+                        win.device, win.luks_passphrase,
+                        "passphrase", "", slot
+                    )
+                    if not ok:
+                        all_ok = False
+                except GLib.Error:
+                    all_ok = False
+            GLib.idle_add(self._on_wipe_done, all_ok, row, btn)
+
+        threading.Thread(target=do_wipe, daemon=True).start()
+
+    def _on_wipe_done(self, ok, row, btn):
+        if ok:
+            btn.set_label("Wiped")
+            btn.add_css_class("dim-label")
+            # Re-enable enrollment controls after wipe
+            self.success = False
+            if self.needs_pin:
+                self.pin_box.set_sensitive(True)
+            self.btn_enroll.set_sensitive(True)
+            # Rescan existing enrollments
+            if hasattr(self, "_device_path") and self._device_path:
+                self._populate_existing(self._device_path)
+        else:
+            btn.set_label("Failed")
+            btn.set_sensitive(True)
+
+    def get_slots_to_wipe(self):
+        """No longer auto-wipe — wipe is done via explicit Wipe buttons."""
+        return []
+
+    def show_touch_overlay(self, parent_overlay):
+        """Show the touch-your-token overlay on the given Gtk.Overlay."""
+        parent_overlay.add_overlay(self._touch_banner_frame)
+        self._touch_banner_frame.set_visible(True)
+        self._touch_progress.set_fraction(0.0)
+        self._touch_pulse_id = GLib.timeout_add(100, self._pulse_progress)
+
+    def _pulse_progress(self):
+        frac = self._touch_progress.get_fraction()
+        # Ease towards ~90% over several seconds, never reaching 100%
+        frac += (0.92 - frac) * 0.04
+        self._touch_progress.set_fraction(frac)
+        return True  # keep running
+
+    def hide_touch_overlay(self, parent_overlay):
+        """Hide and remove the touch overlay."""
+        if self._touch_pulse_id:
+            GLib.source_remove(self._touch_pulse_id)
+            self._touch_pulse_id = None
+        self._touch_banner_frame.set_visible(False)
+        parent_overlay.remove_overlay(self._touch_banner_frame)
+
+    def validate_pin(self):
+        """Check PIN fields match and are non-empty (unless optional). Returns (ok, pin)."""
+        if not self.needs_pin:
+            return True, None
+        pin = self.pin_entry.get_text()
+        if not pin and not self.pin_optional:
+            self.pin_error_label.set_text("PIN cannot be empty.")
+            return False, None
+        if pin and not self.single_pin:
+            confirm = self.pin_confirm_entry.get_text()
+            if pin != confirm:
+                self.pin_error_label.set_text("PINs do not match.")
+                return False, None
+        self.pin_error_label.set_text("")
+        return True, pin
+
+    def set_running(self):
+        self._is_running = True
+        self.spinner.start()
+        self.status_label.set_text("Running…")
+        self.status_label.remove_css_class("success")
+        self.status_label.remove_css_class("error")
+        if self.needs_pin:
+            self.pin_box.set_sensitive(False)
+        self.btn_enroll.set_sensitive(False)
+
+    def set_result(self, ok, stdout, stderr):
+        self._is_running = False
+        self.spinner.stop()
+        buf = self.output_view.get_buffer()
+        output = ""
+        if stdout:
+            output += stdout
+        if stderr:
+            output += "\n" + stderr if output else stderr
+        buf.set_text(output.strip())
+        if ok:
+            self.success = True
+            self.status_label.set_text("Enrolled successfully.")
+            self.status_label.add_css_class("success")
+        else:
+            self.success = False
+            self.status_label.set_text("Enrollment failed — see output above.")
+            self.status_label.add_css_class("error")
+            if self.needs_pin:
+                self.pin_entry.set_text("")
+                self.pin_box.set_sensitive(True)
+            self.btn_enroll.set_sensitive(True)
+
+
+class RecoveryKeyPage(EnrollStepPage):
+    """Shows the recovery key prominently so the user can write it down."""
+
+    def __init__(self):
+        super().__init__(
+            "Recovery Key",
+            "A recovery key will be generated. You MUST write it down and store it safely.\n"
+            "This is your last resort if both your FIDO2 key and TPM are unavailable.",
+            icon_name="dialog-warning-symbolic",
+            needs_pin=False,
+            token_type="systemd-recovery",
+        )
+        self.recovery_key_label = Gtk.Label(
+            label="", selectable=True, wrap=True, xalign=0
+        )
+        self.recovery_key_label.add_css_class("title-3")
+        self.recovery_key_label.add_css_class("monospace")
+        # Insert before the scrolled window
+        self.insert_child_after(self.recovery_key_label, self.status_label)
+
+    def set_result(self, ok, stdout, stderr):
+        super().set_result(ok, stdout, stderr)
+        if ok and stdout:
+            # systemd-cryptenroll prints the recovery key on stdout
+            for line in stdout.splitlines():
+                line = line.strip()
+                # Recovery keys look like groups of characters separated by dashes
+                if line and len(line) > 20 and "-" in line:
+                    self.recovery_key_label.set_text(f"\n{line}\n")
+                    break
+
+
+class FIDO2Page(EnrollStepPage):
+    """FIDO2 enrollment — supports enrolling multiple tokens sequentially."""
+
+    def __init__(self):
+        super().__init__(
+            "FIDO2 Enrollment",
+            "Enrolling your FIDO2 security key.\n"
+            "Enter your FIDO2 token's PIN below.\n"
+            "You may also need to touch your key.",
+            icon_name="auth-fingerprint-symbolic",
+            needs_pin=True,
+            single_pin=True,
+            token_type="systemd-fido2",
+        )
+        # FIDO2 device selector (always shown when multiple tokens present)
+        self._fido2_select_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=4
+        )
+        fido2_sel_label = Gtk.Label(label="Select FIDO2 device:", xalign=0)
+        self._fido2_select_box.append(fido2_sel_label)
+        self._fido2_dropdown = Gtk.DropDown()
+        self._fido2_dropdown.connect("notify::selected", self._on_dropdown_changed)
+        self._fido2_select_box.append(self._fido2_dropdown)
+        self._all_fido2_devices = []  # all detected (hidraw_name, hid_name)
+        self._fido2_devices = []  # unenrolled only
+        self._enrolled_devs = set()  # hidraw names already enrolled this session
+        self._server_enrolled_devs = set()  # hidraw names enrolled on the volume
+        self.svc = None  # set by caller before use
+        # Insert before PIN box
+        self.insert_child_after(self._fido2_select_box, self.existing_box)
+
+        # Show inline Enroll button
+        self.btn_enroll.set_visible(True)
+        self.btn_enroll.set_label("Enroll")
+
+        self.enroll_count = 0  # how many tokens enrolled so far
+        self._udev_client = None
+        self._udev_signal_id = None
+
+    def refresh_fido2_devices(self, devices=None):
+        """Re-scan FIDO2 devices and update the dropdown."""
+        self._all_fido2_devices = devices if devices is not None else detect_fido2_devices()
+        all_enrolled = self._enrolled_devs | self._server_enrolled_devs
+        self._fido2_devices = [
+            d for d in self._all_fido2_devices if d[0] not in all_enrolled
+        ]
+
+        if len(self._all_fido2_devices) <= 1:
+            self._fido2_select_box.set_visible(False)
+        else:
+            self._fido2_select_box.set_visible(True)
+            labels = []
+            for dev, name in self._all_fido2_devices:
+                if dev in all_enrolled:
+                    labels.append(f"\u2713 /dev/{dev} — {name}")
+                else:
+                    labels.append(f"/dev/{dev} — {name}")
+            self._fido2_dropdown.set_model(Gtk.StringList.new(labels))
+            # Select the first unenrolled device
+            for i, (dev, _) in enumerate(self._all_fido2_devices):
+                if dev not in all_enrolled:
+                    self._fido2_dropdown.set_selected(i)
+                    break
+        # Update enroll button and PIN sensitivity
+        self.btn_enroll.set_sensitive(len(self._fido2_devices) > 0)
+        self._update_pin_enrolled_hint()
+
+    def _fetch_enrolled_status(self):
+        """Query the service for which connected tokens are already enrolled."""
+        if not self.svc or not hasattr(self, '_device_path'):
+            return
+        dev_paths = [f"/dev/{d[0]}" for d in self._all_fido2_devices]
+        if not dev_paths:
+            return
+        self.btn_enroll.set_sensitive(False)
+        if self.needs_pin:
+            self.pin_box.set_sensitive(False)
+        def fetch():
+            try:
+                paths = self.svc.check_fido2_enrolled(
+                    self._device_path, dev_paths
+                )
+                # paths are like "/dev/hidraw3" — extract hidraw name
+                names = set()
+                for p in paths:
+                    name = p.replace("/dev/", "")
+                    if name:
+                        names.add(name)
+                GLib.idle_add(self._apply_enrolled_status, names)
+            except GLib.Error:
+                GLib.idle_add(self._apply_enrolled_status, set())
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _apply_enrolled_status(self, server_enrolled):
+        self._server_enrolled_devs = server_enrolled
+        self.refresh_fido2_devices()
+
+    def _on_udev_event(self, _client, action, _device):
+        """Handle hidraw device add/remove via udev."""
+        if self._is_running:
+            return
+        if action in ("add", "remove"):
+            self.refresh_fido2_devices()
+            self._fetch_enrolled_status()
+
+    def set_device(self, device_path):
+        super().set_device(device_path)
+        self._fetch_enrolled_status()
+        self.refresh_fido2_devices()
+        if not self._udev_client:
+            self._udev_client = GUdev.Client(subsystems=["hidraw"])
+            self._udev_signal_id = self._udev_client.connect(
+                "uevent", self._on_udev_event
+            )
+
+    def stop_poll(self):
+        """Disconnect the udev event subscription."""
+        if self._udev_signal_id and self._udev_client:
+            self._udev_client.disconnect(self._udev_signal_id)
+            self._udev_signal_id = None
+        self._udev_client = None
+
+    def _get_selected_device_tuple(self):
+        """Return (hidraw_name, hid_name) of the selected unenrolled device, or None."""
+        all_enrolled = self._enrolled_devs | self._server_enrolled_devs
+        if len(self._all_fido2_devices) <= 1:
+            if self._fido2_devices:
+                return self._fido2_devices[0]
+            return None
+        idx = self._fido2_dropdown.get_selected()
+        if idx < len(self._all_fido2_devices):
+            dev, name = self._all_fido2_devices[idx]
+            if dev not in all_enrolled:
+                return (dev, name)
+        # Fallback: first unenrolled
+        if self._fido2_devices:
+            return self._fido2_devices[0]
+        return None
+
+    def get_selected_fido2_device(self):
+        """Return the /dev/hidrawN path for the selected FIDO2 device."""
+        t = self._get_selected_device_tuple()
+        return f"/dev/{t[0]}" if t else "auto"
+
+    def get_selected_fido2_hidraw(self):
+        """Return the hidraw name (e.g. 'hidraw3') of the currently selected device."""
+        t = self._get_selected_device_tuple()
+        return t[0] if t else None
+
+    def mark_enrolled_and_reset(self):
+        """After a successful enrollment, mark the device as done and reset for the next."""
+        hidraw = self.get_selected_fido2_hidraw()
+        if hidraw:
+            self._enrolled_devs.add(hidraw)
+        self.enroll_count += 1
+        # Reset input fields for next enrollment
+        self.pin_entry.set_text("")
+        self.pin_error_label.set_text("")
+        self.pin_box.set_sensitive(True)
+        # Refresh dropdown — enrolled device will be excluded
+        self.refresh_fido2_devices()
+
+    @property
+    def has_remaining_devices(self):
+        """True if there are unenrolled FIDO2 devices remaining."""
+        return len(self._fido2_devices) > 0
+
+    def _update_pin_enrolled_hint(self):
+        """Show 'Already enrolled' in PIN placeholder when selected device is enrolled."""
+        all_enrolled = self._enrolled_devs | self._server_enrolled_devs
+        selected = self._get_selected_device_tuple()
+        if selected is None and self._all_fido2_devices:
+            # All devices enrolled or single enrolled device
+            self.pin_entry.set_text("")
+            self.pin_entry.set_property("placeholder-text", "Already enrolled")
+            self.pin_box.set_sensitive(False)
+        else:
+            self.pin_entry.set_property("placeholder-text", "PIN")
+            self.pin_box.set_sensitive(True)
+
+    def _on_dropdown_changed(self, dropdown, _pspec):
+        """Update input sensitivity when the user selects a different FIDO2 device."""
+        if self._is_running:
+            return
+        idx = dropdown.get_selected()
+        if idx is not None and idx < len(self._all_fido2_devices):
+            dev, _ = self._all_fido2_devices[idx]
+            all_enrolled = self._enrolled_devs | self._server_enrolled_devs
+            is_enrolled = dev in all_enrolled
+            self.btn_enroll.set_sensitive(not is_enrolled)
+            if self.needs_pin:
+                if is_enrolled:
+                    self.pin_entry.set_text("")
+                    self.pin_entry.set_property(
+                        "placeholder-text", "Already enrolled")
+                    self.pin_box.set_sensitive(False)
+                else:
+                    self.pin_entry.set_property("placeholder-text", "PIN")
+                    self.pin_box.set_sensitive(True)
+
+
+# TPM2 PCR descriptions
+TPM2_PCRS = {
+    0: "Core system firmware (BIOS/UEFI)",
+    1: "Platform configuration (firmware settings)",
+    2: "Option ROM code",
+    3: "Option ROM configuration and data",
+    4: "Boot loader and additional components",
+    5: "Boot loader configuration (e.g. GRUB config)",
+    7: "Secure Boot state (certificates, keys)",
+    8: "Kernel command line (grub.cfg entries)",
+    9: "Kernel image, initrd, and other boot files",
+    11: "Unified kernel image components",
+    12: "Kernel command line (overrides)",
+    14: "MOK certificates and shim state",
+}
+
+# Default PCRs that systemd-cryptenroll uses
+TPM2_DEFAULT_PCRS = {7}
+
+
+class TPM2Page(EnrollStepPage):
+    """TPM2 enrollment with PCR selection."""
+
+    def __init__(self):
+        super().__init__(
+            "TPM2 Enrollment",
+            "Bind to the TPM2 chip.\n"
+            "Optionally set a PIN required at each boot.\n"
+            "Select which PCR registers to bind to:",
+            icon_name="computer-symbolic",
+            needs_pin=True,
+            single_pin=False,
+            pin_optional=True,
+            token_type="systemd-tpm2",
+        )
+        # Show inline Enroll button
+        self.btn_enroll.set_visible(True)
+        self.btn_enroll.set_label("Enroll")
+
+        # PCR checkboxes in a scrolled area
+        pcr_scroll = Gtk.ScrolledWindow()
+        pcr_scroll.set_min_content_height(140)
+        pcr_scroll.set_max_content_height(180)
+        pcr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+        self.pcr_checks = {}
+        for pcr_num, pcr_desc in sorted(TPM2_PCRS.items()):
+            chk = Gtk.CheckButton(label=f"PCR {pcr_num}: {pcr_desc}")
+            chk.set_active(pcr_num in TPM2_DEFAULT_PCRS)
+            pcr_box.append(chk)
+            self.pcr_checks[pcr_num] = chk
+
+        pcr_scroll.set_child(pcr_box)
+        # Insert PCR box after the description but before PIN fields
+        self.insert_child_after(pcr_scroll, list(self)[3])  # after desc label
+
+    def get_selected_pcrs(self):
+        return sorted(n for n, chk in self.pcr_checks.items() if chk.get_active())
+
+
+class PasswordDeletePage(EnrollStepPage):
+    """Confirms and deletes password keyslots."""
+
+    def __init__(self):
+        super().__init__(
+            "Remove Password Keyslot",
+            "Remove the original password keyslot.\n"
+            "After removal, only your enrolled methods and recovery key can unlock the volume.",
+            icon_name="user-trash-symbolic",
+        )
+        # Inline "Remove" button
+        self.btn_enroll.set_visible(True)
+        self.btn_enroll.set_label("Remove Password Keyslot")
+
+
+class DonePage(Gtk.Box):
+    """Final success page — summarizes what actually happened."""
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.set_margin_top(32)
+        self.set_margin_bottom(32)
+        self.set_margin_start(32)
+        self.set_margin_end(32)
+        self.set_valign(Gtk.Align.CENTER)
+
+        self.device_label = Gtk.Label(label="", xalign=0, wrap=True)
+        self.device_label.add_css_class("monospace")
+        self.device_label.add_css_class("dim-label")
+        self.append(self.device_label)
+
+        icon = Gtk.Image.new_from_icon_name("emblem-ok-symbolic")
+        icon.set_pixel_size(64)
+        self.append(icon)
+
+        title = Gtk.Label(label="Setup Complete")
+        title.add_css_class("title-1")
+        self.append(title)
+
+        self.summary_label = Gtk.Label(label="", wrap=True, xalign=0)
+        self.summary_label.set_max_width_chars(60)
+        self.append(self.summary_label)
+
+    def set_device(self, device_path):
+        self.device_label.set_text(f"Device: {device_path}")
+
+    def set_summary(self, enrolled):
+        """enrolled: dict of step_name -> bool indicating what succeeded."""
+        lines = []
+        if enrolled.get("fido2"):
+            lines.append("  \u2713 FIDO2 security key")
+        if (
+            enrolled.get("fido2")
+            and isinstance(enrolled.get("fido2_count"), int)
+            and enrolled["fido2_count"] > 1
+        ):
+            lines[-1] = (
+                f"  \u2713 FIDO2 security key ({enrolled['fido2_count']} tokens)"
+            )
+        if enrolled.get("tpm2"):
+            lines.append("  \u2713 TPM2 chip with PIN")
+        if enrolled.get("recovery"):
+            lines.append("  \u2713 Recovery key")
+        if enrolled.get("delete_pw"):
+            lines.append("  \u2713 Password keyslot removed")
+
+        if lines:
+            text = "Your disk encryption has been updated:\n\n" + "\n".join(lines)
+            if enrolled.get("recovery"):
+                text += "\n\nMake sure you have your recovery key written down before rebooting."
+        else:
+            text = "No changes were made to the volume."
+        self.summary_label.set_text(text)
+
+
+# ---------------------------------------------------------------------------
+# Main Application Window
+# ---------------------------------------------------------------------------
+
+
+class WizardWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(
+            application=app,
+            title="LUKS Enroll Wizard",
+            default_width=640,
+            default_height=700,
+            resizable=False,
+        )
+
+        self.device = None
+        self.luks_passphrase = None
+        self.auth_keyslot = None  # keyslot used to authenticate — must not be wiped
+        self.current_step = 0
+        self.steps = []  # dynamic list of (name, page) tuples
+
+        # D-Bus proxy for privileged operations
+        try:
+            self.svc = LuksEnrollProxy()
+        except GLib.Error as e:
+            self.svc = None
+            print(
+                f"Warning: could not connect to D-Bus service: {e.message}",
+                file=sys.stderr,
+            )
+
+        # Main layout
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_content(vbox)
+
+        # Header bar
+        header = Adw.HeaderBar()
+        vbox.append(header)
+
+        # Service-lost banner (hidden by default)
+        self._svc_banner = Adw.Banner(
+            title="The encryption service has stopped. Operations may fail.",
+        )
+        self._svc_banner.set_revealed(False)
+        vbox.append(self._svc_banner)
+
+        # Overlay wrapping the stack (for touch-your-token banner)
+        self.overlay = Gtk.Overlay()
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_vexpand(True)
+        self.overlay.set_child(self.stack)
+        self.overlay.set_vexpand(True)
+        vbox.append(self.overlay)
+
+        # Navigation buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_margin_start(16)
+        btn_box.set_margin_end(16)
+        btn_box.set_margin_bottom(16)
+        btn_box.set_margin_top(8)
+        btn_box.set_halign(Gtk.Align.END)
+
+        self.btn_back = Gtk.Button(label="Back")
+        self.btn_back.connect("clicked", self.on_back)
+        btn_box.append(self.btn_back)
+
+        self.btn_next = Gtk.Button(label="Next")
+        self.btn_next.add_css_class("suggested-action")
+        self.btn_next.connect("clicked", self.on_next)
+        btn_box.append(self.btn_next)
+
+        vbox.append(btn_box)
+
+        # Build all possible pages (added to stack), but steps list is dynamic
+        self._all_pages = {}
+        self._build_all_pages()
+        self._rebuild_steps()
+        self._update_buttons()
+
+        # Watch for service disappearance
+        if self.svc:
+            self.svc.on_service_vanished(self._on_service_lost)
+
+    def _build_all_pages(self):
+        # Welcome + device detection (merged page)
+        welcome = WelcomePage()
+        welcome._on_submit = lambda: self.on_next(None)
+        welcome.detect()
+        self.stack.add_named(welcome, "welcome")
+        self._all_pages["welcome"] = welcome
+
+        # FIDO2
+        fido2 = FIDO2Page()
+        fido2.svc = self.svc
+        fido2._on_submit = lambda: self._on_inline_enroll("fido2")
+        self.stack.add_named(fido2, "fido2")
+        self._all_pages["fido2"] = fido2
+
+        # TPM2
+        tpm2 = TPM2Page()
+        tpm2._on_submit = lambda: self._on_inline_enroll("tpm2")
+        self.stack.add_named(tpm2, "tpm2")
+        self._all_pages["tpm2"] = tpm2
+
+        # Recovery key
+        recovery = RecoveryKeyPage()
+        recovery._on_submit = lambda: self._on_inline_enroll("recovery")
+        self.stack.add_named(recovery, "recovery")
+        self._all_pages["recovery"] = recovery
+
+        # Delete password
+        delete_pw = PasswordDeletePage()
+        delete_pw._on_submit = lambda: self._on_inline_enroll("delete_pw")
+        self.stack.add_named(delete_pw, "delete_pw")
+        self._all_pages["delete_pw"] = delete_pw
+
+        # Done
+        done = DonePage()
+        self.stack.add_named(done, "done")
+        self._all_pages["done"] = done
+
+    def _rebuild_steps(self):
+        """Rebuild the dynamic step list based on welcome page selections."""
+        sel = self._all_pages["welcome"].selections
+        self.steps = [
+            ("welcome", self._all_pages["welcome"]),
+        ]
+        if sel.get("fido2"):
+            self.steps.append(("fido2", self._all_pages["fido2"]))
+        if sel.get("tpm2"):
+            self.steps.append(("tpm2", self._all_pages["tpm2"]))
+        if sel.get("recovery"):
+            self.steps.append(("recovery", self._all_pages["recovery"]))
+        if sel.get("delete_pw"):
+            self.steps.append(("delete_pw", self._all_pages["delete_pw"]))
+        self.steps.append(("done", self._all_pages["done"]))
+
+    def _update_buttons(self):
+        name, page = self.steps[self.current_step]
+        self.stack.set_visible_child_name(name)
+
+        self.btn_back.set_sensitive(self.current_step > 0)
+        self.btn_next.set_sensitive(True)
+
+        if name == "done":
+            self.btn_next.set_label("Close")
+            self.btn_back.set_sensitive(False)
+            # Summarize what actually succeeded
+            enrolled = {}
+            for step_name, step_page in self.steps:
+                if isinstance(step_page, EnrollStepPage):
+                    enrolled[step_name] = step_page.success
+                    if isinstance(step_page, FIDO2Page):
+                        enrolled["fido2_count"] = step_page.enroll_count
+            page.set_summary(enrolled)
+        elif name in ("fido2", "tpm2", "delete_pw"):
+            # "Next" if something was enrolled on this page, "Skip" otherwise
+            if isinstance(page, EnrollStepPage) and page.success:
+                self.btn_next.set_label("Next")
+            elif isinstance(page, FIDO2Page) and page.enroll_count > 0:
+                self.btn_next.set_label("Next")
+            else:
+                self.btn_next.set_label("Skip")
+        elif name == "recovery":
+            has_existing = False
+            if self.device and self.svc:
+                try:
+                    has_existing = bool(
+                        self.svc.get_tokens_by_type(self.device, "systemd-recovery")
+                    )
+                except GLib.Error:
+                    pass
+            if has_existing or page.success:
+                self.btn_next.set_label("Next")
+                self.btn_next.set_sensitive(True)
+                page.btn_enroll.set_visible(True)
+                page.btn_enroll.set_label("Generate New Recovery Key")
+                page.btn_enroll.set_sensitive(True)
+                if not page.success:
+                    page.status_label.set_text("A recovery key is already enrolled.")
+            else:
+                # No recovery key at all — auto-enroll one
+                self.btn_next.set_sensitive(False)
+                self.btn_next.set_label("Next")
+                self._run_enroll_recovery(page, auto_advance=False)
+        else:
+            self.btn_next.set_label("Next")
+
+        # Focus the first text entry on the current page
+        self._focus_first_entry(page)
+
+    def _on_service_lost(self):
+        """Show a banner when the D-Bus service vanishes mid-wizard."""
+        self._svc_banner.set_revealed(True)
+        # Stop any running spinner on the current page
+        name, page = self.steps[self.current_step]
+        if isinstance(page, EnrollStepPage) and page._is_running:
+            page.set_result(False, "", "Service stopped unexpectedly.")
+        # Re-enable navigation so the user can close
+        self.btn_next.set_sensitive(True)
+        self.btn_back.set_sensitive(self.current_step > 0)
+
+    def _on_passphrase_verified(self, page, ok, keyslot, passphrase):
+        page._verify_spinner.stop()
+        self.btn_next.set_sensitive(True)
+        if not ok:
+            page.pw_error_label.set_text("Incorrect passphrase or recovery key")
+            return
+        page.pw_error_label.set_text("")
+        self.device = page.device
+        self.luks_passphrase = passphrase
+        self.auth_keyslot = keyslot  # keyslot number used to authenticate
+        self._rebuild_steps()
+        self.current_step = 0  # welcome is step 0
+        for _n, p in self.steps:
+            if hasattr(p, "set_device"):
+                p.set_device(self.device)
+        self._advance()
+
+    def _on_inline_enroll(self, step_name):
+        """Handle clicks on inline Enroll/Run buttons within enrollment pages."""
+        page = self._all_pages[step_name]
+
+        if step_name == "fido2":
+            if not page.has_remaining_devices:
+                return
+            ok, pin = page.validate_pin()
+            if not ok:
+                return
+            fido2_dev = page.get_selected_fido2_device()
+            self._run_enroll_fido2(
+                page,
+                pin,
+                fido2_dev,
+                show_touch=True,
+                auto_advance=False,
+            )
+
+        elif step_name == "tpm2":
+            ok, pin = page.validate_pin()
+            if not ok:
+                return
+            if not page.get_selected_pcrs():
+                page.pin_error_label.set_text("Select at least one PCR.")
+                return
+            pcrs = "+".join(str(p) for p in page.get_selected_pcrs())
+            page.success = False  # allow re-enrollment
+            self._run_enroll_tpm2(page, pin, pcrs, auto_advance=False)
+
+        elif step_name == "recovery":
+            page.success = False
+            self._run_enroll_recovery(page, auto_advance=False)
+
+        elif step_name == "delete_pw":
+            if page.success:
+                return
+            try:
+                pw_slots = self.svc.find_password_keyslots(self.device)
+            except GLib.Error:
+                pw_slots = []
+            if not pw_slots:
+                page.set_result(
+                    True, "No password keyslots found — nothing to remove.", ""
+                )
+                return
+            self._run_delete_password_slots(page, pw_slots)
+
+    def _focus_first_entry(self, page):
+        if isinstance(page, WelcomePage):
+            page.passphrase_entry.grab_focus()
+        elif isinstance(page, EnrollStepPage) and page.needs_pin:
+            page.pin_entry.grab_focus()
+
+    def _advance(self):
+        self.current_step += 1
+        self._update_buttons()
+
+    def on_back(self, _btn):
+        if self.current_step > 0:
+            self.current_step -= 1
+            name, _ = self.steps[self.current_step]
+            # Reconnect FIDO2 udev events if returning to welcome
+            if name == "welcome":
+                welcome = self._all_pages["welcome"]
+                if not welcome._udev_client:
+                    welcome._udev_client = GUdev.Client(subsystems=["hidraw"])
+                    welcome._udev_signal_id = welcome._udev_client.connect(
+                        "uevent", welcome._on_udev_event
+                    )
+                    welcome._poll_fido2()
+            self._update_buttons()
+
+    def on_next(self, _btn):
+        name, page = self.steps[self.current_step]
+
+        if name == "done":
+            self.close()
+            return
+
+        if name == "welcome":
+            if not page.device and not page.detect():
+                return
+            # If empty passphrase already verified, skip prompting
+            if page._empty_pw_result:
+                ok, keyslot = page._empty_pw_result
+                page.stop_polling()
+                self._on_passphrase_verified(page, ok, keyslot, "")
+                return
+            passphrase = page.get_passphrase()
+            if not passphrase:
+                page.pw_error_label.set_text(
+                    "A passphrase or recovery key is required."
+                )
+                return
+            page.pw_error_label.set_text("")
+            page.stop_polling()
+            # Verify passphrase before proceeding
+            page._verify_spinner.start()
+            self.btn_next.set_sensitive(False)
+
+            def do_verify():
+                try:
+                    ok, keyslot = self.svc.verify_passphrase(page.device, passphrase)
+                except GLib.Error as e:
+                    ok, keyslot = False, -1
+                GLib.idle_add(
+                    self._on_passphrase_verified, page, ok, keyslot, passphrase
+                )
+
+            threading.Thread(target=do_verify, daemon=True).start()
+            return
+
+        if name in ("fido2", "tpm2"):
+            # Next/Skip always advances — enrollment is via inline Enroll button
+            self._advance()
+            return
+
+        if name == "recovery":
+            self._advance()
+            return
+
+        if name == "delete_pw":
+            # Next/Skip always advances — deletion is via inline button
+            self._advance()
+            return
+
+        self._advance()
+
+    def _run_enroll_fido2(
+        self, page, pin, fido2_dev, auto_advance=True, show_touch=False
+    ):
+        """Run FIDO2 enrollment via D-Bus service."""
+        page.set_running()
+        self.btn_next.set_sensitive(False)
+        self.btn_back.set_sensitive(False)
+
+        if show_touch:
+            page.show_touch_overlay(self.overlay)
+
+        def do_enroll():
+            try:
+                ok, stdout, stderr = self.svc.enroll_fido2(
+                    self.device,
+                    self.luks_passphrase,
+                    pin or "",
+                    fido2_dev,
+                )
+            except GLib.Error as e:
+                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
+            GLib.idle_add(
+                self._on_enroll_done, page, ok, stdout, stderr, auto_advance, show_touch
+            )
+
+        threading.Thread(target=do_enroll, daemon=True).start()
+
+    def _run_enroll_tpm2(self, page, pin, pcrs, auto_advance=True):
+        """Run TPM2 enrollment via D-Bus service."""
+        page.set_running()
+        self.btn_next.set_sensitive(False)
+        self.btn_back.set_sensitive(False)
+
+        def do_enroll():
+            try:
+                ok, stdout, stderr = self.svc.enroll_tpm2(
+                    self.device,
+                    self.luks_passphrase,
+                    pin or "",
+                    pcrs,
+                )
+            except GLib.Error as e:
+                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
+            GLib.idle_add(
+                self._on_enroll_done, page, ok, stdout, stderr, auto_advance, False
+            )
+
+        threading.Thread(target=do_enroll, daemon=True).start()
+
+    def _run_enroll_recovery(self, page, auto_advance=True):
+        """Run recovery key enrollment via D-Bus service."""
+        page.set_running()
+        self.btn_next.set_sensitive(False)
+        self.btn_back.set_sensitive(False)
+
+        def do_enroll():
+            try:
+                ok, stdout, stderr = self.svc.enroll_recovery_key(
+                    self.device,
+                    self.luks_passphrase,
+                )
+            except GLib.Error as e:
+                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
+            GLib.idle_add(
+                self._on_enroll_done, page, ok, stdout, stderr, auto_advance, False
+            )
+
+        threading.Thread(target=do_enroll, daemon=True).start()
+
+    def _on_enroll_done(
+        self, page, ok, stdout, stderr, auto_advance=True, had_touch=False
+    ):
+        if had_touch:
+            page.hide_touch_overlay(self.overlay)
+        page.set_result(ok, stdout, stderr)
+        self.btn_back.set_sensitive(True)
+        self.btn_next.set_sensitive(True)
+        # Rescan existing enrollments on the page after any enroll attempt
+        if isinstance(page, EnrollStepPage) and self.device:
+            page._populate_existing(self.device)
+        name, _ = self.steps[self.current_step]
+        if ok and name == "fido2" and isinstance(page, FIDO2Page):
+            # FIDO2: mark device enrolled, reset for next token
+            page.mark_enrolled_and_reset()
+            if page.has_remaining_devices:
+                page.success = False
+                page.pin_entry.grab_focus()
+            else:
+                page.success = True
+            # Update bottom button label
+            self.btn_next.set_label("Next" if page.enroll_count > 0 else "Skip")
+        elif ok and name == "recovery":
+            # Recovery: allow generating additional keys
+            page.success = True
+            page.btn_enroll.set_visible(True)
+            page.btn_enroll.set_label("Generate New Recovery Key")
+            page.btn_enroll.set_sensitive(True)
+            self.btn_next.set_label("Next")
+            self.btn_next.set_sensitive(True)
+        elif ok and auto_advance:
+            self.current_step += 1
+            self._update_buttons()
+        elif ok:
+            # TPM2 or delete_pw succeeded
+            self.btn_next.set_label("Next")
+            self.btn_next.set_sensitive(True)
+            page.btn_enroll.set_sensitive(False)
+
+    def _run_delete_password_slots(self, page, slots):
+        """Delete password keyslots via D-Bus service."""
+        page.set_running()
+        self.btn_next.set_sensitive(False)
+        self.btn_back.set_sensitive(False)
+
+        def do_delete():
+            all_ok = True
+            combined_stdout = ""
+            combined_stderr = ""
+            for slot in slots:
+                try:
+                    ok, stdout, stderr = self.svc.wipe_slot(
+                        self.device, self.luks_passphrase,
+                        "passphrase", "", slot
+                    )
+                except GLib.Error as e:
+                    ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
+                combined_stdout += f"Slot {slot}: {'OK' if ok else 'FAILED'}\n"
+                if stdout:
+                    combined_stdout += stdout
+                if stderr:
+                    combined_stderr += stderr + "\n"
+                if not ok:
+                    all_ok = False
+            GLib.idle_add(
+                self._on_enroll_done,
+                page,
+                all_ok,
+                combined_stdout,
+                combined_stderr,
+                False,
+            )
+
+        threading.Thread(target=do_delete, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Management Window
+# ---------------------------------------------------------------------------
+
+
+class DeviceListPage(Adw.NavigationPage):
+    """Shows internal volumes and removable devices with their enrollment status."""
+
+    def __init__(self, svc):
+        super().__init__(title="Disk Encryption")
+        self.svc = svc
+        self._elevated = False
+        self._caller_uid = os.getuid()
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+
+        # Header bar with refresh and unlock buttons
+        header = Adw.HeaderBar()
+        refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh_btn.set_tooltip_text("Refresh")
+        refresh_btn.connect("clicked", lambda _btn: self._populate())
+        header.pack_end(refresh_btn)
+
+        self._unlock_btn = Gtk.Button()
+        unlock_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        unlock_box.append(Gtk.Image.new_from_icon_name("system-lock-screen-symbolic"))
+        self._unlock_label = Gtk.Label(label="Unlock")
+        unlock_box.append(self._unlock_label)
+        self._unlock_btn.set_child(unlock_box)
+        self._unlock_btn.add_css_class("destructive-action")
+        self._unlock_btn.set_tooltip_text("Authenticate for privileged operations")
+        self._unlock_btn.connect("clicked", self._on_unlock_clicked)
+        header.pack_start(self._unlock_btn)
+
+        toolbar_view.add_top_bar(header)
+
+        # Content stack: either the preferences page or the empty status page
+        self.content_stack = Gtk.Stack()
+        toolbar_view.set_content(self.content_stack)
+
+        # Preferences page with device groups
+        self.prefs_page = Adw.PreferencesPage()
+        self.internal_group = Adw.PreferencesGroup(title="Internal Volumes")
+        self.removable_group = Adw.PreferencesGroup(title="Removable Devices")
+        self.file_group = Adw.PreferencesGroup(title="Opened Files")
+        self.prefs_page.add(self.internal_group)
+        self.prefs_page.add(self.removable_group)
+        self.prefs_page.add(self.file_group)
+
+        # Static action group for creating / opening image files
+        self.file_actions_group = Adw.PreferencesGroup(
+            title="Encrypted File Containers",
+            description="LUKS-encrypted image files for portable storage",
+        )
+        create_row = Adw.ActionRow(
+            title="Create Encrypted File",
+            subtitle="Create a new LUKS-encrypted image file",
+        )
+        create_row.add_prefix(Gtk.Image.new_from_icon_name("document-new-symbolic"))
+        create_row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+        create_row.set_activatable(True)
+        create_row.connect("activated", self._on_create_image)
+        self.file_actions_group.add(create_row)
+
+        open_row = Adw.ActionRow(
+            title="Open Encrypted File",
+            subtitle="Open an existing LUKS-encrypted image file",
+        )
+        open_row.add_prefix(Gtk.Image.new_from_icon_name("document-open-symbolic"))
+        open_row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+        open_row.set_activatable(True)
+        open_row.connect("activated", self._on_open_image)
+        self.file_actions_group.add(open_row)
+
+        self.prefs_page.add(self.file_actions_group)
+        self.content_stack.add_named(self.prefs_page, "devices")
+
+        # Track opened/created image file paths and their rows
+        self._image_files = []
+        self._dynamic_rows = {}
+
+        # Empty state — no devices found
+        self.status_page = Adw.StatusPage(
+            title="No Devices Found",
+            description="No LUKS-encrypted devices were detected.",
+            icon_name="drive-harddisk-symbolic",
+        )
+        self.content_stack.add_named(self.status_page, "empty")
+
+        # Error state — service not available
+        self.error_page = Adw.StatusPage(
+            title="Service Not Available",
+            description=(
+                "The luks-enroll D-Bus service is not running.\n\n"
+                "Install the package or start the service manually:\n"
+                "sudo cp net.contemno.* /usr/share/dbus-1/system.d/\n"
+                "sudo systemctl reload dbus"
+            ),
+            icon_name="dialog-error-symbolic",
+        )
+        self.content_stack.add_named(self.error_page, "error")
+
+        self._populate()
+
+    def _clear_dynamic_rows(self):
+        """Remove all dynamically-added rows from their groups."""
+        for row, group in self._dynamic_rows.values():
+            group.remove(row)
+        self._dynamic_rows.clear()
+
+    def _add_row(self, group, row, key):
+        """Add a row to a group and track it for later removal."""
+        group.add(row)
+        self._dynamic_rows[key] = (row, group)
+
+    def _needs_elevation(self, path):
+        """Check if a path requires admin privileges (not a user-owned file)."""
+        try:
+            real = os.path.realpath(path)
+            if os.path.isfile(real) and os.stat(real).st_uid == self._caller_uid:
+                return False
+        except OSError:
+            pass
+        return True
+
+    def _apply_lock_state(self, row, path):
+        """Disable a row and add a lock icon if it requires elevation."""
+        if not self._elevated and self._needs_elevation(path):
+            row.set_activatable(False)
+            row.set_sensitive(False)
+            row.add_suffix(Gtk.Image.new_from_icon_name("system-lock-screen-symbolic"))
+
+    def _on_unlock_clicked(self, _btn):
+        """Trigger polkit authentication."""
+        if not self.svc or self._elevated:
+            return
+        self._unlock_btn.set_sensitive(False)
+        self._unlock_label.set_text("Authenticating…")
+        self.svc.authenticate_async(self._on_auth_finish)
+
+    def _on_auth_finish(self, proxy, result):
+        """Handle polkit auth result."""
+        try:
+            res = proxy.call_finish(result)
+            ok = res.unpack()[0]
+        except GLib.Error:
+            ok = False
+
+        if ok:
+            self._elevated = True
+            self._unlock_btn.set_visible(False)
+            self._populate()
+        else:
+            self._unlock_btn.set_sensitive(True)
+            self._unlock_label.set_text("Unlock")
+
+    def _build_summary(self, device):
+        """Build a human-readable enrollment summary for a device."""
+        try:
+            keyslots = self.svc.get_keyslots(device)
+        except GLib.Error:
+            return "Unable to read keyslots"
+
+        type_counts = {}
+        for _slot, stype in keyslots.items():
+            type_counts[stype] = type_counts.get(stype, 0) + 1
+
+        if not type_counts:
+            return "No keyslots"
+
+        parts = []
+        for stype, count in sorted(type_counts.items()):
+            label = (
+                stype.replace("systemd-", "").upper()
+                if "systemd-" in stype
+                else stype.capitalize()
+            )
+            parts.append(f"{count} {label}")
+        return ", ".join(parts)
+
+    def _populate(self):
+        """Kick off background device detection, then update UI."""
+        if not self.svc:
+            self.content_stack.set_visible_child_name("error")
+            return
+
+        def fetch_data():
+            data = {"error": None, "devices": [], "removable": [], "summaries": {}}
+            try:
+                data["devices"] = self.svc.detect_devices()
+            except GLib.Error as e:
+                data["error"] = e.message
+                GLib.idle_add(self._apply_populate, data)
+                return
+
+            try:
+                data["removable"] = self.svc.detect_removable_devices()
+            except GLib.Error:
+                pass
+
+            # Pre-fetch summaries for all encrypted devices
+            for dev in data["devices"]:
+                data["summaries"][dev] = self._build_summary(dev)
+            for rdev in data["removable"]:
+                for part in rdev.get("partitions", []):
+                    if part.get("encrypted"):
+                        data["summaries"][part["device"]] = self._build_summary(
+                            part["device"]
+                        )
+            for img_path in self._image_files:
+                if os.path.isfile(img_path):
+                    data["summaries"][img_path] = self._build_summary(img_path)
+
+            GLib.idle_add(self._apply_populate, data)
+
+        threading.Thread(target=fetch_data, daemon=True).start()
+
+    def _apply_populate(self, data):
+        """Apply fetched device data to the UI (runs on main thread)."""
+        self._clear_dynamic_rows()
+
+        if data["error"]:
+            self.error_page.set_description(
+                f"Could not communicate with the D-Bus service:\n{data['error']}"
+            )
+            self.content_stack.set_visible_child_name("error")
+            return
+
+        removable_devs = data["removable"]
+        summaries = data["summaries"]
+
+        # Collect paths to exclude from internal volumes list
+        exclude = {os.path.realpath(p) for p in self._image_files if os.path.exists(p)}
+        for rdev in removable_devs:
+            exclude.add(os.path.realpath(rdev["device"]))
+            for part in rdev.get("partitions", []):
+                exclude.add(os.path.realpath(part["device"]))
+        devices = [d for d in data["devices"] if os.path.realpath(d) not in exclude]
+
+        self.content_stack.set_visible_child_name("devices")
+
+        has_devices = bool(devices) or bool(removable_devs)
+        self.internal_group.set_visible(bool(devices))
+        self.removable_group.set_visible(bool(removable_devs))
+
+        if not has_devices:
+            row = Adw.ActionRow(
+                title="No encrypted devices detected",
+                subtitle="Insert a removable device or create an encrypted file below",
+            )
+            row.add_prefix(Gtk.Image.new_from_icon_name("dialog-information-symbolic"))
+            self._add_row(self.internal_group, row, "no-devices-hint")
+            self.internal_group.set_visible(True)
+            self.internal_group.set_title("")
+        else:
+            self.internal_group.set_title("Internal Volumes")
+
+        for dev in devices:
+            summary = summaries.get(dev, "")
+            row = Adw.ActionRow(title=dev, subtitle=summary)
+            row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+            row.set_activatable(True)
+            row.connect("activated", self._on_row_activated, dev)
+            self._apply_lock_state(row, dev)
+            self._add_row(self.internal_group, row, f"int:{dev}")
+
+        for rdev in removable_devs:
+            dev_path = rdev["device"]
+            partitions = rdev.get("partitions", [])
+            dev_size = rdev.get("size", "")
+            dev_label = rdev.get("label", "")
+
+            if partitions:
+                for part in partitions:
+                    part_path = part["device"]
+                    part_size = part.get("size", "")
+                    part_label = part.get("label", "")
+                    encrypted = part.get("encrypted", False)
+
+                    if encrypted:
+                        summary = summaries.get(part_path, "")
+                        subtitle = f"{part_size}"
+                        if part_label:
+                            subtitle = f"{part_label} — {subtitle}"
+                        subtitle += f" — {summary}"
+                        row = Adw.ActionRow(title=part_path, subtitle=subtitle)
+                        row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+                        row.set_activatable(True)
+                        row.connect("activated", self._on_row_activated, part_path)
+                        self._apply_lock_state(row, part_path)
+                        self._add_row(self.removable_group, row, f"rem:{part_path}")
+                    else:
+                        subtitle = f"{part_size}"
+                        if part_label:
+                            subtitle = f"{part_label} — {subtitle}"
+                        subtitle += " — Unencrypted"
+                        row = Adw.ActionRow(title=part_path, subtitle=subtitle)
+                        encrypt_btn = Gtk.Button(label="Encrypt")
+                        encrypt_btn.set_valign(Gtk.Align.CENTER)
+                        encrypt_btn.add_css_class("suggested-action")
+                        encrypt_btn.connect(
+                            "clicked", self._on_encrypt_clicked, part_path, part_size
+                        )
+                        row.add_suffix(encrypt_btn)
+                        self._apply_lock_state(row, part_path)
+                        self._add_row(self.removable_group, row, f"rem:{part_path}")
+            else:
+                subtitle = f"{dev_size}"
+                if dev_label:
+                    subtitle = f"{dev_label} — {subtitle}"
+                subtitle += " — No partitions"
+                row = Adw.ActionRow(title=dev_path, subtitle=subtitle)
+                encrypt_btn = Gtk.Button(label="Encrypt")
+                encrypt_btn.set_valign(Gtk.Align.CENTER)
+                encrypt_btn.add_css_class("suggested-action")
+                encrypt_btn.connect(
+                    "clicked", self._on_encrypt_clicked, dev_path, dev_size
+                )
+                row.add_suffix(encrypt_btn)
+                self._apply_lock_state(row, dev_path)
+                self._add_row(self.removable_group, row, f"rem:{dev_path}")
+
+        # Opened/created image files
+        self.file_group.set_visible(bool(self._image_files))
+        for img_path in self._image_files:
+            if not os.path.isfile(img_path):
+                continue
+            summary = summaries.get(img_path, "")
+            name = os.path.basename(img_path)
+            row = Adw.ActionRow(title=name, subtitle=f"{img_path} — {summary}")
+            row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+            row.set_activatable(True)
+            row.connect("activated", self._on_row_activated, img_path)
+            close_btn = Gtk.Button(icon_name="window-close-symbolic")
+            close_btn.set_valign(Gtk.Align.CENTER)
+            close_btn.set_tooltip_text("Remove from list")
+            close_btn.add_css_class("flat")
+            close_btn.connect("clicked", self._on_remove_image, img_path)
+            row.add_suffix(close_btn)
+            self._add_row(self.file_group, row, f"img:{img_path}")
+
+        # Show unlock button only if there are locked items and not yet elevated
+        if self._elevated:
+            self._unlock_btn.set_visible(False)
+        else:
+            all_paths = list(devices) + [
+                p["device"] for r in removable_devs for p in r.get("partitions", [r])
+            ]
+            has_locked = any(self._needs_elevation(p) for p in all_paths)
+            self._unlock_btn.set_visible(has_locked)
+
+    def _on_row_activated(self, _row, device):
+        nav = self.get_ancestor(Adw.NavigationView)
+        if nav:
+            detail = DeviceDetailPage(self.svc, device)
+            nav.push(detail)
+
+    def _on_encrypt_clicked(self, _btn, device, size_str):
+        """Push the encrypt page for an unencrypted device."""
+        nav = self.get_ancestor(Adw.NavigationView)
+        if nav:
+            page = EncryptDevicePage(self.svc, device, size_str, self)
+            nav.push(page)
+
+    def _on_create_image(self, _row):
+        """Push the create image page onto the navigation view."""
+        nav = self.get_ancestor(Adw.NavigationView)
+        if nav:
+            page = CreateImagePage(self.svc, self)
+            nav.push(page)
+
+    def _on_open_image(self, _row):
+        """Open a file chooser to select an existing encrypted image file."""
+        win = self.get_root()
+        dialog = Gtk.FileDialog(title="Open Encrypted Image File")
+        img_filter = Gtk.FileFilter()
+        img_filter.set_name("LUKS image files")
+        img_filter.add_pattern("*.img")
+        img_filter.add_pattern("*.luks")
+        img_filter.add_mime_type("application/octet-stream")
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("All files")
+        all_filter.add_pattern("*")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(img_filter)
+        filters.append(all_filter)
+        dialog.set_filters(filters)
+        dialog.open(win, None, self._on_open_image_response)
+
+    def _on_open_image_response(self, dialog, result):
+        """Handle file chooser result."""
+        try:
+            gfile = dialog.open_finish(result)
+        except GLib.Error:
+            return  # user cancelled
+        path = gfile.get_path()
+        if path and path not in self._image_files:
+            self._image_files.append(path)
+            self._populate()
+            # Navigate directly to the device detail page
+            nav = self.get_ancestor(Adw.NavigationView)
+            if nav:
+                detail = DeviceDetailPage(self.svc, path)
+                nav.push(detail)
+
+    def _on_remove_image(self, _btn, img_path):
+        """Remove an image file from the tracked list."""
+        if img_path in self._image_files:
+            self._image_files.remove(img_path)
+            self._populate()
+
+    def add_image_file(self, path):
+        """Add an image file path to the tracked list and refresh."""
+        if path not in self._image_files:
+            self._image_files.append(path)
+            self._populate()
+
+
+class EncryptDevicePage(Adw.NavigationPage):
+    """Page for encrypting an unencrypted removable device."""
+
+    def __init__(self, svc, device, size_str, list_page):
+        super().__init__(title="Encrypt Device")
+        self.svc = svc
+        self.device = device
+        self.list_page = list_page
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        toolbar_view.set_content(scroll)
+
+        prefs = Adw.PreferencesPage()
+        scroll.set_child(prefs)
+
+        warning_group = Adw.PreferencesGroup(
+            title="Encrypt Device",
+            description=(
+                f"This will erase ALL data on {device} ({size_str}) "
+                "and create an encrypted LUKS2 partition.\n\n"
+                "This action cannot be undone."
+            ),
+        )
+        prefs.add(warning_group)
+
+        pw_group = Adw.PreferencesGroup(title="Passphrase")
+        prefs.add(pw_group)
+
+        self._pw_row = Adw.PasswordEntryRow(title="Passphrase")
+        pw_group.add(self._pw_row)
+
+        self._pw_confirm_row = Adw.PasswordEntryRow(title="Confirm Passphrase")
+        self._pw_confirm_row.connect("entry-activated", lambda _: self._do_encrypt())
+        pw_group.add(self._pw_confirm_row)
+
+        btn_row = Adw.ActionRow()
+        self._encrypt_btn = Gtk.Button(label="Encrypt")
+        self._encrypt_btn.add_css_class("destructive-action")
+        self._encrypt_btn.set_valign(Gtk.Align.CENTER)
+        self._encrypt_btn.connect("clicked", lambda _: self._do_encrypt())
+        btn_row.add_suffix(self._encrypt_btn)
+        pw_group.add(btn_row)
+
+        # Status
+        status_group = Adw.PreferencesGroup()
+        prefs.add(status_group)
+        self._spinner = Gtk.Spinner()
+        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
+        status_row = Adw.ActionRow()
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        status_box.append(self._spinner)
+        status_box.append(self._status_label)
+        status_row.add_suffix(status_box)
+        status_group.add(status_row)
+
+    def _do_encrypt(self):
+        pw = self._pw_row.get_text()
+        confirm = self._pw_confirm_row.get_text()
+        if not pw:
+            self._status_label.set_text("Passphrase cannot be empty.")
+            self._status_label.add_css_class("error")
+            return
+        if pw != confirm:
+            self._status_label.set_text("Passphrases do not match.")
+            self._status_label.add_css_class("error")
+            return
+
+        self._status_label.set_text("Encrypting…")
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+        self._spinner.start()
+        self._encrypt_btn.set_sensitive(False)
+        self._pending_pw = pw
+
+        def do_format():
+            try:
+                ok, partition, stderr = self.svc.format_partition(self.device, pw)
+            except GLib.Error as e:
+                ok, partition, stderr = False, "", f"D-Bus error: {e.message}"
+            GLib.idle_add(self._on_format_done, ok, partition, stderr)
+
+        threading.Thread(target=do_format, daemon=True).start()
+
+    def _on_format_done(self, ok, partition, stderr):
+        self._spinner.stop()
+        self._encrypt_btn.set_sensitive(True)
+        if ok:
+            self._status_label.set_text("Encrypted successfully.")
+            self._status_label.remove_css_class("error")
+            self._status_label.add_css_class("success")
+            self.list_page._populate()
+            # Navigate to the new encrypted partition's detail page
+            target = partition or self.device
+            nav = self.get_ancestor(Adw.NavigationView)
+            if nav:
+                detail = DeviceDetailPage(self.svc, target, passphrase=self._pending_pw)
+                nav.push(detail)
+        else:
+            self._status_label.set_text(f"Failed: {stderr}")
+            self._status_label.add_css_class("error")
+            self._status_label.remove_css_class("success")
+
+
+class CreateImagePage(Adw.NavigationPage):
+    """Page for creating a new LUKS-encrypted image file."""
+
+    def __init__(self, svc, list_page):
+        super().__init__(title="Create Encrypted File")
+        self.svc = svc
+        self.list_page = list_page
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        toolbar_view.set_content(scroll)
+
+        prefs = Adw.PreferencesPage()
+        scroll.set_child(prefs)
+
+        # File location group
+        loc_group = Adw.PreferencesGroup(
+            title="File Location",
+            description="Choose where to save the encrypted image file",
+        )
+        prefs.add(loc_group)
+
+        self._path_row = Adw.EntryRow(title="File path")
+        home = os.path.expanduser("~")
+        self._path_row.set_text(os.path.join(home, "encrypted.img"))
+        loc_group.add(self._path_row)
+
+        browse_row = Adw.ActionRow(title="Choose location…")
+        browse_row.add_prefix(Gtk.Image.new_from_icon_name("folder-open-symbolic"))
+        browse_row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+        browse_row.set_activatable(True)
+        browse_row.connect("activated", self._on_browse)
+        loc_group.add(browse_row)
+
+        # Size group
+        size_group = Adw.PreferencesGroup(title="Size")
+        prefs.add(size_group)
+
+        size_row = Adw.ActionRow(title="Image size (MB)")
+        self._size_spin = Gtk.SpinButton.new_with_range(16, 65536, 64)
+        self._size_spin.set_value(256)
+        self._size_spin.set_valign(Gtk.Align.CENTER)
+        size_row.add_suffix(self._size_spin)
+        size_group.add(size_row)
+
+        # Passphrase group
+        pw_group = Adw.PreferencesGroup(title="Passphrase")
+        prefs.add(pw_group)
+
+        self._pw_row = Adw.PasswordEntryRow(title="Passphrase")
+        pw_group.add(self._pw_row)
+
+        self._pw_confirm_row = Adw.PasswordEntryRow(title="Confirm passphrase")
+        pw_group.add(self._pw_confirm_row)
+
+        # Status + action
+        action_group = Adw.PreferencesGroup()
+        prefs.add(action_group)
+
+        self._status_label = Gtk.Label(label="", xalign=0, wrap=True)
+        self._status_label.set_margin_start(16)
+        self._status_label.set_margin_end(16)
+
+        self._spinner = Gtk.Spinner()
+        self._spinner.set_margin_start(16)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_margin_start(16)
+        btn_box.set_margin_end(16)
+        btn_box.set_margin_top(8)
+        btn_box.set_margin_bottom(16)
+        btn_box.append(self._spinner)
+        btn_box.append(self._status_label)
+
+        self._create_btn = Gtk.Button(label="Create")
+        self._create_btn.add_css_class("suggested-action")
+        self._create_btn.set_halign(Gtk.Align.END)
+        self._create_btn.set_hexpand(True)
+        self._create_btn.connect("clicked", self._on_create)
+        btn_box.append(self._create_btn)
+
+        status_row = Adw.ActionRow()
+        status_row.set_child(btn_box)
+        action_group.add(status_row)
+
+    def _on_browse(self, _row):
+        """Open a save-file dialog for choosing image location."""
+        win = self.get_root()
+        dialog = Gtk.FileDialog(
+            title="Save Encrypted Image As",
+            initial_name="encrypted.img",
+        )
+        dialog.save(win, None, self._on_save_response)
+
+    def _on_save_response(self, dialog, result):
+        try:
+            gfile = dialog.save_finish(result)
+        except GLib.Error:
+            return
+        path = gfile.get_path()
+        if path:
+            self._path_row.set_text(path)
+
+    def _on_create(self, _btn):
+        path = self._path_row.get_text().strip()
+        size_mb = int(self._size_spin.get_value())
+        pw = self._pw_row.get_text()
+        confirm = self._pw_confirm_row.get_text()
+
+        if not path:
+            self._status_label.set_text("File path cannot be empty.")
+            self._status_label.add_css_class("error")
+            return
+        if not pw:
+            self._status_label.set_text("Passphrase cannot be empty.")
+            self._status_label.add_css_class("error")
+            return
+        if pw != confirm:
+            self._status_label.set_text("Passphrases do not match.")
+            self._status_label.add_css_class("error")
+            return
+
+        self._status_label.set_text("Creating…")
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+        self._spinner.start()
+        self._create_btn.set_sensitive(False)
+        self._pending_path = path
+        self._pending_pw = pw
+
+        self.svc.create_encrypted_image_async(path, size_mb, pw, self._on_create_finish)
+
+    def _on_create_finish(self, proxy, result):
+        """Async callback — runs on main thread after D-Bus call completes."""
+        path = self._pending_path
+        try:
+            res = proxy.call_finish(result)
+            ok, _keyslot, error = res.unpack()
+        except GLib.Error as e:
+            ok, error = False, f"D-Bus error: {e.message}"
+
+        self._spinner.stop()
+        self._create_btn.set_sensitive(True)
+        if ok:
+            self._status_label.set_text("Created successfully.")
+            self._status_label.remove_css_class("error")
+            self._status_label.add_css_class("success")
+            self.list_page.add_image_file(path)
+            # Replace this page with the device detail page, pre-unlocked
+            nav = self.get_ancestor(Adw.NavigationView)
+            if nav:
+                detail = DeviceDetailPage(self.svc, path, passphrase=self._pending_pw)
+                nav.push(detail)
+        else:
+            self._status_label.set_text(f"Failed: {error}")
+            self._status_label.add_css_class("error")
+            self._status_label.remove_css_class("success")
+
+
+class DeviceDetailPage(Adw.NavigationPage):
+    """Detail view for a single LUKS device — unlock, view enrollments, manage."""
+
+    def __init__(self, svc, device, passphrase=None):
+        super().__init__(title=device)
+        self.svc = svc
+        self.device = device
+        self.passphrase = None
+        self.auth_keyslot = None
+        self.unlock_method = "passphrase"
+        self.unlock_pin = ""
+        self._unlocked = False
+        self._initial_passphrase = passphrase
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+
+        header = Adw.HeaderBar()
+        toolbar_view.add_top_bar(header)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        toolbar_view.set_content(scroll)
+
+        self._main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        scroll.set_child(self._main_box)
+
+        self._prefs_page = Adw.PreferencesPage()
+        self._main_box.append(self._prefs_page)
+
+        # --- Enrolled methods group (shown before unlock) ---
+        self._methods_group = Adw.PreferencesGroup(title="Enrolled Methods")
+        self._methods_group.set_visible(False)
+        self._prefs_page.add(self._methods_group)
+
+        # --- Token unlock group (TPM2 / FIDO2) ---
+        self._token_unlock_group = Adw.PreferencesGroup(title="Unlock with Token")
+        self._token_unlock_group.set_visible(False)
+        self._prefs_page.add(self._token_unlock_group)
+
+        self._tpm2_row = Adw.ActionRow(
+            title="Unlock with TPM2",
+            subtitle="Use the TPM2 chip to unlock",
+        )
+        self._tpm2_row.add_prefix(Gtk.Image.new_from_icon_name("computer-symbolic"))
+        self._tpm2_pin_entry = Gtk.PasswordEntry()
+        self._tpm2_pin_entry.set_show_peek_icon(True)
+        self._tpm2_pin_entry.set_valign(Gtk.Align.CENTER)
+        self._tpm2_pin_entry.set_hexpand(True)
+        self._tpm2_pin_entry.set_property("placeholder-text", "PIN (if required)")
+        self._tpm2_pin_entry.connect("activate", lambda _: self._do_token_unlock("systemd-tpm2"))
+        self._tpm2_row.add_suffix(self._tpm2_pin_entry)
+        tpm2_btn = Gtk.Button(icon_name="go-next-symbolic")
+        tpm2_btn.set_valign(Gtk.Align.CENTER)
+        tpm2_btn.add_css_class("flat")
+        tpm2_btn.connect("clicked", lambda _: self._do_token_unlock("systemd-tpm2"))
+        self._tpm2_row.add_suffix(tpm2_btn)
+        self._tpm2_row.set_visible(False)
+        self._token_unlock_group.add(self._tpm2_row)
+
+        self._fido2_row = Adw.ActionRow(
+            title="Unlock with FIDO2",
+            subtitle="Touch your security key to unlock",
+        )
+        self._fido2_row.add_prefix(Gtk.Image.new_from_icon_name("media-removable-symbolic"))
+        self._fido2_pin_entry = Gtk.PasswordEntry()
+        self._fido2_pin_entry.set_show_peek_icon(True)
+        self._fido2_pin_entry.set_valign(Gtk.Align.CENTER)
+        self._fido2_pin_entry.set_hexpand(True)
+        self._fido2_pin_entry.set_property("placeholder-text", "PIN")
+        self._fido2_pin_entry.connect("activate", lambda _: self._do_token_unlock("systemd-fido2"))
+        self._fido2_row.add_suffix(self._fido2_pin_entry)
+        fido2_btn = Gtk.Button(icon_name="go-next-symbolic")
+        fido2_btn.set_valign(Gtk.Align.CENTER)
+        fido2_btn.add_css_class("flat")
+        fido2_btn.connect("clicked", lambda _: self._do_token_unlock("systemd-fido2"))
+        self._fido2_row.add_suffix(fido2_btn)
+        self._fido2_row.set_visible(False)
+        self._token_unlock_group.add(self._fido2_row)
+
+        # --- Passphrase / recovery key unlock group ---
+        self._unlock_group = Adw.PreferencesGroup(title="Unlock with Passphrase")
+
+        self._pw_row = Adw.ActionRow(title="Passphrase")
+        self._pw_entry = Gtk.PasswordEntry()
+        self._pw_entry.set_show_peek_icon(True)
+        self._pw_entry.set_valign(Gtk.Align.CENTER)
+        self._pw_entry.set_hexpand(True)
+        self._pw_entry.connect("activate", lambda _: self._do_unlock())
+        self._pw_row.add_suffix(self._pw_entry)
+        self._unlock_group.add(self._pw_row)
+
+        self._rk_row = Adw.ActionRow(title="Recovery Key")
+        self._rk_entry = Gtk.PasswordEntry()
+        self._rk_entry.set_show_peek_icon(True)
+        self._rk_entry.set_valign(Gtk.Align.CENTER)
+        self._rk_entry.set_hexpand(True)
+        self._rk_entry.connect("activate", lambda _: self._do_unlock())
+        self._rk_row.add_suffix(self._rk_entry)
+        self._unlock_group.add(self._rk_row)
+
+        unlock_btn_row = Adw.ActionRow()
+        self._unlock_btn = Gtk.Button(label="Unlock")
+        self._unlock_btn.add_css_class("suggested-action")
+        self._unlock_btn.set_valign(Gtk.Align.CENTER)
+        self._unlock_btn.connect("clicked", lambda _: self._do_unlock())
+        unlock_btn_row.add_suffix(self._unlock_btn)
+        self._unlock_group.add(unlock_btn_row)
+
+        self._unlock_spinner = Gtk.Spinner()
+        self._unlock_error = Gtk.Label(label="", xalign=0)
+        self._unlock_error.add_css_class("error")
+        spinner_row = Adw.ActionRow()
+        spinner_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        spinner_box.append(self._unlock_spinner)
+        spinner_box.append(self._unlock_error)
+        spinner_row.add_suffix(spinner_box)
+        self._unlock_group.add(spinner_row)
+
+        self._prefs_page.add(self._unlock_group)
+
+        # Hide unlock fields until we know what's enrolled
+        self._pw_row.set_visible(False)
+        self._rk_row.set_visible(False)
+
+        # --- Device info group (hidden until unlocked) ---
+        self._info_group = Adw.PreferencesGroup(title="Device Info")
+        self._info_group.set_visible(False)
+        self._prefs_page.add(self._info_group)
+
+        # --- Enrollments group (hidden until unlocked) ---
+        self._enrollments_group = Adw.PreferencesGroup(title="Current Enrollments")
+        self._enrollments_group.set_visible(False)
+        self._prefs_page.add(self._enrollments_group)
+
+        # --- Add enrollment group (hidden until unlocked) ---
+        self._add_group = Adw.PreferencesGroup(title="Add Enrollment")
+        self._add_group.set_visible(False)
+        self._prefs_page.add(self._add_group)
+
+        # Track dynamically-added rows for proper cleanup on refresh
+        self._dynamic_rows = {}
+
+        # Fetch enrolled methods in background (visible before unlock)
+        self._fetch_enrolled_methods()
+
+        # If passphrase already known (e.g. just created the file), auto-unlock
+        if self._initial_passphrase is not None:
+            self._auto_unlock_with(self._initial_passphrase)
+        else:
+            # Try empty passphrase in background
+            self._try_empty_passphrase()
+
+    def _auto_unlock_with(self, passphrase):
+        """Verify the known passphrase asynchronously and auto-unlock."""
+        self._unlock_spinner.start()
+        self.svc.verify_passphrase_async(
+            self.device, passphrase, self._on_auto_unlock_finish
+        )
+
+    def _on_auto_unlock_finish(self, proxy, result):
+        self._unlock_spinner.stop()
+        try:
+            res = proxy.call_finish(result)
+            ok, keyslot = res.unpack()
+        except GLib.Error:
+            ok, keyslot = False, -1
+        if ok:
+            self.passphrase = self._initial_passphrase
+            self.auth_keyslot = keyslot
+            self._show_unlocked()
+        else:
+            # Passphrase didn't work — fall back to manual unlock
+            self._initial_passphrase = None
+
+    def _try_empty_passphrase(self):
+        """Try unlocking with empty passphrase."""
+        self._unlock_spinner.start()
+        self.svc.verify_passphrase_async(self.device, "", self._on_empty_pw_finish)
+
+    def _on_empty_pw_finish(self, proxy, result):
+        self._unlock_spinner.stop()
+        try:
+            res = proxy.call_finish(result)
+            ok, keyslot = res.unpack()
+        except GLib.Error:
+            ok, keyslot = False, -1
+        if ok:
+            self.passphrase = ""
+            self.auth_keyslot = keyslot
+            self._show_unlocked()
+
+    def _fetch_enrolled_methods(self):
+        """Fetch enrolled token/keyslot info in background (no unlock needed)."""
+        def fetch():
+            data = {"fido2": [], "tpm2": [], "recovery": [], "pw_slots": [],
+                    "systemd_version": 0}
+            try:
+                data["fido2"] = self.svc.get_tokens_by_type(self.device, "systemd-fido2")
+            except GLib.Error:
+                pass
+            try:
+                data["tpm2"] = self.svc.get_tokens_by_type(self.device, "systemd-tpm2")
+            except GLib.Error:
+                pass
+            try:
+                data["recovery"] = self.svc.get_tokens_by_type(self.device, "systemd-recovery")
+            except GLib.Error:
+                pass
+            try:
+                data["pw_slots"] = self.svc.find_password_keyslots(self.device)
+            except GLib.Error:
+                pass
+            try:
+                data["systemd_version"] = self.svc.get_systemd_version()
+            except GLib.Error:
+                pass
+            GLib.idle_add(self._apply_enrolled_methods, data)
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _apply_enrolled_methods(self, data):
+        """Show enrolled methods and configure unlock fields accordingly."""
+        self._clear_dynamic_rows("method:")
+
+        has_any = False
+
+        if data["pw_slots"]:
+            has_any = True
+            count = len(data["pw_slots"])
+            slots = ", ".join(str(s) for s in data["pw_slots"])
+            row = Adw.ActionRow(
+                title="Password",
+                subtitle=f"{count} keyslot{'s' if count > 1 else ''} (slot {slots})",
+            )
+            row.add_prefix(Gtk.Image.new_from_icon_name("dialog-password-symbolic"))
+            self._add_row(self._methods_group, row, "method:pw")
+
+        if data["fido2"]:
+            has_any = True
+            count = len(data["fido2"])
+            row = Adw.ActionRow(
+                title="FIDO2 Security Key",
+                subtitle=f"{count} enrollment{'s' if count > 1 else ''}",
+            )
+            row.add_prefix(Gtk.Image.new_from_icon_name("media-removable-symbolic"))
+            self._add_row(self._methods_group, row, "method:fido2")
+
+        if data["tpm2"]:
+            has_any = True
+            count = len(data["tpm2"])
+            row = Adw.ActionRow(
+                title="TPM2",
+                subtitle=f"{count} enrollment{'s' if count > 1 else ''}",
+            )
+            row.add_prefix(Gtk.Image.new_from_icon_name("computer-symbolic"))
+            self._add_row(self._methods_group, row, "method:tpm2")
+
+        if data["recovery"]:
+            has_any = True
+            count = len(data["recovery"])
+            row = Adw.ActionRow(
+                title="Recovery Key",
+                subtitle=f"{count} key{'s' if count > 1 else ''}",
+            )
+            row.add_prefix(Gtk.Image.new_from_icon_name("security-high-symbolic"))
+            self._add_row(self._methods_group, row, "method:recovery")
+
+        if not has_any:
+            row = Adw.ActionRow(
+                title="No enrollments detected",
+                subtitle="Unlock with passphrase to manage enrollments",
+            )
+            self._add_row(self._methods_group, row, "method:none")
+
+        self._methods_group.set_visible(True)
+
+        # Show/hide unlock options based on what's enrolled
+        has_password = bool(data["pw_slots"])
+        has_recovery = bool(data["recovery"])
+        has_tpm2 = bool(data["tpm2"])
+        has_fido2 = bool(data["fido2"])
+
+        # Token unlock group
+        # TPM2 token unlock requires systemd >= 256 for --unlock-tpm2-device
+        tpm2_unlock_ok = has_tpm2 and data.get("systemd_version", 0) >= 256
+        self._tpm2_row.set_visible(tpm2_unlock_ok)
+        self._fido2_row.set_visible(has_fido2)
+        self._token_unlock_group.set_visible(tpm2_unlock_ok or has_fido2)
+
+        # Passphrase/recovery unlock group
+        self._pw_row.set_visible(has_password)
+        self._rk_row.set_visible(has_recovery)
+        # Always show at least the passphrase field as fallback
+        if not has_password and not has_recovery:
+            self._pw_row.set_visible(True)
+        # Update group title based on whether tokens are also available
+        if has_tpm2 or has_fido2:
+            self._unlock_group.set_title("Unlock with Passphrase")
+        else:
+            self._unlock_group.set_title("Unlock Device")
+
+    def _do_unlock(self):
+        pw = self._pw_entry.get_text() or self._rk_entry.get_text()
+        if not pw:
+            self._unlock_error.set_text("Enter a passphrase or recovery key.")
+            return
+        self._unlock_error.set_text("")
+        self._unlock_spinner.start()
+        self._unlock_btn.set_sensitive(False)
+        self._pending_pw = pw
+        self.svc.verify_passphrase_async(self.device, pw, self._on_unlock_finish)
+
+    def _on_unlock_finish(self, proxy, result):
+        self._unlock_spinner.stop()
+        self._unlock_btn.set_sensitive(True)
+        try:
+            res = proxy.call_finish(result)
+            ok, keyslot = res.unpack()
+        except GLib.Error:
+            ok, keyslot = False, -1
+        if ok:
+            self.passphrase = self._pending_pw
+            self.auth_keyslot = keyslot
+            self._show_unlocked()
+        else:
+            self._unlock_error.set_text("Incorrect passphrase or recovery key.")
+
+    def _do_token_unlock(self, token_type):
+        """Attempt to unlock using a LUKS2 token (TPM2 or FIDO2)."""
+        if token_type == "systemd-tpm2":
+            pin = self._tpm2_pin_entry.get_text()
+        else:
+            pin = self._fido2_pin_entry.get_text()
+        self._unlock_error.set_text("")
+        self._unlock_spinner.start()
+        self._pending_token_type = token_type
+        self._pending_token_pin = pin
+        self.svc.unlock_with_token_async(
+            self.device, token_type, pin, self._on_token_unlock_finish
+        )
+
+    def _on_token_unlock_finish(self, proxy, result):
+        self._unlock_spinner.stop()
+        try:
+            res = proxy.call_finish(result)
+            ok, keyslot = res.unpack()
+        except GLib.Error as e:
+            ok, keyslot = False, -1
+            self._unlock_error.set_text(f"Token error: {e.message}")
+            return
+        if ok:
+            # Token unlock doesn't give us a passphrase, but we record the keyslot
+            # and the unlock method so wipe operations can use the same method
+            self.passphrase = None
+            self.auth_keyslot = keyslot
+            self.unlock_method = self._pending_token_type
+            self.unlock_pin = self._pending_token_pin
+            self._show_unlocked()
+        else:
+            token_name = "TPM2" if "tpm2" in self._pending_token_type else "FIDO2"
+            self._unlock_error.set_text(
+                f"{token_name} unlock failed. Check PIN or try another method."
+            )
+
+    def _show_unlocked(self):
+        """Hide unlock groups and fetch device details in background."""
+        self._unlocked = True
+        self._unlock_group.set_visible(False)
+        self._token_unlock_group.set_visible(False)
+        self._methods_group.set_visible(False)
+        self._fetch_detail_data()
+
+    def _fetch_detail_data(self):
+        """Fetch device info and enrollments in background thread."""
+
+        def fetch():
+            data = {}
+            try:
+                data["info"] = self.svc.get_device_info(self.device)
+            except GLib.Error:
+                data["info"] = {"device": self.device, "size": "?", "removable": False}
+
+            token_types = [
+                ("systemd-fido2", "FIDO2 Security Key"),
+                ("systemd-tpm2", "TPM2"),
+                ("systemd-recovery", "Recovery Key"),
+            ]
+            data["tokens"] = []
+            for token_type, label in token_types:
+                try:
+                    tokens = self.svc.get_tokens_by_type(self.device, token_type)
+                except GLib.Error:
+                    tokens = []
+                for token_id, slots in tokens:
+                    data["tokens"].append((label, token_id, slots))
+
+            try:
+                data["pw_slots"] = self.svc.find_password_keyslots(self.device)
+            except GLib.Error:
+                data["pw_slots"] = []
+
+            GLib.idle_add(self._apply_detail_data, data)
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _apply_detail_data(self, data):
+        """Apply fetched detail data to UI (runs on main thread)."""
+        self._apply_device_info(data["info"])
+        self._apply_enrollments(data["tokens"], data["pw_slots"])
+        self._populate_add_enrollment()
+        self._info_group.set_visible(True)
+        self._enrollments_group.set_visible(True)
+        self._add_group.set_visible(True)
+
+    def _clear_dynamic_rows(self, prefix=None):
+        """Remove tracked dynamic rows, optionally filtered by key prefix."""
+        to_remove = []
+        for key, (row, group) in self._dynamic_rows.items():
+            if prefix is None or key.startswith(prefix):
+                group.remove(row)
+                to_remove.append(key)
+        for key in to_remove:
+            del self._dynamic_rows[key]
+
+    def _add_row(self, group, row, key):
+        """Add a row to a group and track it for later removal."""
+        group.add(row)
+        self._dynamic_rows[key] = (row, group)
+
+    def _apply_device_info(self, info):
+        """Fill in device info rows from pre-fetched data."""
+        self._clear_dynamic_rows("info:")
+
+        row_dev = Adw.ActionRow(
+            title="Device", subtitle=info.get("device", self.device)
+        )
+        self._add_row(self._info_group, row_dev, "info:device")
+
+        row_size = Adw.ActionRow(title="Size", subtitle=info.get("size", "Unknown"))
+        self._add_row(self._info_group, row_size, "info:size")
+
+        dev_type = "Removable" if info.get("removable") else "Internal"
+        row_type = Adw.ActionRow(title="Type", subtitle=dev_type)
+        self._add_row(self._info_group, row_type, "info:type")
+
+        if info.get("filesystem"):
+            row_fs = Adw.ActionRow(title="Filesystem", subtitle=info["filesystem"])
+            self._add_row(self._info_group, row_fs, "info:fs")
+
+
+    def _apply_enrollments(self, tokens, pw_slots):
+        """List all current enrollments from pre-fetched data."""
+        self._clear_dynamic_rows("enroll:")
+
+        any_enrollments = False
+        for label, token_id, slots in tokens:
+            any_enrollments = True
+            slot_str = ", ".join(str(s) for s in slots)
+            row = Adw.ActionRow(
+                title=label,
+                subtitle=f"Token {token_id}, keyslot {slot_str}",
+            )
+            wipe_btn = Gtk.Button(label="Wipe")
+            wipe_btn.add_css_class("destructive-action")
+            wipe_btn.set_valign(Gtk.Align.CENTER)
+            is_auth = self.auth_keyslot is not None and self.auth_keyslot in slots
+            if is_auth:
+                wipe_btn.set_sensitive(False)
+                wipe_btn.set_tooltip_text(
+                    "Cannot wipe the keyslot used to authenticate"
+                )
+            else:
+                wipe_btn.connect("clicked", self._on_wipe_clicked, slots, wipe_btn)
+            row.add_suffix(wipe_btn)
+            self._add_row(self._enrollments_group, row, f"enroll:tok:{token_id}")
+
+        for slot in pw_slots:
+            any_enrollments = True
+            row = Adw.ActionRow(
+                title="Password",
+                subtitle=f"Keyslot {slot}",
+            )
+            wipe_btn = Gtk.Button(label="Wipe")
+            wipe_btn.add_css_class("destructive-action")
+            wipe_btn.set_valign(Gtk.Align.CENTER)
+            is_auth = self.auth_keyslot is not None and self.auth_keyslot == slot
+            if is_auth:
+                wipe_btn.set_sensitive(False)
+                wipe_btn.set_tooltip_text(
+                    "Cannot wipe the keyslot used to authenticate"
+                )
+            else:
+                wipe_btn.connect("clicked", self._on_wipe_clicked, [slot], wipe_btn)
+            row.add_suffix(wipe_btn)
+            self._add_row(self._enrollments_group, row, f"enroll:pw:{slot}")
+
+        if not any_enrollments:
+            row = Adw.ActionRow(title="No enrollments found")
+            self._add_row(self._enrollments_group, row, "enroll:none")
+
+    def _on_wipe_clicked(self, btn, slots, wipe_btn):
+        """Confirm and wipe enrollment slots."""
+        win = self.get_root()
+        slot_str = ", ".join(str(s) for s in slots)
+        dialog = Adw.AlertDialog(
+            heading="Wipe Enrollment",
+            body=f"Remove keyslot(s) {slot_str} from {self.device}?\n\nThis cannot be undone.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("wipe", "Wipe")
+        dialog.set_response_appearance("wipe", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self._on_wipe_confirmed, slots, wipe_btn)
+        dialog.present(win)
+
+    def _on_wipe_confirmed(self, _dialog, response, slots, wipe_btn):
+        if response != "wipe":
+            return
+        wipe_btn.set_sensitive(False)
+        wipe_btn.set_label("Wiping...")
+
+        def do_wipe():
+            all_ok = True
+            for slot in slots:
+                try:
+                    ok, _out, _err = self.svc.wipe_slot(
+                        self.device, self.passphrase or "",
+                        self.unlock_method, self.unlock_pin, slot
+                    )
+                    if not ok:
+                        all_ok = False
+                except GLib.Error:
+                    all_ok = False
+            GLib.idle_add(self._on_wipe_done, all_ok, wipe_btn)
+
+        threading.Thread(target=do_wipe, daemon=True).start()
+
+    def _on_wipe_done(self, ok, wipe_btn):
+        if ok:
+            wipe_btn.set_label("Wiped")
+            self._fetch_detail_data()
+        else:
+            wipe_btn.set_label("Failed")
+            wipe_btn.set_sensitive(True)
+
+    def _populate_add_enrollment(self):
+        """Build 'Add Enrollment' rows."""
+        self._clear_dynamic_rows("add:")
+
+        row_fido2 = Adw.ActionRow(
+            title="Add FIDO2 Key", subtitle="Security key with PIN"
+        )
+        row_fido2.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+        row_fido2.set_activatable(True)
+        row_fido2.connect(
+            "activated", lambda _: self._push_enroll_page(ManageFido2EnrollPage)
+        )
+        self._add_row(self._add_group, row_fido2, "add:fido2")
+
+        row_tpm2 = Adw.ActionRow(
+            title="Add TPM2", subtitle="TPM2 chip with optional PIN"
+        )
+        row_tpm2.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+        row_tpm2.set_activatable(True)
+        row_tpm2.connect(
+            "activated", lambda _: self._push_enroll_page(ManageTpm2EnrollPage)
+        )
+        self._add_row(self._add_group, row_tpm2, "add:tpm2")
+
+        row_recovery = Adw.ActionRow(
+            title="Add Recovery Key", subtitle="Generate a new recovery key"
+        )
+        row_recovery.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+        row_recovery.set_activatable(True)
+        row_recovery.connect(
+            "activated", lambda _: self._push_enroll_page(ManageRecoveryEnrollPage)
+        )
+        self._add_row(self._add_group, row_recovery, "add:recovery")
+
+        row_pw = Adw.ActionRow(
+            title="Add Password", subtitle="Add a passphrase keyslot"
+        )
+        row_pw.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+        row_pw.set_activatable(True)
+        row_pw.connect(
+            "activated", lambda _: self._push_enroll_page(ManagePassphraseEnrollPage)
+        )
+        self._add_row(self._add_group, row_pw, "add:password")
+
+    def _push_enroll_page(self, page_class):
+        nav = self.get_ancestor(Adw.NavigationView)
+        if nav:
+            page = page_class(self.svc, self.device, self.passphrase, self,
+                              self.unlock_method, self.unlock_pin)
+            nav.push(page)
+
+    def refresh_after_enroll(self):
+        """Called by enrollment pages after successful enrollment."""
+        if self._unlocked:
+            self._fetch_detail_data()
+
+
+class ManageFido2EnrollPage(Adw.NavigationPage):
+    """FIDO2 enrollment page for the management view."""
+
+    def __init__(self, svc, device, passphrase, detail_page,
+                 unlock_method="passphrase", unlock_pin=""):
+        super().__init__(title="Add FIDO2 Key")
+        self.svc = svc
+        self.device = device
+        self.passphrase = passphrase
+        self.detail_page = detail_page
+        self.unlock_method = unlock_method
+        self.unlock_pin = unlock_pin
+        self._fido2_devices = []  # all detected (hidraw_name, hid_name)
+        self._enrolled_devs = set()  # hidraw names already enrolled
+        self._is_enrolling = False
+        self._checking_status = False
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        toolbar_view.set_content(scroll)
+
+        self._content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        scroll.set_child(self._content_box)
+
+        prefs = Adw.PreferencesPage()
+        self._content_box.append(prefs)
+
+        self._group = Adw.PreferencesGroup(
+            title="FIDO2 Security Key",
+            description="Enter your FIDO2 token's PIN. You may need to touch the key.",
+        )
+        prefs.add(self._group)
+
+        # FIDO2 device row — always created, visibility managed by refresh
+        self._fido2_row = Adw.ActionRow(title="FIDO2 Device")
+        self._fido2_dropdown = Gtk.DropDown()
+        self._fido2_dropdown.set_valign(Gtk.Align.CENTER)
+        self._fido2_dropdown.connect("notify::selected", self._on_dropdown_changed)
+        self._fido2_row.add_suffix(self._fido2_dropdown)
+        self._group.add(self._fido2_row)
+
+        # Single-device / no-device status row
+        self._det_row = Adw.ActionRow(title="No FIDO2 device detected",
+                                      subtitle="Plug in a FIDO2 security key")
+        self._group.add(self._det_row)
+
+        # PIN entry
+        self._pin_row = Adw.ActionRow(title="PIN")
+        self._pin_entry = Gtk.PasswordEntry()
+        self._pin_entry.set_show_peek_icon(True)
+        self._pin_entry.set_valign(Gtk.Align.CENTER)
+        self._pin_entry.set_hexpand(True)
+        self._pin_entry.connect("activate", lambda _: self._do_enroll())
+        self._pin_row.add_suffix(self._pin_entry)
+        self._group.add(self._pin_row)
+
+        # Enroll button
+        btn_row = Adw.ActionRow()
+        self._enroll_btn = Gtk.Button(label="Enroll")
+        self._enroll_btn.add_css_class("suggested-action")
+        self._enroll_btn.set_valign(Gtk.Align.CENTER)
+        self._enroll_btn.connect("clicked", lambda _: self._do_enroll())
+        btn_row.add_suffix(self._enroll_btn)
+        self._group.add(btn_row)
+
+        # Status (outside PreferencesGroup for full-width text)
+        self._spinner = Gtk.Spinner()
+        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
+        self._status_label.set_hexpand(True)
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        status_box.set_margin_start(16)
+        status_box.set_margin_end(16)
+        status_box.set_margin_top(8)
+        status_box.set_margin_bottom(8)
+        status_box.append(self._spinner)
+        status_box.append(self._status_label)
+        self._content_box.append(status_box)
+
+        # Initial scan and subscribe to hidraw udev events
+        self._refresh_devices()
+        self._fetch_enrolled_status()
+        self._udev_client = GUdev.Client(subsystems=["hidraw"])
+        self._udev_signal_id = self._udev_client.connect(
+            "uevent", self._on_udev_event
+        )
+
+    def _on_udev_event(self, _client, action, _device):
+        """Handle hidraw device add/remove via udev."""
+        if self._is_enrolling:
+            return
+        if action in ("add", "remove"):
+            self._refresh_devices()
+            self._fetch_enrolled_status()
+
+    def _fetch_enrolled_status(self):
+        """Query service for which connected tokens are already enrolled."""
+        dev_paths = [f"/dev/{d[0]}" for d in self._fido2_devices]
+        if not dev_paths:
+            return
+        self._checking_status = True
+        self._enroll_btn.set_sensitive(False)
+        self._pin_row.set_sensitive(False)
+        self._status_label.set_text("Checking enrollment status…")
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+        self._spinner.start()
+        def fetch():
+            try:
+                paths = self.svc.check_fido2_enrolled(self.device, dev_paths)
+                names = {p.replace("/dev/", "") for p in paths if p}
+                GLib.idle_add(self._apply_enrolled_status, names)
+            except GLib.Error:
+                GLib.idle_add(self._apply_enrolled_status, set())
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _apply_enrolled_status(self, server_enrolled):
+        self._checking_status = False
+        self._spinner.stop()
+        self._status_label.set_text("")
+        self._enrolled_devs = server_enrolled
+        self._update_device_ui()
+
+    def _refresh_devices(self):
+        self._fido2_devices = detect_fido2_devices()
+        self._update_device_ui()
+
+    def _update_device_ui(self):
+        """Update the device selector and button sensitivity."""
+        unenrolled = [d for d in self._fido2_devices
+                      if d[0] not in self._enrolled_devs]
+
+        if self._fido2_devices:
+            self._fido2_row.set_visible(True)
+            self._det_row.set_visible(False)
+            labels = []
+            for dev, name in self._fido2_devices:
+                if dev in self._enrolled_devs:
+                    labels.append(f"\u2713 /dev/{dev} — {name}")
+                else:
+                    labels.append(f"/dev/{dev} — {name}")
+            self._fido2_dropdown.set_model(Gtk.StringList.new(labels))
+            self._fido2_dropdown.set_sensitive(len(self._fido2_devices) > 1)
+            # Select the first unenrolled device
+            for i, (dev, _) in enumerate(self._fido2_devices):
+                if dev not in self._enrolled_devs:
+                    self._fido2_dropdown.set_selected(i)
+                    break
+        else:
+            self._fido2_row.set_visible(False)
+            self._det_row.set_visible(True)
+            self._det_row.set_title("No FIDO2 device detected")
+            self._det_row.set_subtitle("Plug in a FIDO2 security key")
+
+        has_unenrolled = len(unenrolled) > 0
+        self._enroll_btn.set_sensitive(has_unenrolled)
+        self._pin_row.set_sensitive(has_unenrolled)
+        self._update_pin_enrolled_hint()
+
+    def _update_pin_enrolled_hint(self):
+        """Show 'Already enrolled' in PIN placeholder when selected device is enrolled."""
+        is_enrolled = False
+        if self._fido2_devices:
+            idx = self._fido2_dropdown.get_selected()
+            if idx is not None and idx < len(self._fido2_devices):
+                dev, _ = self._fido2_devices[idx]
+                is_enrolled = dev in self._enrolled_devs
+
+        if is_enrolled or not self._fido2_devices:
+            self._pin_entry.set_text("")
+            self._pin_entry.set_property(
+                "placeholder-text", "Already enrolled"
+                if is_enrolled else "")
+        else:
+            self._pin_entry.set_property("placeholder-text", "PIN")
+
+    def _on_dropdown_changed(self, dropdown, _pspec):
+        if self._is_enrolling:
+            return
+        idx = dropdown.get_selected()
+        if idx is not None and idx < len(self._fido2_devices):
+            dev, _ = self._fido2_devices[idx]
+            is_enrolled = dev in self._enrolled_devs
+            self._enroll_btn.set_sensitive(not is_enrolled)
+            self._pin_row.set_sensitive(not is_enrolled)
+            if is_enrolled:
+                self._pin_entry.set_text("")
+                self._pin_entry.set_property(
+                    "placeholder-text", "Already enrolled")
+            else:
+                self._pin_entry.set_property("placeholder-text", "PIN")
+
+    def _get_selected_fido2_device(self):
+        unenrolled = [d for d in self._fido2_devices
+                      if d[0] not in self._enrolled_devs]
+        if self._fido2_devices:
+            idx = self._fido2_dropdown.get_selected()
+            if idx is not None and idx < len(self._fido2_devices):
+                dev, _ = self._fido2_devices[idx]
+                if dev not in self._enrolled_devs:
+                    return f"/dev/{dev}"
+            # Fallback: first unenrolled
+            if unenrolled:
+                return f"/dev/{unenrolled[0][0]}"
+        return "auto"
+
+    def _do_enroll(self):
+        pin = self._pin_entry.get_text()
+        if not pin:
+            self._status_label.set_text("PIN cannot be empty.")
+            self._status_label.add_css_class("error")
+            return
+        fido2_dev = self._get_selected_fido2_device()
+        self._is_enrolling = True
+        self._enroll_btn.set_sensitive(False)
+        self._pin_row.set_sensitive(False)
+        self._fido2_row.set_sensitive(False)
+        self._spinner.start()
+        self._status_label.set_text("Enrolling... touch your key if prompted.")
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+
+        def do_enroll():
+            try:
+                ok, stdout, stderr = self.svc.enroll_fido2(
+                    self.device, self.passphrase or "", pin, fido2_dev,
+                    self.unlock_method, self.unlock_pin
+                )
+            except GLib.Error as e:
+                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
+            GLib.idle_add(self._on_enroll_done, ok, stdout, stderr)
+
+        threading.Thread(target=do_enroll, daemon=True).start()
+
+    def _on_enroll_done(self, ok, stdout, stderr):
+        self._is_enrolling = False
+        self._spinner.stop()
+        self._fido2_row.set_sensitive(True)
+        self._pin_entry.set_text("")
+        if ok:
+            self._status_label.set_text("FIDO2 key enrolled successfully.")
+            self._status_label.add_css_class("success")
+            self._status_label.remove_css_class("error")
+            self.detail_page.refresh_after_enroll()
+            # Re-fetch enrolled status to update UI
+            self._fetch_enrolled_status()
+        else:
+            msg = stderr or "Enrollment failed."
+            self._status_label.set_text(msg)
+            self._status_label.add_css_class("error")
+            self._status_label.remove_css_class("success")
+            self._enroll_btn.set_sensitive(True)
+            self._pin_row.set_sensitive(True)
+
+
+class ManageTpm2EnrollPage(Adw.NavigationPage):
+    """TPM2 enrollment page for the management view (PIN optional)."""
+
+    def __init__(self, svc, device, passphrase, detail_page,
+                 unlock_method="passphrase", unlock_pin=""):
+        super().__init__(title="Add TPM2")
+        self.svc = svc
+        self.device = device
+        self.passphrase = passphrase
+        self.detail_page = detail_page
+        self.unlock_method = unlock_method
+        self.unlock_pin = unlock_pin
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        toolbar_view.set_content(scroll)
+
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        scroll.set_child(content_box)
+
+        prefs = Adw.PreferencesPage()
+        content_box.append(prefs)
+
+        group = Adw.PreferencesGroup(
+            title="TPM2 Enrollment",
+            description="Bind to the TPM2 chip. Select PCR registers to bind.",
+        )
+        prefs.add(group)
+
+        # TPM2 detection
+        tpm2_info = detect_tpm2_device()
+        if tpm2_info:
+            det_row = Adw.ActionRow(title="Detected", subtitle=tpm2_info)
+            group.add(det_row)
+        else:
+            det_row = Adw.ActionRow(title="No TPM2 device detected")
+            group.add(det_row)
+
+        # PCR checkboxes
+        self._pcr_group = Adw.PreferencesGroup(title="PCR Registers")
+        pcr_group = self._pcr_group
+        prefs.add(pcr_group)
+        self._pcr_checks = {}
+        for pcr_num, pcr_desc in sorted(TPM2_PCRS.items()):
+            row = Adw.ActionRow(title=f"PCR {pcr_num}", subtitle=pcr_desc)
+            chk = Gtk.CheckButton()
+            chk.set_active(pcr_num in TPM2_DEFAULT_PCRS)
+            chk.set_valign(Gtk.Align.CENTER)
+            row.add_prefix(chk)
+            row.set_activatable_widget(chk)
+            pcr_group.add(row)
+            self._pcr_checks[pcr_num] = chk
+
+        # PIN (optional)
+        self._pin_group = Adw.PreferencesGroup(
+            title="PIN (Optional)",
+            description="Leave blank to unlock without a PIN.",
+        )
+        pin_group = self._pin_group
+        prefs.add(pin_group)
+
+        self._pin_row = Adw.ActionRow(title="PIN")
+        self._pin_entry = Gtk.PasswordEntry()
+        self._pin_entry.set_show_peek_icon(True)
+        self._pin_entry.set_valign(Gtk.Align.CENTER)
+        self._pin_entry.set_hexpand(True)
+        self._pin_row.add_suffix(self._pin_entry)
+        pin_group.add(self._pin_row)
+
+        self._pin_confirm_row = Adw.ActionRow(title="Confirm PIN")
+        self._pin_confirm = Gtk.PasswordEntry()
+        self._pin_confirm.set_show_peek_icon(True)
+        self._pin_confirm.set_valign(Gtk.Align.CENTER)
+        self._pin_confirm.set_hexpand(True)
+        self._pin_confirm.connect("activate", lambda _: self._do_enroll())
+        self._pin_confirm_row.add_suffix(self._pin_confirm)
+        pin_group.add(self._pin_confirm_row)
+
+        btn_row = Adw.ActionRow()
+        self._enroll_btn = Gtk.Button(label="Enroll")
+        self._enroll_btn.add_css_class("suggested-action")
+        self._enroll_btn.set_valign(Gtk.Align.CENTER)
+        self._enroll_btn.connect("clicked", lambda _: self._do_enroll())
+        if not tpm2_info:
+            self._enroll_btn.set_sensitive(False)
+        btn_row.add_suffix(self._enroll_btn)
+        pin_group.add(btn_row)
+
+        # Status (outside PreferencesGroup for full-width text)
+        self._spinner = Gtk.Spinner()
+        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
+        self._status_label.set_hexpand(True)
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        status_box.set_margin_start(16)
+        status_box.set_margin_end(16)
+        status_box.set_margin_top(8)
+        status_box.set_margin_bottom(8)
+        status_box.append(self._spinner)
+        status_box.append(self._status_label)
+        content_box.append(status_box)
+
+    def _do_enroll(self):
+        pin = self._pin_entry.get_text()
+        confirm = self._pin_confirm.get_text()
+        if pin and pin != confirm:
+            self._status_label.set_text("PINs do not match.")
+            self._status_label.add_css_class("error")
+            return
+        selected = sorted(n for n, chk in self._pcr_checks.items() if chk.get_active())
+        if not selected:
+            self._status_label.set_text("Select at least one PCR register.")
+            self._status_label.add_css_class("error")
+            return
+        pcrs = "+".join(str(p) for p in selected)
+        self._enroll_btn.set_sensitive(False)
+        self._pcr_group.set_sensitive(False)
+        self._pin_group.set_sensitive(False)
+        self._spinner.start()
+        self._status_label.set_text("Enrolling...")
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+
+        def do_enroll():
+            try:
+                ok, stdout, stderr = self.svc.enroll_tpm2(
+                    self.device, self.passphrase or "", pin, pcrs,
+                    self.unlock_method, self.unlock_pin
+                )
+            except GLib.Error as e:
+                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
+            GLib.idle_add(self._on_done, ok, stdout, stderr)
+
+        threading.Thread(target=do_enroll, daemon=True).start()
+
+    def _on_done(self, ok, stdout, stderr):
+        self._spinner.stop()
+        self._enroll_btn.set_sensitive(True)
+        self._pcr_group.set_sensitive(True)
+        self._pin_group.set_sensitive(True)
+        if ok:
+            self._status_label.set_text("TPM2 enrolled successfully.")
+            self._status_label.add_css_class("success")
+            self._status_label.remove_css_class("error")
+            self.detail_page.refresh_after_enroll()
+        else:
+            msg = stderr or "Enrollment failed."
+            self._status_label.set_text(msg)
+            self._status_label.add_css_class("error")
+            self._status_label.remove_css_class("success")
+
+
+class ManageRecoveryEnrollPage(Adw.NavigationPage):
+    """Recovery key enrollment page for the management view."""
+
+    def __init__(self, svc, device, passphrase, detail_page,
+                 unlock_method="passphrase", unlock_pin=""):
+        super().__init__(title="Add Recovery Key")
+        self.svc = svc
+        self.device = device
+        self.passphrase = passphrase
+        self.unlock_method = unlock_method
+        self.unlock_pin = unlock_pin
+        self.detail_page = detail_page
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        toolbar_view.set_content(scroll)
+
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        scroll.set_child(content_box)
+
+        prefs = Adw.PreferencesPage()
+        content_box.append(prefs)
+
+        group = Adw.PreferencesGroup(
+            title="Recovery Key",
+            description=(
+                "Generate a recovery key. You MUST write it down and store it safely.\n"
+                "This is your last resort if all other unlock methods are unavailable."
+            ),
+        )
+        prefs.add(group)
+
+        btn_row = Adw.ActionRow()
+        self._enroll_btn = Gtk.Button(label="Generate Recovery Key")
+        self._enroll_btn.add_css_class("suggested-action")
+        self._enroll_btn.set_valign(Gtk.Align.CENTER)
+        self._enroll_btn.connect("clicked", lambda _: self._do_enroll())
+        btn_row.add_suffix(self._enroll_btn)
+        group.add(btn_row)
+
+        # Status and recovery key display (outside PreferencesGroup for full width)
+        self._spinner = Gtk.Spinner()
+        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
+        self._status_label.set_hexpand(True)
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        status_box.set_margin_start(16)
+        status_box.set_margin_end(16)
+        status_box.set_margin_top(8)
+        status_box.append(self._spinner)
+        status_box.append(self._status_label)
+        content_box.append(status_box)
+
+        self._key_label = Gtk.Label(label="", selectable=True, wrap=True, xalign=0)
+        self._key_label.add_css_class("title-3")
+        self._key_label.add_css_class("monospace")
+        self._key_label.set_margin_start(16)
+        self._key_label.set_margin_end(16)
+        self._key_label.set_margin_bottom(16)
+        content_box.append(self._key_label)
+
+    def _do_enroll(self):
+        self._enroll_btn.set_sensitive(False)
+        self._spinner.start()
+        self._status_label.set_text("Generating recovery key...")
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+        self._key_label.set_text("")
+
+        def do_enroll():
+            try:
+                ok, stdout, stderr = self.svc.enroll_recovery_key(
+                    self.device, self.passphrase or "",
+                    self.unlock_method, self.unlock_pin
+                )
+            except GLib.Error as e:
+                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
+            GLib.idle_add(self._on_done, ok, stdout, stderr)
+
+        threading.Thread(target=do_enroll, daemon=True).start()
+
+    def _on_done(self, ok, stdout, stderr):
+        self._spinner.stop()
+        self._enroll_btn.set_sensitive(True)
+        if ok:
+            self._status_label.set_text("Recovery key generated. Write it down!")
+            self._status_label.add_css_class("success")
+            self._status_label.remove_css_class("error")
+            # Extract recovery key from stdout
+            if stdout:
+                for line in stdout.splitlines():
+                    line = line.strip()
+                    if line and len(line) > 20 and "-" in line:
+                        self._key_label.set_text(line)
+                        break
+            self.detail_page.refresh_after_enroll()
+        else:
+            msg = stderr or "Failed to generate recovery key."
+            self._status_label.set_text(msg)
+            self._status_label.add_css_class("error")
+            self._status_label.remove_css_class("success")
+
+
+class ManagePassphraseEnrollPage(Adw.NavigationPage):
+    """Passphrase enrollment page for the management view."""
+
+    def __init__(self, svc, device, passphrase, detail_page,
+                 unlock_method="passphrase", unlock_pin=""):
+        super().__init__(title="Add Password")
+        self.svc = svc
+        self.device = device
+        self.passphrase = passphrase
+        self.detail_page = detail_page
+        self.unlock_method = unlock_method
+        self.unlock_pin = unlock_pin
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        toolbar_view.set_content(scroll)
+
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        scroll.set_child(content_box)
+
+        prefs = Adw.PreferencesPage()
+        content_box.append(prefs)
+
+        group = Adw.PreferencesGroup(
+            title="Add Password",
+            description="Add a new passphrase keyslot to the device.",
+        )
+        prefs.add(group)
+
+        self._pw_row = Adw.ActionRow(title="New Passphrase")
+        self._pw_entry = Gtk.PasswordEntry()
+        self._pw_entry.set_show_peek_icon(True)
+        self._pw_entry.set_valign(Gtk.Align.CENTER)
+        self._pw_entry.set_hexpand(True)
+        self._pw_row.add_suffix(self._pw_entry)
+        group.add(self._pw_row)
+
+        self._pw_confirm_row = Adw.ActionRow(title="Confirm Passphrase")
+        self._pw_confirm = Gtk.PasswordEntry()
+        self._pw_confirm.set_show_peek_icon(True)
+        self._pw_confirm.set_valign(Gtk.Align.CENTER)
+        self._pw_confirm.set_hexpand(True)
+        self._pw_confirm.connect("activate", lambda _: self._do_enroll())
+        self._pw_confirm_row.add_suffix(self._pw_confirm)
+        group.add(self._pw_confirm_row)
+
+        btn_row = Adw.ActionRow()
+        self._enroll_btn = Gtk.Button(label="Add Password")
+        self._enroll_btn.add_css_class("suggested-action")
+        self._enroll_btn.set_valign(Gtk.Align.CENTER)
+        self._enroll_btn.connect("clicked", lambda _: self._do_enroll())
+        btn_row.add_suffix(self._enroll_btn)
+        group.add(btn_row)
+
+        # Status (outside PreferencesGroup for full-width text)
+        self._spinner = Gtk.Spinner()
+        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
+        self._status_label.set_hexpand(True)
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        status_box.set_margin_start(16)
+        status_box.set_margin_end(16)
+        status_box.set_margin_top(8)
+        status_box.set_margin_bottom(8)
+        status_box.append(self._spinner)
+        status_box.append(self._status_label)
+        content_box.append(status_box)
+
+    def _do_enroll(self):
+        pw = self._pw_entry.get_text()
+        confirm = self._pw_confirm.get_text()
+        if not pw:
+            self._status_label.set_text("Passphrase cannot be empty.")
+            self._status_label.add_css_class("error")
+            return
+        if pw != confirm:
+            self._status_label.set_text("Passphrases do not match.")
+            self._status_label.add_css_class("error")
+            return
+        self._enroll_btn.set_sensitive(False)
+        self._pw_row.set_sensitive(False)
+        self._pw_confirm_row.set_sensitive(False)
+        self._spinner.start()
+        self._status_label.set_text("Adding passphrase...")
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+
+        def do_enroll():
+            try:
+                ok, stdout, stderr = self.svc.enroll_passphrase(
+                    self.device, self.passphrase or "", pw,
+                    self.unlock_method, self.unlock_pin
+                )
+            except GLib.Error as e:
+                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
+            GLib.idle_add(self._on_done, ok, stdout, stderr)
+
+        threading.Thread(target=do_enroll, daemon=True).start()
+
+    def _on_done(self, ok, stdout, stderr):
+        self._spinner.stop()
+        self._enroll_btn.set_sensitive(True)
+        self._pw_row.set_sensitive(True)
+        self._pw_confirm_row.set_sensitive(True)
+        if ok:
+            self._status_label.set_text("Passphrase added successfully.")
+            self._status_label.add_css_class("success")
+            self._status_label.remove_css_class("error")
+            self.detail_page.refresh_after_enroll()
+        else:
+            msg = stderr or "Failed to add passphrase."
+            self._status_label.set_text(msg)
+            self._status_label.add_css_class("error")
+            self._status_label.remove_css_class("success")
+
+
+class ManagementWindow(Adw.ApplicationWindow):
+    """Management view for LUKS disk encryption."""
+
+    def __init__(self, app):
+        super().__init__(
+            application=app,
+            title="Disk Encryption",
+            default_width=640,
+            default_height=700,
+            resizable=False,
+        )
+
+        # D-Bus proxy for privileged operations
+        try:
+            self.svc = LuksEnrollProxy()
+        except GLib.Error as e:
+            self.svc = None
+            print(
+                f"Warning: could not connect to D-Bus service: {e.message}",
+                file=sys.stderr,
+            )
+
+        # Main layout: NavigationView
+        self.nav_view = Adw.NavigationView()
+        self.set_content(self.nav_view)
+
+        self.device_list_page = DeviceListPage(self.svc)
+        self.nav_view.push(self.device_list_page)
+
+        # Watch for service disappearance
+        if self.svc:
+            self.svc.on_service_vanished(self._on_service_lost)
+
+        # Auto-refresh for hot-plug detection
+        GLib.timeout_add_seconds(5, self._auto_refresh)
+
+    def _on_service_lost(self):
+        """Pop all pages back to root when the D-Bus service vanishes."""
+        while self.nav_view.get_visible_page() != self.device_list_page:
+            self.nav_view.pop()
+        self.device_list_page._populate()
+
+    def _auto_refresh(self):
+        """Periodically refresh the device list."""
+        if self.device_list_page:
+            self.device_list_page._populate()
+        return GLib.SOURCE_CONTINUE
+
+
+# ---------------------------------------------------------------------------
+# CSS
+# ---------------------------------------------------------------------------
+
+CSS = b"""
+.monospace { font-family: monospace; }
+.success { color: @success_color; }
+.error { color: @error_color; }
+.touch-overlay {
+    background: alpha(@window_bg_color, 0.95);
+    border-radius: 16px;
+    padding: 48px;
+    margin: 32px;
+}
+"""
+
+
+class LuksEnrollApp(Adw.Application):
+    def __init__(self, mode="manage"):
+        super().__init__(
+            application_id="net.contemno.luks-enroll",
+            flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
+        )
+        self.mode = mode
+
+    def do_activate(self):
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            (
+                self.get_active_window().get_display()
+                if self.get_active_window()
+                else __import__("gi").repository.Gdk.Display.get_default()
+            ),
+            css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+        if self.mode == "first-login":
+            win = WizardWindow(self)
+        else:
+            win = ManagementWindow(self)
+        win.present()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="LUKS Disk Encryption Manager")
+    parser.add_argument(
+        "--first-login",
+        action="store_true",
+        help="Run the first-login enrollment wizard",
+    )
+    args, gtk_args = parser.parse_known_args()
+
+    mode = "first-login" if args.first_login else "manage"
+    app = LuksEnrollApp(mode=mode)
+    app.run([sys.argv[0]] + gtk_args)
+
+
+if __name__ == "__main__":
+    main()
