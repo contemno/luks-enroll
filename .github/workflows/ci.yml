@@ -43,3 +43,29 @@ jobs:
 
       - name: Run tests
         run: python3 -m pytest tests/ -v
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install C build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcryptsetup-dev libfido2-dev libtss2-dev libblkid-dev
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Tests (includes LUKS2 image-file integration tests)
+        run: cargo test --workspace
