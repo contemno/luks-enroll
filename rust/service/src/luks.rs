@@ -99,8 +99,8 @@ fn cached_volume_key(device: &str) -> Option<VolumeKey> {
 // ---------------------------------------------------------------------------
 
 fn open_luks2(device: &str) -> Result<CryptDevice> {
-    let mut dev = CryptInit::init(Path::new(device))
-        .map_err(|_| Error::from("Failed to open device"))?;
+    let mut dev =
+        CryptInit::init(Path::new(device)).map_err(|_| Error::from("Failed to open device"))?;
     dev.context_handle()
         .load::<()>(Some(EncryptionFormat::Luks2), None)
         .map_err(|_| Error::from("Failed to load LUKS2 header"))?;
@@ -231,8 +231,12 @@ pub fn fido2_token_refs(device: &str) -> Result<Vec<Fido2TokenRef>> {
                 .and_then(|v| v.as_str())
                 .ok_or(Error::from("fido2 token missing fido2-salt"))?;
             out.push(Fido2TokenRef {
-                cred_id: B64.decode(cred).map_err(|e| Error(format!("bad base64: {e}")))?,
-                salt: B64.decode(salt).map_err(|e| Error(format!("bad base64: {e}")))?,
+                cred_id: B64
+                    .decode(cred)
+                    .map_err(|e| Error(format!("bad base64: {e}")))?,
+                salt: B64
+                    .decode(salt)
+                    .map_err(|e| Error(format!("bad base64: {e}")))?,
             });
         }
     }
@@ -262,13 +266,16 @@ pub fn tpm2_token_refs(device: &str) -> Result<Vec<Tpm2TokenRef>> {
                     let mut buf = Vec::new();
                     for p in parts {
                         let s = p.as_str().ok_or(Error::from("bad tpm2-blob entry"))?;
-                        buf.extend(B64.decode(s).map_err(|e| Error(format!("bad base64: {e}")))?);
+                        buf.extend(
+                            B64.decode(s)
+                                .map_err(|e| Error(format!("bad base64: {e}")))?,
+                        );
                     }
                     buf
                 }
-                serde_json::Value::String(s) => {
-                    B64.decode(s).map_err(|e| Error(format!("bad base64: {e}")))?
-                }
+                serde_json::Value::String(s) => B64
+                    .decode(s)
+                    .map_err(|e| Error(format!("bad base64: {e}")))?,
                 _ => bail!("bad tpm2-blob field"),
             };
             let pcrs = match tinfo.get("tpm2-pcrs") {
@@ -339,11 +346,7 @@ fn derive_passphrase_from_token(
 /// Verify unlock via a LUKS2 token (FIDO2/TPM2) and cache the volume key so
 /// follow-up enrollment operations don't need a second touch/unseal.
 /// Returns the keyslot, or an error message.
-pub fn verify_token(
-    device: &str,
-    token_type: &str,
-    pin: &str,
-) -> std::result::Result<i32, String> {
+pub fn verify_token(device: &str, token_type: &str, pin: &str) -> std::result::Result<i32, String> {
     const VALID: [&str; 2] = ["systemd-fido2", "systemd-tpm2"];
     if !VALID.contains(&token_type) {
         // Parity: Python raises here (caller turns it into a D-Bus failure).
