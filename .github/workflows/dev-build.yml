@@ -1,0 +1,131 @@
+name: Dev build
+
+# Branch builds: every push to a work branch (or a manual dispatch once
+# this file reaches the default branch) produces installable dev
+# artifacts without tagging a release:
+#   * the .deb, versioned by scripts/gen-changelog.sh as
+#     <latest-tag>~git<shortsha> (0.0.0~git<shortsha> before any tag),
+#     built the same way release.yml builds it;
+#   * the Rust luks-enroll-service binary from rust/ (Phase A), for
+#     overlay-testing the service port on real hardware while the deb
+#     still ships the Python implementation (until Phase A6).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "claude/**"
+      - "dev/**"
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential git dpkg-dev debhelper devscripts \
+            python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
+            libcryptsetup12 systemd
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0  # full history + tags for changelog generation
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Generate dev debian/changelog from git history
+        run: |
+          DEBFULLNAME="GitHub Actions" \
+          DEBEMAIL="actions@github.com" \
+          ./scripts/gen-changelog.sh
+          head -8 debian/changelog
+
+      - name: Build package
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp ../*.deb ../*.buildinfo ../*.changes artifacts/
+          echo "DEV_VERSION=$(dpkg-parsechangelog -S Version)" >> "$GITHUB_ENV"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: luks-enroll-deb-dev
+          path: artifacts/
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          {
+            echo "## Dev .deb"
+            echo ""
+            echo "Version: \`${DEV_VERSION}\` (sorts below the next tagged release)"
+            echo ""
+            echo '```sh'
+            echo "sudo apt install ./luks-enroll_*.deb"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rust-service:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install C build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcryptsetup-dev libfido2-dev libtss2-dev libblkid-dev
+
+      - name: Build release binary
+        run: cargo build --release -p luks-enroll-service
+
+      - name: Stage artifact
+        run: |
+          mkdir -p ../dev-artifact
+          cp target/release/luks-enroll-service ../dev-artifact/
+          sha256sum ../dev-artifact/luks-enroll-service | tee ../dev-artifact/SHA256SUMS
+
+      - name: Upload Rust service binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: luks-enroll-service-rust-dev
+          path: dev-artifact/
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          {
+            echo "## Rust service binary (Phase A overlay test)"
+            echo ""
+            echo "Built on ubuntu-noble; links the distro libcryptsetup12,"
+            echo "libfido2-1, libtss2-esys/-mu, libblkid1 — target should be"
+            echo "Ubuntu 24.04-compatible until Phase A6 packaging lands."
+            echo ""
+            echo "Install the dev .deb first (Python stack + policy files),"
+            echo "then overlay the Rust service and let bus activation pick"
+            echo "it up:"
+            echo ""
+            echo '```sh'
+            echo "sudo install -m755 luks-enroll-service /usr/sbin/luks-enroll-service"
+            echo "sudo systemctl kill net.contemno.LuksEnroll.service 2>/dev/null || true"
+            echo '```'
+            echo ""
+            echo "Restore the Python service by reinstalling the .deb."
+          } >> "$GITHUB_STEP_SUMMARY"
