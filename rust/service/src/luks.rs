@@ -216,6 +216,11 @@ pub fn find_token_for_keyslot(device: &str, slot: i32) -> i32 {
 /// Parse systemd-fido2 tokens from the LUKS2 header.
 pub fn fido2_token_refs(device: &str) -> Result<Vec<Fido2TokenRef>> {
     let meta = metadata_json(device).ok_or(Error::from("Failed to read LUKS2 metadata"))?;
+    fido2_refs_from_meta(&meta)
+}
+
+/// Pure parser for systemd-fido2 tokens in LUKS2 metadata JSON.
+fn fido2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Fido2TokenRef>> {
     let mut out = Vec::new();
     if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
         for tinfo in tokens.values() {
@@ -250,6 +255,14 @@ pub fn fido2_token_refs(device: &str) -> Result<Vec<Fido2TokenRef>> {
 /// (concatenated), and pcrs as list or scalar.
 pub fn tpm2_token_refs(device: &str) -> Result<Vec<Tpm2TokenRef>> {
     let meta = metadata_json(device).ok_or(Error::from("Failed to read LUKS2 metadata"))?;
+    tpm2_refs_from_meta(&meta)
+}
+
+/// Pure parser for systemd-tpm2 tokens in LUKS2 metadata JSON. The lenient
+/// shapes (array blobs, scalar pcrs) appear only when reading headers
+/// written by other tools — the systemd token plugins validate what *we*
+/// write through crypt_token_json_set, so these forms are read-side only.
+fn tpm2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Tpm2TokenRef>> {
     let mut out = Vec::new();
     if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
         for (tid, tinfo) in tokens {
@@ -501,4 +514,90 @@ pub fn format_luks2(path: &str, passphrase: &str) -> Result<i32> {
         .add_by_key(None, None, passphrase.as_bytes(), CryptVolumeKey::empty())
         .map_err(|e| Error(format!("crypt_keyslot_add_by_key failed: {e}")))?;
     Ok(slot as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tpm2_refs_parse_quirks() {
+        // Old-style header written by another tool: only "tpm2-blob"
+        // (dash), blob split into base64 chunks, pcrs as a number list.
+        let meta = serde_json::json!({
+            "tokens": {
+                "3": {
+                    "type": "systemd-tpm2",
+                    "keyslots": ["1"],
+                    "tpm2-blob": [B64.encode([0x01, 0x02]), B64.encode([0x03])],
+                    "tpm2-pcrs": [7, 11],
+                    "tpm2-pin": true,
+                },
+                "4": {
+                    "type": "systemd-fido2",
+                    "keyslots": ["2"],
+                },
+            }
+        });
+        let refs = tpm2_refs_from_meta(&meta).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].token_id, "3");
+        assert_eq!(refs[0].blob, vec![0x01, 0x02, 0x03]);
+        assert_eq!(refs[0].pcrs, "7+11");
+        assert_eq!(refs[0].pcr_bank, "sha256"); // default when absent
+        assert!(refs[0].pin_required);
+    }
+
+    #[test]
+    fn tpm2_refs_prefer_underscore_blob_and_scalar_pcrs() {
+        let meta = serde_json::json!({
+            "tokens": {
+                "0": {
+                    "type": "systemd-tpm2",
+                    "tpm2_blob": B64.encode([0xAA]),
+                    "tpm2-blob": B64.encode([0xBB]),
+                    "tpm2-pcrs": "7",
+                    "tpm2-pcr-bank": "sha1",
+                }
+            }
+        });
+        let refs = tpm2_refs_from_meta(&meta).unwrap();
+        assert_eq!(refs[0].blob, vec![0xAA], "tpm2_blob wins over tpm2-blob");
+        assert_eq!(refs[0].pcrs, "7");
+        assert_eq!(refs[0].pcr_bank, "sha1");
+        assert!(!refs[0].pin_required); // default when absent
+    }
+
+    #[test]
+    fn tpm2_refs_missing_blob_is_error() {
+        let meta = serde_json::json!({
+            "tokens": { "0": { "type": "systemd-tpm2" } }
+        });
+        assert!(tpm2_refs_from_meta(&meta).is_err());
+    }
+
+    #[test]
+    fn fido2_refs_parse_and_skip_other_types() {
+        let meta = serde_json::json!({
+            "tokens": {
+                "1": {
+                    "type": "systemd-fido2",
+                    "fido2-credential": B64.encode([9u8; 4]),
+                    "fido2-salt": B64.encode([7u8; 4]),
+                },
+                "2": { "type": "systemd-recovery", "keyslots": ["5"] },
+            }
+        });
+        let refs = fido2_refs_from_meta(&meta).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].cred_id, vec![9u8; 4]);
+        assert_eq!(refs[0].salt, vec![7u8; 4]);
+    }
+
+    #[test]
+    fn no_tokens_section_is_empty_not_error() {
+        let meta = serde_json::json!({"keyslots": {}});
+        assert!(tpm2_refs_from_meta(&meta).unwrap().is_empty());
+        assert!(fido2_refs_from_meta(&meta).unwrap().is_empty());
+    }
 }

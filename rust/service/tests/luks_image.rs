@@ -227,9 +227,15 @@ fn token_style_keyslot_with_minimal_pbkdf() {
     assert!(luks::fido2_token_refs(&img).expect("refs").is_empty());
 }
 
-/// tpm2 token parsing tolerates both blob spellings and list blobs.
+/// A fully-formed systemd-tpm2 token — the exact shape op_enroll_tpm2
+/// writes — must pass libcryptsetup's token validation (the systemd token
+/// plugins are installed in CI and validate on crypt_token_json_set; this
+/// is a real conformance check against systemd's own validator) and parse
+/// back through tpm2_token_refs. The lenient read-side parsing quirks
+/// (array blobs, scalar pcrs) are covered by unit tests in luks.rs, since
+/// those shapes can't be *written* through a validating plugin.
 #[test]
-fn tpm2_token_ref_parsing_quirks() {
+fn tpm2_token_full_shape_roundtrip() {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
 
@@ -238,23 +244,28 @@ fn tpm2_token_ref_parsing_quirks() {
     let vk = luks::get_volume_key(&img, "passphrase", PASSPHRASE, "").expect("vk");
     let slot = luks::add_keyslot_by_volume_key(&img, &vk, b"tpm2-secret", true).expect("slot");
 
-    // Old-style: only "tpm2-blob", pcrs as list of numbers, blob split in
-    // two base64 chunks.
+    let blob_b64 = B64.encode(vec![0x5A; 96]);
     let token_json = serde_json::json!({
         "type": "systemd-tpm2",
         "keyslots": [slot.to_string()],
-        "tpm2-blob": [B64.encode([0x01, 0x02]), B64.encode([0x03])],
+        "tpm2-blob": blob_b64,
+        "tpm2_blob": blob_b64,
         "tpm2-pcrs": [7, 11],
         "tpm2-pcr-bank": "sha256",
         "tpm2-primary-alg": "ecc",
+        "tpm2-policy-hash": "ab".repeat(32),
         "tpm2-pin": true,
+        "tpm2_pubkey_pcrs": [],
+        "tpm2_pcr_hash": "sha256",
+        "tpm2_pcrlock": false,
+        "tpm2_srk": B64.encode([0x11; 32]),
     })
     .to_string();
     luks::set_token(&img, -1, Some(&token_json)).expect("set token");
 
     let refs = luks::tpm2_token_refs(&img).expect("refs");
     assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].blob, vec![0x01, 0x02, 0x03]);
+    assert_eq!(refs[0].blob, vec![0x5A; 96]);
     assert_eq!(refs[0].pcrs, "7+11");
     assert_eq!(refs[0].pcr_bank, "sha256");
     assert!(refs[0].pin_required);
