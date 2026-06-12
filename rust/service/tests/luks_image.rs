@@ -12,13 +12,8 @@ const PASSPHRASE: &str = "test-passphrase-123";
 
 /// 32 MiB image: LUKS2 reserves 16 MiB for metadata by default.
 fn new_luks_image(dir: &tempfile::TempDir) -> String {
-    let path = dir
-        .path()
-        .join("test.img")
-        .to_string_lossy()
-        .into_owned();
-    let (ok, keyslot, err) =
-        service::op_create_encrypted_image(&path, 32, PASSPHRASE, None);
+    let path = dir.path().join("test.img").to_string_lossy().into_owned();
+    let (ok, keyslot, err) = service::op_create_encrypted_image(&path, 32, PASSPHRASE, None);
     assert!(ok, "op_create_encrypted_image failed: {err}");
     assert_eq!(keyslot, 0, "first keyslot should be 0");
     path
@@ -52,8 +47,7 @@ fn create_image_format_and_verify() {
 #[test]
 fn create_image_rejects_bad_paths_and_sizes() {
     // Outside the allowlist.
-    let (ok, slot, err) =
-        service::op_create_encrypted_image("/var/evil.img", 32, PASSPHRASE, None);
+    let (ok, slot, err) = service::op_create_encrypted_image("/var/evil.img", 32, PASSPHRASE, None);
     assert!(!ok);
     assert_eq!(slot, -1);
     assert_eq!(err, "Path must be under /home/ or /tmp/");
@@ -110,13 +104,8 @@ fn enroll_passphrase_and_wipe_slot() {
     let dir = tmpdir();
     let img = new_luks_image(&dir);
 
-    let (ok, _, err) = service::op_enroll_passphrase(
-        &img,
-        PASSPHRASE,
-        "second-passphrase",
-        "passphrase",
-        "",
-    );
+    let (ok, _, err) =
+        service::op_enroll_passphrase(&img, PASSPHRASE, "second-passphrase", "passphrase", "");
     assert!(ok, "passphrase enrollment failed: {err}");
     assert_eq!(luks::verify_passphrase(&img, "second-passphrase"), Ok(1));
     assert_eq!(luks::list_keyslots(&img).len(), 2);
@@ -226,7 +215,8 @@ fn token_style_keyslot_with_minimal_pbkdf() {
     // The minimal-PBKDF slot uses pbkdf2 (visible in the LUKS2 metadata).
     let meta = luks::metadata_json(&img).expect("metadata");
     assert_eq!(
-        meta["keyslots"][slot.to_string()]["kdf"]["type"], "pbkdf2",
+        meta["keyslots"][slot.to_string()]["kdf"]["type"],
+        "pbkdf2",
         "token keyslot should use minimal pbkdf2"
     );
     // And the base64 secret unlocks it.
