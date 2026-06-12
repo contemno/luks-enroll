@@ -731,6 +731,7 @@ dependencies = [
  "getrandom",
  "gpt",
  "libblkid-rs",
+ "libblkid-rs-sys",
  "libc",
  "libcryptsetup-rs",
  "nix",
