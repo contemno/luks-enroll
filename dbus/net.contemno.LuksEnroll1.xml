@@ -1,0 +1,126 @@
+<node>
+  <interface name="net.contemno.LuksEnroll1">
+    <method name="DetectDevices">
+      <arg direction="out" type="as" name="devices"/>
+    </method>
+    <method name="GetKeyslots">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="out" type="s" name="keyslots_json"/>
+    </method>
+    <method name="GetTokensByType">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="token_type"/>
+      <arg direction="out" type="s" name="tokens_json"/>
+    </method>
+    <method name="FindPasswordKeyslots">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="out" type="ai" name="keyslots"/>
+    </method>
+    <method name="VerifyPassphrase">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="out" type="b" name="success"/>
+      <arg direction="out" type="i" name="keyslot"/>
+    </method>
+    <method name="UnlockWithToken">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="token_type"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="out" type="b" name="success"/>
+      <arg direction="out" type="i" name="keyslot"/>
+    </method>
+    <method name="EnrollFido2">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="in" type="s" name="fido2_device"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="EnrollTpm2">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="in" type="s" name="pcrs"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="EnrollRecoveryKey">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="WipeSlot">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="in" type="i" name="slot"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="CreateEncryptedImage">
+      <arg direction="in" type="s" name="path"/>
+      <arg direction="in" type="i" name="size_mb"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="i" name="keyslot"/>
+      <arg direction="out" type="s" name="error"/>
+    </method>
+    <method name="DetectRemovableDevices">
+      <arg direction="out" type="s" name="devices_json"/>
+    </method>
+    <method name="GetDeviceInfo">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="out" type="s" name="info_json"/>
+    </method>
+    <method name="FormatPartition">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="partition"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="EnrollPassphrase">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="existing_passphrase"/>
+      <arg direction="in" type="s" name="new_passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="GetSetting">
+      <arg direction="in" type="s" name="key"/>
+      <arg direction="out" type="s" name="value"/>
+    </method>
+    <method name="SetSetting">
+      <arg direction="in" type="s" name="key"/>
+      <arg direction="in" type="s" name="value"/>
+      <arg direction="out" type="b" name="ok"/>
+    </method>
+    <method name="CheckFido2Enrolled">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="as" name="fido2_dev_paths"/>
+      <arg direction="out" type="as" name="enrolled_hidraw_paths"/>
+    </method>
+    <method name="Authenticate">
+      <arg direction="out" type="b" name="authorized"/>
+    </method>
+    <method name="GetSystemdVersion">
+      <arg direction="out" type="i" name="version"/>
+    </method>
+  </interface>
+</node>
