@@ -20,6 +20,7 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 getrandom = "0.4.2"
 gpt = "4.1.0"
 libblkid-rs = "0.4.2"
+libblkid-rs-sys = "0.3.1"
 libc = "0.2.186"
 libcryptsetup-rs = { version = "0.16.0", features = ["mutex"] }
 nix = { version = "0.30", features = ["fs", "ioctl", "user"] }
