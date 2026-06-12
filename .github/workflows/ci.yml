@@ -69,3 +69,12 @@ jobs:
 
       - name: Tests (includes LUKS2 image-file integration tests)
         run: cargo test --workspace
+
+      - name: TPM2 seal/unseal roundtrips against swtpm
+        run: |
+          sudo apt-get install -y --no-install-recommends swtpm
+          mkdir -p /tmp/swtpm-state
+          swtpm socket --tpm2 --server port=2321 --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear --tpmstate dir=/tmp/swtpm-state --daemon
+          TCTI="swtpm:host=127.0.0.1,port=2321" \
+            cargo test -p luks-enroll-service tpm2 -- --ignored

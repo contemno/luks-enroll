@@ -43,6 +43,13 @@ The application is split between an unprivileged GTK client and a privileged D-B
 - **Polkit actions:** `net.contemno.luks-enroll.read` (auth-cached for inspection), `net.contemno.luks-enroll.manage` (required for any destructive change)
 - **systemd hardening:** the service unit runs with `ProtectSystem=strict`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies=AF_UNIX`, a minimal capability bounding set, and explicit `DeviceAllow` rules for block, hidraw, tpm, and tpmrm device classes.
 
+## Rust port (Phase A, in progress)
+
+The privileged service is being ported to Rust — see [RUST_MIGRATION.md](RUST_MIGRATION.md)
+for the plan and status. The Rust workspace lives in [`rust/`](rust/); the D-Bus interface
+contract is frozen in [`dbus/net.contemno.LuksEnroll1.xml`](dbus/net.contemno.LuksEnroll1.xml),
+so the Python client and service remain the shipped implementation until the swap (Phase A6).
+
 ## Initramfs unlock
 
 The package ships [`/etc/dracut.conf.d/luks-enroll.conf`](dist/etc/dracut.conf.d/luks-enroll.conf), which conditionally adds the `fido2` and `tpm2-tss` dracut modules and pulls in the matching `libcryptsetup-token-systemd-*.so` plugins. The conf file is sourced as shell, so it is a no-op on systems without the relevant libraries — and a no-op entirely if dracut is not installed.
