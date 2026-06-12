@@ -85,7 +85,7 @@ async fn wait_for_name(conn: &zbus::Connection) {
     panic!("service never acquired {BUS_NAME}");
 }
 
-async fn proxy(conn: &zbus::Connection) -> zbus::Proxy<'_> {
+async fn make_proxy(conn: &zbus::Connection) -> zbus::Proxy<'_> {
     zbus::Proxy::new(conn, BUS_NAME, OBJECT_PATH, INTERFACE)
         .await
         .expect("proxy")
@@ -98,7 +98,7 @@ async fn e2e_over_private_bus() {
     };
     let conn = connect(&address).await;
     wait_for_name(&conn).await;
-    let proxy = proxy(&conn).await;
+    let proxy = make_proxy(&conn).await;
 
     // --- Unprivileged method ---
     let version: i32 = proxy
@@ -154,12 +154,23 @@ async fn e2e_over_private_bus() {
         Some("org.freedesktop.DBus.Error.InvalidArgs")
     );
 
-    // --- No polkitd on this bus: a method without an ownership path must
-    //     fail with the exact polkit error name. ---
-    let err = proxy
+    // --- Auth-cache parity: the ownership-skip above cached this sender's
+    //     read auth, so a no-ownership-path read now succeeds without
+    //     polkit (exactly like the Python service within the 30 s TTL). ---
+    let _: Vec<String> = proxy
+        .call("DetectDevices", &())
+        .await
+        .expect("DetectDevices must succeed via the cached read auth");
+
+    // --- A fresh connection is a new sender with no cached auth, and
+    //     there is no polkitd on this bus: it must fail with the exact
+    //     polkit error name. ---
+    let conn2 = connect(&address).await;
+    let proxy2 = make_proxy(&conn2).await;
+    let err = proxy2
         .call::<_, _, Vec<String>>("DetectDevices", &())
         .await
-        .expect_err("DetectDevices must fail without polkit");
+        .expect_err("DetectDevices from a fresh sender must fail without polkit");
     assert_eq!(
         error_name(&err),
         Some("org.freedesktop.PolicyKit1.Error.NotAuthorized")
