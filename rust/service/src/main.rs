@@ -61,12 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Idle timeout: every privileged method call pings idle_tx; exit after
     // IDLE_TIMEOUT with no pings.
     let idle = async {
-        loop {
-            match tokio::time::timeout(IDLE_TIMEOUT, idle_rx.recv()).await {
-                Ok(Some(())) => continue,
-                Ok(None) | Err(_) => break,
-            }
-        }
+        while let Ok(Some(())) = tokio::time::timeout(IDLE_TIMEOUT, idle_rx.recv()).await {}
     };
 
     tokio::select! {

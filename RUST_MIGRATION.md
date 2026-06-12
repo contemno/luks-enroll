@@ -117,20 +117,51 @@ The Rust service replicates the Python service bug-for-bug where the wire format
 2. **LUKS discovery scans /sys/class/block + per-device blkid probe** instead of the libblkid
    cache API — same results, no dependency on /run/blkid cache state.
 3. **GPT creation uses the pure-Rust `gpt` crate** rather than libfdisk: protective MBR + GPT,
-   single partition, type GUID 8309, default alignment. sgdisk-equivalent output.
+   single partition, type GUID 8309. The partition starts at the first usable LBA (34) rather
+   than sgdisk's 1 MiB-aligned 2048 — visible in `fdisk -l`, functionally irrelevant for a
+   single LUKS partition on removable media.
 4. **Tokio** for the async runtime; blocking crypto/hardware work runs on `spawn_blocking`
    threads, libcryptsetup access serialized by the crate's `mutex` feature.
+5. **Two FIDO2 error constants corrected.** The Python service hand-defined
+   `FIDO_ERR_UP_REQUIRED = 0x11` and `FIDO_ERR_PIN_NOT_SET = 0x2B`; `fido/err.h` says 0x3B and
+   0x35. The Rust port takes all constants from bindgen against the system header, which fixes
+   credential-probe classification for devices returning those codes — exactly the FFI-drift
+   bug class the migration was meant to eliminate.
 
-## Testing strategy
+### Implementation findings (Phase A, recorded for posterity)
+- tss-esapi 7.7.0 wraps neither `Esys_TR_Serialize` nor `Private` marshaling, and
+  `Public::marshall()` emits the bare TPMT_PUBLIC (no size prefix). The TPM2 module therefore
+  drives the ESYS command layer through the `tss_esapi::tss2_esys` sys re-export
+  (call-for-call with the Python ctypes flow, explicit flush bookkeeping) and produces the
+  token blob with `Tss2_MU_TPM2B_PRIVATE_Marshal` ‖ `Tss2_MU_TPM2B_PUBLIC_Marshal` — the
+  size-prefixed TPM2B forms systemd expects. Templates and PCR selections still use the typed
+  builders, with the wire layout pinned by unit tests.
+- The systemd cryptsetup token plugins (`libcryptsetup-token-systemd-*.so`), when installed,
+  validate token JSON on `crypt_token_json_set`. The integration suite exploits this: writing
+  the service's own token shapes through a validating libcryptsetup doubles as a conformance
+  check against systemd's validator. The lenient read-side parsing quirks (chunked array
+  blobs, scalar pcrs, `tpm2_blob` vs `tpm2-blob`) are unit-tested against the pure parsers.
+- The Python `_wipefs` sets a partitions-flags value of `1<<1` labeled PARTS_MAGIC; on current
+  util-linux that bit is `BLKID_PARTS_FORCE_GPT` and PARTS_MAGIC is `1<<3`. Either way only
+  `SBMAGIC*` values are consumed, so the wiped set is identical; the Rust port passes the real
+  header constant and preserves the PTMAGIC-not-wiped quirk.
 
-- Unit tests: modhex recovery keys, PCR selection encoding, crypttab/sysfs parsing, device-name
-  parsing, token JSON shapes (golden values lifted from the Python implementation/tests).
+## Testing strategy (implemented)
+
+- Unit tests: modhex recovery keys, PCR selection encoding/wire layout, crypttab/sysfs/device-
+  name parsing (including the mmcblk quirk), probe-code classification, token-JSON parser
+  quirks, hidraw path validation.
 - Integration tests (no root, no hardware): real libcryptsetup against LUKS2 image files in
-  $TMPDIR — format, keyslot add/destroy, token set/get, passphrase verify, volume-key extract.
-  Gated behind `--ignored` in environments without libcryptsetup.
-- TPM2: tests run against any TCTI via `TCTI` env (swtpm in CI: `swtpm:port=2321`).
-- FIDO2: token I/O behind a trait; orchestration tested with a mock device; hardware behavior
-  validated manually per the A-phase gate checklist.
+  /tmp — image creation, format, keyslot add/destroy (normal and minimal PBKDF), token
+  set/get with golden systemd token shapes, passphrase verify, volume-key extract, wipe-slot
+  semantics including last-keyslot protection.
+- D-Bus end-to-end: the real binary on a private dbus-daemon — bus-name acquisition,
+  ownership-based polkit bypass, read-auth caching, fresh-sender denial with the exact
+  `org.freedesktop.PolicyKit1.Error.NotAuthorized` name, InvalidArgs on bad device paths.
+- TPM2: seal/unseal roundtrips (PIN and no-PIN, wrong-PIN rejection) against swtpm in CI via
+  `TCTI=swtpm:host=127.0.0.1,port=2321`, `--ignored`-gated elsewhere.
+- FIDO2: orchestration decisions (probe classification, candidate ordering) are pure,
+  unit-tested functions; hardware behavior is validated per the A-phase gate checklist.
 - The Python test suite continues to run against the Python implementations until A6.
 
 ## Effort and risks

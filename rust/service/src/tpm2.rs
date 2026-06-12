@@ -929,6 +929,16 @@ mod tests {
 
     // --- Full roundtrip against a real TPM (swtpm or hardware) ---------------
 
+    /// Serializes the roundtrip tests: cargo runs tests on parallel
+    /// threads, but a raw swtpm socket TCTI has no resource manager, and
+    /// two concurrent seal/unseal flows need more transient object slots
+    /// than the reference TPM's three (-> TPM_RC_OBJECT_MEMORY, 0x902).
+    /// Note: repeated wrong-PIN runs against one long-lived swtpm also
+    /// accumulate dictionary-attack failures (the sealed object has no
+    /// NODA, like systemd's); restart swtpm with a fresh state dir if
+    /// unseals start failing with TPM_RC_LOCKOUT (0x921).
+    static TPM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// True when some TCTI is configured or the kernel resource manager
     /// device exists; the roundtrip tests are additionally #[ignore]d so
     /// they only run on demand (cargo test -- --ignored) with e.g.:
@@ -949,6 +959,7 @@ mod tests {
             eprintln!("skipping: no TCTI configured and no /dev/tpmrm0");
             return;
         }
+        let _serial = TPM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let secret = b"correct horse battery staple";
         let sealed = seal(secret, "7", "").expect("seal failed");
         assert_eq!(sealed.primary_alg, "ecc");
@@ -985,6 +996,7 @@ mod tests {
             eprintln!("skipping: no TCTI configured and no /dev/tpmrm0");
             return;
         }
+        let _serial = TPM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let secret = b"pin protected secret";
         let sealed = seal(secret, "7+11", "hunter2").expect("seal failed");
         assert_eq!(sealed.policy_hash.len(), 32);

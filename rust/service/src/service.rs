@@ -701,6 +701,7 @@ impl LuksEnrollService {
     }
 
     #[zbus(name = "WipeSlot")]
+    #[allow(clippy::too_many_arguments)]
     async fn wipe_slot(
         &self,
         #[zbus(connection)] conn: &Connection,
@@ -790,6 +791,7 @@ impl LuksEnrollService {
     }
 
     #[zbus(name = "EnrollPassphrase")]
+    #[allow(clippy::too_many_arguments)]
     async fn enroll_passphrase(
         &self,
         #[zbus(connection)] conn: &Connection,
