@@ -132,7 +132,11 @@ impl LuksEnrollService {
                     };
                     if let Some(target) = target {
                         if let Ok(md) = std::fs::metadata(&target) {
-                            let type_ok = if create_image { md.is_dir() } else { md.is_file() };
+                            let type_ok = if create_image {
+                                md.is_dir()
+                            } else {
+                                md.is_file()
+                            };
                             if type_ok && md.uid() == uid {
                                 needs_polkit = false;
                             }
