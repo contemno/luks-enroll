@@ -600,20 +600,28 @@ mod tests {
             pin_cstring(Some("1234")).unwrap(),
             Some(CString::new("1234").unwrap())
         );
-        assert!(pin_cstring(Some("12\034")).is_err());
+        assert!(pin_cstring(Some("12\u{0}34")).is_err());
     }
 
     #[test]
     fn enroll_rejects_bad_paths() {
+        // Not `.unwrap_err()`: Fido2Enrollment carries a secret and
+        // deliberately has no Debug impl.
+        fn expect_err(r: Result<Fido2Enrollment>) -> Error {
+            match r {
+                Ok(_) => panic!("expected enroll to fail"),
+                Err(e) => e,
+            }
+        }
         // Nonexistent path: canonicalize fails -> invalid (original path
         // in the message).
-        let err = enroll("/tmp/no-such-fido2-device", None).unwrap_err();
+        let err = expect_err(enroll("/tmp/no-such-fido2-device", None));
         assert_eq!(
             err.to_string(),
             "Invalid FIDO2 device path: /tmp/no-such-fido2-device"
         );
         // Exists but is not a hidraw node.
-        let err = enroll("/dev/null", None).unwrap_err();
+        let err = expect_err(enroll("/dev/null", None));
         assert_eq!(err.to_string(), "Invalid FIDO2 device path: /dev/null");
     }
 
