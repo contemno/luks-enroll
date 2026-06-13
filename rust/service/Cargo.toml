@@ -34,4 +34,5 @@ zbus_polkit = "5.0.0"
 zeroize = "1.9.0"
 
 [dev-dependencies]
+nix = { version = "0.30", features = ["mount", "sched", "process"] }
 tempfile = "3.27.0"

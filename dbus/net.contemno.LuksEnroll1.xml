@@ -122,5 +122,110 @@
     <method name="GetSystemdVersion">
       <arg direction="out" type="i" name="version"/>
     </method>
+
+    <!--
+      File-descriptor variants. For encrypted-container files the client
+      opens the file it owns and passes the descriptor (type 'h'); the
+      service operates on /proc/self/fd/N. This lets the sandboxed service
+      manage a user-owned container's LUKS header under
+      ProtectHome=read-only without relaxing the sandbox, and removes the
+      path allowlist, the TOCTOU window, and the polkit round-trip
+      (possession of a writable descriptor is the capability). Block
+      devices keep using the string-path methods above.
+    -->
+    <method name="GetKeyslotsFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="out" type="s" name="keyslots_json"/>
+    </method>
+    <method name="GetTokensByTypeFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="token_type"/>
+      <arg direction="out" type="s" name="tokens_json"/>
+    </method>
+    <method name="FindPasswordKeyslotsFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="out" type="ai" name="keyslots"/>
+    </method>
+    <method name="VerifyPassphraseFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="out" type="b" name="success"/>
+      <arg direction="out" type="i" name="keyslot"/>
+    </method>
+    <method name="UnlockWithTokenFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="token_type"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="out" type="b" name="success"/>
+      <arg direction="out" type="i" name="keyslot"/>
+    </method>
+    <method name="EnrollFido2Fd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="in" type="s" name="fido2_device"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="EnrollTpm2Fd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="in" type="s" name="pcrs"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="EnrollRecoveryKeyFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="EnrollPassphraseFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="existing_passphrase"/>
+      <arg direction="in" type="s" name="new_passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="WipeSlotFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="in" type="i" name="slot"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="GetDeviceInfoFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="out" type="s" name="info_json"/>
+    </method>
+    <method name="CheckFido2EnrolledFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="as" name="fido2_dev_paths"/>
+      <arg direction="out" type="as" name="enrolled_hidraw_paths"/>
+    </method>
+    <method name="CreateEncryptedImageFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="i" name="size_mb"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="i" name="keyslot"/>
+      <arg direction="out" type="s" name="error"/>
+    </method>
   </interface>
 </node>
