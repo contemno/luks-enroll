@@ -2774,9 +2774,107 @@ INTROSPECTION_XML = """
     <method name="GetSystemdVersion">
       <arg direction="out" type="i" name="version"/>
     </method>
+    <method name="GetKeyslotsFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="out" type="s" name="keyslots_json"/>
+    </method>
+    <method name="GetTokensByTypeFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="token_type"/>
+      <arg direction="out" type="s" name="tokens_json"/>
+    </method>
+    <method name="FindPasswordKeyslotsFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="out" type="ai" name="keyslots"/>
+    </method>
+    <method name="VerifyPassphraseFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="out" type="b" name="success"/>
+      <arg direction="out" type="i" name="keyslot"/>
+    </method>
+    <method name="UnlockWithTokenFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="token_type"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="out" type="b" name="success"/>
+      <arg direction="out" type="i" name="keyslot"/>
+    </method>
+    <method name="EnrollFido2Fd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="in" type="s" name="fido2_device"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="EnrollTpm2Fd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="in" type="s" name="pcrs"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="EnrollRecoveryKeyFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="EnrollPassphraseFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="existing_passphrase"/>
+      <arg direction="in" type="s" name="new_passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="WipeSlotFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="pin"/>
+      <arg direction="in" type="i" name="slot"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stdout"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <method name="GetDeviceInfoFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="out" type="s" name="info_json"/>
+    </method>
+    <method name="CheckFido2EnrolledFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="as" name="fido2_dev_paths"/>
+      <arg direction="out" type="as" name="enrolled_hidraw_paths"/>
+    </method>
+    <method name="CreateEncryptedImageFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="i" name="size_mb"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="i" name="keyslot"/>
+      <arg direction="out" type="s" name="error"/>
+    </method>
   </interface>
 </node>
 """
+
+
+class _FdError(Exception):
+    """Raised when a passed UNIX file descriptor fails validation."""
 
 
 class LuksEnrollService:
@@ -2821,6 +2919,59 @@ class LuksEnrollService:
     def handle_method_call(self, connection, sender, object_path, interface_name,
                            method_name, parameters, invocation):
         """Handle incoming D-Bus method calls."""
+
+        # Fd-variant methods: the caller passes a UNIX file descriptor (D-Bus
+        # type 'h') as the first arg instead of a device path. Possession of a
+        # writable fd is the capability, so these BYPASS polkit and the
+        # path-realpath/validation logic. The fd is fstat/access-checked inside
+        # each handler. We still reset the idle timer and enforce string caps.
+        if method_name.endswith("Fd"):
+            self._reset_idle_timeout()
+            # Enforce length limits on string parameters (skip the fd handle).
+            for arg in parameters.unpack():
+                if isinstance(arg, str) and len(arg) > _MAX_PASSPHRASE_LEN:
+                    invocation.return_dbus_error(
+                        "org.freedesktop.DBus.Error.InvalidArgs",
+                        "Parameter exceeds maximum length",
+                    )
+                    return
+
+            handler = getattr(self, f"_handle_{method_name}", None)
+            if handler is None:
+                invocation.return_dbus_error(
+                    "org.freedesktop.DBus.Error.UnknownMethod",
+                    f"Unknown method: {method_name}",
+                )
+                return
+
+            # Pure metadata reads run inline; all the enroll/wipe/create/verify
+            # crypto ops block and must run off the main loop.
+            inline_fd_methods = {
+                "GetKeyslotsFd", "GetTokensByTypeFd",
+                "FindPasswordKeyslotsFd", "GetDeviceInfoFd",
+            }
+            if method_name in inline_fd_methods:
+                try:
+                    handler(parameters, invocation)
+                except Exception as e:
+                    print(f"Method {method_name} failed: {e}", file=sys.stderr)
+                    invocation.return_dbus_error(
+                        "org.freedesktop.DBus.Error.Failed",
+                        "Operation failed",
+                    )
+            else:
+                def _run():
+                    try:
+                        handler(parameters, invocation)
+                    except Exception as e:
+                        print(f"Method {method_name} failed: {e}",
+                              file=sys.stderr)
+                        invocation.return_dbus_error(
+                            "org.freedesktop.DBus.Error.Failed",
+                            "Operation failed",
+                        )
+                threading.Thread(target=_run, daemon=True).start()
+            return
 
         # Read-only methods (use POLKIT_ACTION_READ, auth may be cached)
         read_methods = {
@@ -3016,10 +3167,8 @@ class LuksEnrollService:
         keyslot = result if isinstance(result, int) else -1
         invocation.return_value(GLib.Variant("(bi)", (ok, keyslot)))
 
-    def _handle_EnrollFido2(self, parameters, invocation):
-        device, passphrase, pin, fido2_device, unlock_method, unlock_pin = (
-            parameters.unpack()
-        )
+    def _do_EnrollFido2(self, device, passphrase, pin, fido2_device,
+                        unlock_method, unlock_pin, invocation):
         try:
             # Reject if this physical token is already enrolled on this volume
             meta = _get_luks_json(device)
@@ -3094,8 +3243,16 @@ class LuksEnrollService:
                 GLib.Variant("(bss)", (False, "", "Operation failed"))
             )
 
-    def _handle_CheckFido2Enrolled(self, parameters, invocation):
-        device, fido2_dev_paths = parameters.unpack()
+    def _handle_EnrollFido2(self, parameters, invocation):
+        device, passphrase, pin, fido2_device, unlock_method, unlock_pin = (
+            parameters.unpack()
+        )
+        self._do_EnrollFido2(
+            device, passphrase, pin, fido2_device, unlock_method, unlock_pin,
+            invocation,
+        )
+
+    def _do_CheckFido2Enrolled(self, device, fido2_dev_paths, invocation):
         enrolled_paths = []
         try:
             meta = _get_luks_json(device)
@@ -3148,10 +3305,12 @@ class LuksEnrollService:
               file=sys.stderr)
         invocation.return_value(GLib.Variant("(as)", (enrolled_paths,)))
 
-    def _handle_EnrollTpm2(self, parameters, invocation):
-        device, passphrase, pin, pcrs, unlock_method, unlock_pin = (
-            parameters.unpack()
-        )
+    def _handle_CheckFido2Enrolled(self, parameters, invocation):
+        device, fido2_dev_paths = parameters.unpack()
+        self._do_CheckFido2Enrolled(device, fido2_dev_paths, invocation)
+
+    def _do_EnrollTpm2(self, device, passphrase, pin, pcrs, unlock_method,
+                       unlock_pin, invocation):
         try:
 
             # Generate random 32-byte secret to seal
@@ -3205,8 +3364,17 @@ class LuksEnrollService:
                 GLib.Variant("(bss)", (False, "", "Operation failed"))
             )
 
-    def _handle_EnrollRecoveryKey(self, parameters, invocation):
-        device, passphrase, unlock_method, unlock_pin = parameters.unpack()
+    def _handle_EnrollTpm2(self, parameters, invocation):
+        device, passphrase, pin, pcrs, unlock_method, unlock_pin = (
+            parameters.unpack()
+        )
+        self._do_EnrollTpm2(
+            device, passphrase, pin, pcrs, unlock_method, unlock_pin,
+            invocation,
+        )
+
+    def _do_EnrollRecoveryKey(self, device, passphrase, unlock_method,
+                              unlock_pin, invocation):
         try:
             # Generate modhex recovery key
             recovery_key = _make_recovery_key()
@@ -3239,8 +3407,14 @@ class LuksEnrollService:
                 GLib.Variant("(bss)", (False, "", "Operation failed"))
             )
 
-    def _handle_WipeSlot(self, parameters, invocation):
-        device, passphrase, unlock_method, pin, slot = parameters.unpack()
+    def _handle_EnrollRecoveryKey(self, parameters, invocation):
+        device, passphrase, unlock_method, unlock_pin = parameters.unpack()
+        self._do_EnrollRecoveryKey(
+            device, passphrase, unlock_method, unlock_pin, invocation,
+        )
+
+    def _do_WipeSlot(self, device, passphrase, unlock_method, pin, slot,
+                     invocation):
         try:
             # Verify the caller can unlock the device
             _get_volume_key(device, unlock_method, passphrase, pin)
@@ -3270,6 +3444,12 @@ class LuksEnrollService:
             invocation.return_value(
                 GLib.Variant("(bss)", (False, "", "Operation failed"))
             )
+
+    def _handle_WipeSlot(self, parameters, invocation):
+        device, passphrase, unlock_method, pin, slot = parameters.unpack()
+        self._do_WipeSlot(
+            device, passphrase, unlock_method, pin, slot, invocation,
+        )
 
     def _handle_CreateEncryptedImage(self, parameters, invocation):
         path, size_mb, passphrase = parameters.unpack()
@@ -3313,10 +3493,8 @@ class LuksEnrollService:
             stderr = "Operation failed"
         invocation.return_value(GLib.Variant("(bss)", (ok, partition, stderr)))
 
-    def _handle_EnrollPassphrase(self, parameters, invocation):
-        device, existing_passphrase, new_passphrase, unlock_method, unlock_pin = (
-            parameters.unpack()
-        )
+    def _do_EnrollPassphrase(self, device, existing_passphrase, new_passphrase,
+                             unlock_method, unlock_pin, invocation):
         try:
             # Get volume key to add new keyslot
             vk, vk_size = _get_volume_key(
@@ -3336,6 +3514,15 @@ class LuksEnrollService:
                 GLib.Variant("(bss)", (False, "", "Operation failed"))
             )
 
+    def _handle_EnrollPassphrase(self, parameters, invocation):
+        device, existing_passphrase, new_passphrase, unlock_method, unlock_pin = (
+            parameters.unpack()
+        )
+        self._do_EnrollPassphrase(
+            device, existing_passphrase, new_passphrase, unlock_method,
+            unlock_pin, invocation,
+        )
+
     def _handle_GetSetting(self, parameters, invocation):
         key = parameters.unpack()[0]
         value = _load_setting(key)
@@ -3354,6 +3541,269 @@ class LuksEnrollService:
         # All token operations are now handled natively; return high value
         # so existing GUI version checks always pass.
         invocation.return_value(GLib.Variant("(i)", (999,)))
+
+    # -----------------------------------------------------------------------
+    # File-descriptor variants
+    #
+    # GDBus delivers 'h' args as an index into the message's UnixFDList. We
+    # dup the real os-level fd out of the list (we own it; must os.close it),
+    # fstat it to confirm a regular file (or block device for non-create ops),
+    # check the access mode (O_RDWR for write ops, at least readable for
+    # reads), then operate on /proc/self/fd/N so the privileged sandboxed
+    # service writes through the client's writable mount under
+    # ProtectHome=read-only. Possession of the fd is the capability, so polkit
+    # is skipped (done in handle_method_call).
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_fd(invocation, parameters, need_write, regular_only=False):
+        """Resolve and validate the UNIX fd passed as the first arg.
+
+        Returns (real_fd, path) on success. Raises _FdError on validation
+        failure (caller maps it to the operation's failure tuple). The caller
+        owns real_fd and must os.close it.
+        """
+        handle_index = parameters.unpack()[0]
+        fd_list = invocation.get_message().get_unix_fd_list()
+        if fd_list is None:
+            raise _FdError("No file descriptor list in message")
+        # Gio.UnixFDList.get dups and returns an os-level fd we own.
+        real_fd = fd_list.get(handle_index)
+        if real_fd < 0:
+            raise _FdError("Invalid file descriptor")
+        try:
+            st = os.fstat(real_fd)
+            is_reg = stat.S_ISREG(st.st_mode)
+            is_blk = stat.S_ISBLK(st.st_mode)
+            if not (is_reg or (not regular_only and is_blk)):
+                raise _FdError("Descriptor is not a regular file")
+            flags = fcntl.fcntl(real_fd, fcntl.F_GETFL)
+            acc = flags & os.O_ACCMODE
+            if need_write:
+                if acc != os.O_RDWR:
+                    raise _FdError("File descriptor is not writable")
+            elif acc == os.O_WRONLY:
+                raise _FdError("File descriptor is not readable")
+        except OSError as e:
+            os.close(real_fd)
+            raise _FdError(f"Invalid file descriptor: {e}") from e
+        except _FdError:
+            os.close(real_fd)
+            raise
+        return real_fd, f"/proc/self/fd/{real_fd}"
+
+    def _handle_GetKeyslotsFd(self, parameters, invocation):
+        real_fd, path = self._resolve_fd(invocation, parameters, need_write=False)
+        try:
+            slots = list_luks_keyslots(path)
+            invocation.return_value(GLib.Variant("(s)", (json.dumps(slots),)))
+        finally:
+            os.close(real_fd)
+
+    def _handle_GetTokensByTypeFd(self, parameters, invocation):
+        token_type = parameters.unpack()[1]
+        real_fd, path = self._resolve_fd(invocation, parameters, need_write=False)
+        try:
+            tokens = find_tokens_by_type(path, token_type)
+            result = [[tid, slots] for tid, slots in tokens]
+            invocation.return_value(GLib.Variant("(s)", (json.dumps(result),)))
+        finally:
+            os.close(real_fd)
+
+    def _handle_FindPasswordKeyslotsFd(self, parameters, invocation):
+        real_fd, path = self._resolve_fd(invocation, parameters, need_write=False)
+        try:
+            slots = find_password_keyslots(path)
+            invocation.return_value(GLib.Variant("(ai)", (slots,)))
+        finally:
+            os.close(real_fd)
+
+    def _handle_GetDeviceInfoFd(self, parameters, invocation):
+        real_fd, path = self._resolve_fd(invocation, parameters, need_write=False)
+        try:
+            info = get_device_info(path)
+            invocation.return_value(GLib.Variant("(s)", (json.dumps(info),)))
+        finally:
+            os.close(real_fd)
+
+    def _handle_VerifyPassphraseFd(self, parameters, invocation):
+        passphrase = parameters.unpack()[1]
+        real_fd, path = self._resolve_fd(invocation, parameters, need_write=False)
+        try:
+            ok, result = verify_luks_passphrase(path, passphrase)
+            keyslot = result if isinstance(result, int) else -1
+            invocation.return_value(GLib.Variant("(bi)", (ok, keyslot)))
+        finally:
+            os.close(real_fd)
+
+    def _handle_UnlockWithTokenFd(self, parameters, invocation):
+        token_type, pin = parameters.unpack()[1:]
+        try:
+            real_fd, path = self._resolve_fd(
+                invocation, parameters, need_write=False
+            )
+        except _FdError as e:
+            print(f"UnlockWithTokenFd failed: {e}", file=sys.stderr)
+            invocation.return_value(GLib.Variant("(bi)", (False, -1)))
+            return
+        try:
+            ok, result = verify_luks_token(path, token_type, pin)
+            keyslot = result if isinstance(result, int) else -1
+            invocation.return_value(GLib.Variant("(bi)", (ok, keyslot)))
+        except Exception as e:
+            print(f"UnlockWithTokenFd failed: {e}", file=sys.stderr)
+            invocation.return_value(GLib.Variant("(bi)", (False, -1)))
+        finally:
+            os.close(real_fd)
+
+    def _handle_CheckFido2EnrolledFd(self, parameters, invocation):
+        fido2_dev_paths = parameters.unpack()[1]
+        try:
+            real_fd, path = self._resolve_fd(
+                invocation, parameters, need_write=False
+            )
+        except _FdError as e:
+            print(f"CheckFido2EnrolledFd failed: {e}", file=sys.stderr)
+            invocation.return_value(GLib.Variant("(as)", ([],)))
+            return
+        try:
+            self._do_CheckFido2Enrolled(path, fido2_dev_paths, invocation)
+        finally:
+            os.close(real_fd)
+
+    def _handle_EnrollFido2Fd(self, parameters, invocation):
+        _, passphrase, pin, fido2_device, unlock_method, unlock_pin = (
+            parameters.unpack()
+        )
+        try:
+            real_fd, path = self._resolve_fd(
+                invocation, parameters, need_write=True
+            )
+        except _FdError as e:
+            print(f"EnrollFido2Fd failed: {e}", file=sys.stderr)
+            invocation.return_value(
+                GLib.Variant("(bss)", (False, "", "Operation failed"))
+            )
+            return
+        try:
+            self._do_EnrollFido2(
+                path, passphrase, pin, fido2_device, unlock_method,
+                unlock_pin, invocation,
+            )
+        finally:
+            os.close(real_fd)
+
+    def _handle_EnrollTpm2Fd(self, parameters, invocation):
+        _, passphrase, pin, pcrs, unlock_method, unlock_pin = parameters.unpack()
+        try:
+            real_fd, path = self._resolve_fd(
+                invocation, parameters, need_write=True
+            )
+        except _FdError as e:
+            print(f"EnrollTpm2Fd failed: {e}", file=sys.stderr)
+            invocation.return_value(
+                GLib.Variant("(bss)", (False, "", "Operation failed"))
+            )
+            return
+        try:
+            self._do_EnrollTpm2(
+                path, passphrase, pin, pcrs, unlock_method, unlock_pin,
+                invocation,
+            )
+        finally:
+            os.close(real_fd)
+
+    def _handle_EnrollRecoveryKeyFd(self, parameters, invocation):
+        _, passphrase, unlock_method, unlock_pin = parameters.unpack()
+        try:
+            real_fd, path = self._resolve_fd(
+                invocation, parameters, need_write=True
+            )
+        except _FdError as e:
+            print(f"EnrollRecoveryKeyFd failed: {e}", file=sys.stderr)
+            invocation.return_value(
+                GLib.Variant("(bss)", (False, "", "Operation failed"))
+            )
+            return
+        try:
+            self._do_EnrollRecoveryKey(
+                path, passphrase, unlock_method, unlock_pin, invocation,
+            )
+        finally:
+            os.close(real_fd)
+
+    def _handle_EnrollPassphraseFd(self, parameters, invocation):
+        _, existing_passphrase, new_passphrase, unlock_method, unlock_pin = (
+            parameters.unpack()
+        )
+        try:
+            real_fd, path = self._resolve_fd(
+                invocation, parameters, need_write=True
+            )
+        except _FdError as e:
+            print(f"EnrollPassphraseFd failed: {e}", file=sys.stderr)
+            invocation.return_value(
+                GLib.Variant("(bss)", (False, "", "Operation failed"))
+            )
+            return
+        try:
+            self._do_EnrollPassphrase(
+                path, existing_passphrase, new_passphrase, unlock_method,
+                unlock_pin, invocation,
+            )
+        finally:
+            os.close(real_fd)
+
+    def _handle_WipeSlotFd(self, parameters, invocation):
+        _, passphrase, unlock_method, pin, slot = parameters.unpack()
+        try:
+            real_fd, path = self._resolve_fd(
+                invocation, parameters, need_write=True
+            )
+        except _FdError as e:
+            print(f"WipeSlotFd failed: {e}", file=sys.stderr)
+            invocation.return_value(
+                GLib.Variant("(bss)", (False, "", "Operation failed"))
+            )
+            return
+        try:
+            self._do_WipeSlot(
+                path, passphrase, unlock_method, pin, slot, invocation,
+            )
+        finally:
+            os.close(real_fd)
+
+    def _handle_CreateEncryptedImageFd(self, parameters, invocation):
+        _, size_mb, passphrase = parameters.unpack()
+        # Client created the file; the service ftruncates and luksFormats it.
+        # NO chown, NO path allowlist (the writable fd is the capability).
+        try:
+            real_fd, path = self._resolve_fd(
+                invocation, parameters, need_write=True, regular_only=True
+            )
+        except _FdError as e:
+            print(f"CreateEncryptedImageFd failed: {e}", file=sys.stderr)
+            invocation.return_value(
+                GLib.Variant("(bis)", (False, -1, "Operation failed"))
+            )
+            return
+        try:
+            if not (1 <= size_mb <= 8192):
+                invocation.return_value(GLib.Variant(
+                    "(bis)",
+                    (False, -1, "size_mb must be between 1 and 8192"),
+                ))
+                return
+            os.ftruncate(real_fd, size_mb * 1024 * 1024)
+            keyslot = _luks_format_device(path, passphrase)
+            invocation.return_value(GLib.Variant("(bis)", (True, keyslot, "")))
+        except Exception as e:
+            print(f"CreateEncryptedImageFd failed: {e}", file=sys.stderr)
+            invocation.return_value(
+                GLib.Variant("(bis)", (False, -1, "Operation failed"))
+            )
+        finally:
+            os.close(real_fd)
 
 
 # ---------------------------------------------------------------------------
