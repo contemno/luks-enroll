@@ -3612,6 +3612,8 @@ class ManageTpm2EnrollPage(Adw.NavigationPage):
         else:
             det_row = Adw.ActionRow(title="No TPM2 device detected")
             group.add(det_row)
+        # Display-only: keep it out of the keyboard tab order.
+        det_row.set_focusable(False)
 
         # PCR checkboxes
         self._pcr_group = Adw.PreferencesGroup(title="PCR Registers")
@@ -3624,6 +3626,9 @@ class ManageTpm2EnrollPage(Adw.NavigationPage):
             chk.set_active(pcr_num in TPM2_DEFAULT_PCRS)
             chk.set_valign(Gtk.Align.CENTER)
             row.add_prefix(chk)
+            # Tab should stop on the checkbox itself, not also on the row;
+            # a click anywhere on the row still toggles it (activatable).
+            row.set_focusable(False)
             row.set_activatable_widget(chk)
             pcr_group.add(row)
             self._pcr_checks[pcr_num] = chk
@@ -3637,6 +3642,8 @@ class ManageTpm2EnrollPage(Adw.NavigationPage):
         prefs.add(pin_group)
 
         self._pin_row = Adw.ActionRow(title="PIN")
+        # The row wraps a text input; Tab should land on the entry, not the row.
+        self._pin_row.set_focusable(False)
         self._pin_entry = Gtk.PasswordEntry()
         self._pin_entry.set_show_peek_icon(True)
         self._pin_entry.set_valign(Gtk.Align.CENTER)
@@ -3645,6 +3652,7 @@ class ManageTpm2EnrollPage(Adw.NavigationPage):
         pin_group.add(self._pin_row)
 
         self._pin_confirm_row = Adw.ActionRow(title="Confirm PIN")
+        self._pin_confirm_row.set_focusable(False)
         self._pin_confirm = Gtk.PasswordEntry()
         self._pin_confirm.set_show_peek_icon(True)
         self._pin_confirm.set_valign(Gtk.Align.CENTER)
@@ -3654,6 +3662,7 @@ class ManageTpm2EnrollPage(Adw.NavigationPage):
         pin_group.add(self._pin_confirm_row)
 
         btn_row = Adw.ActionRow()
+        btn_row.set_focusable(False)
         self._enroll_btn = Gtk.Button(label="Enroll")
         self._enroll_btn.add_css_class("suggested-action")
         self._enroll_btn.set_valign(Gtk.Align.CENTER)
