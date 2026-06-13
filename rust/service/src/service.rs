@@ -15,6 +15,7 @@
 //! Python service used.
 
 use std::collections::HashMap;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use zbus::message::Header;
+use zbus::zvariant::OwnedFd;
 use zbus::Connection;
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
@@ -194,6 +196,59 @@ impl LuksEnrollService {
         }
         Ok(())
     }
+
+    /// Validate a file descriptor received over D-Bus for an *Fd method.
+    ///
+    /// The descriptor must refer to a regular file (or a block device,
+    /// unless `regular_only`) and, for write operations, must be opened
+    /// read-write. Possession of the descriptor *is* the authorization:
+    /// the caller could only have obtained it by holding the access it
+    /// represents, which is strictly stronger than the path-based
+    /// ownership skip — so no polkit check is consulted (and a round-trip
+    /// is saved). Operating on the file through /proc/self/fd also lets the
+    /// sandboxed, privileged service reach user-owned container files under
+    /// `ProtectHome=read-only` without relaxing the sandbox: the descriptor
+    /// carries the client's writable mount, so the reopen writes through.
+    fn check_fd<Fd: AsFd>(fd: Fd, need_write: bool, regular_only: bool) -> MethodResult<()> {
+        let st = nix::sys::stat::fstat(&fd)
+            .map_err(|_| SvcError::InvalidArgs("Invalid file descriptor".into()))?;
+        let typ = (st.st_mode as u32) & libc::S_IFMT;
+        let is_reg = typ == libc::S_IFREG;
+        let is_blk = typ == libc::S_IFBLK;
+        if !(is_reg || (!regular_only && is_blk)) {
+            return Err(SvcError::InvalidArgs(
+                "Descriptor is not a regular file".into(),
+            ));
+        }
+        let flags = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFL)
+            .map_err(|_| SvcError::InvalidArgs("Invalid file descriptor".into()))?;
+        let acc = nix::fcntl::OFlag::from_bits_truncate(flags) & nix::fcntl::OFlag::O_ACCMODE;
+        if need_write {
+            if acc != nix::fcntl::OFlag::O_RDWR {
+                return Err(SvcError::InvalidArgs(
+                    "File descriptor is not writable".into(),
+                ));
+            }
+        } else if acc == nix::fcntl::OFlag::O_WRONLY {
+            return Err(SvcError::InvalidArgs(
+                "File descriptor is not readable".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Keep the bus-activated service alive while work is in flight.
+    /// (The *Fd methods skip the polkit gate, so they reset the idle timer
+    /// here instead of through `gate`.)
+    fn touch_idle(&self) {
+        let _ = self.idle_tx.send(());
+    }
+}
+
+/// Path libcryptsetup can open for an fd received over D-Bus. The fd table
+/// is process-wide, so /proc/self/fd is valid from the blocking thread.
+fn fd_path<Fd: AsRawFd>(fd: &Fd) -> String {
+    format!("/proc/self/fd/{}", fd.as_raw_fd())
 }
 
 async fn check_polkit(conn: &Connection, hdr: &Header<'_>, action: &str) -> bool {
@@ -446,6 +501,20 @@ pub fn op_create_encrypted_image(
         Ok(keyslot) => (true, keyslot, String::new()),
         Err(e) => {
             eprintln!("CreateEncryptedImage failed: {e}");
+            (false, -1, "Operation failed".to_string())
+        }
+    }
+}
+
+/// Create-image variant for fd-passing: the client created and owns the
+/// file, so there is no path allowlist, no parent-directory ownership
+/// check, and no chown — the descriptor is the capability. The handler
+/// sizes the file via ftruncate before calling this.
+pub fn op_create_image_fd(path: &str, passphrase: &str) -> (bool, i32, String) {
+    match luks::format_luks2(path, passphrase) {
+        Ok(keyslot) => (true, keyslot, String::new()),
+        Err(e) => {
+            eprintln!("CreateEncryptedImage(fd) failed: {e}");
             (false, -1, "Operation failed".to_string())
         }
     }
@@ -880,5 +949,251 @@ impl LuksEnrollService {
         // All token operations are handled natively; return a high value
         // so existing GUI version checks always pass.
         999
+    }
+
+    // -----------------------------------------------------------------
+    // File-descriptor variants
+    //
+    // For encrypted-container files the client opens the file itself
+    // (it owns it) and passes the descriptor; the service operates on
+    // /proc/self/fd/N. This lets the hardened, sandboxed service write a
+    // user-owned container's LUKS header under ProtectHome=read-only
+    // without relaxing the sandbox, and removes the path allowlist,
+    // TOCTOU window, and polkit round-trip. Block devices keep using the
+    // path-based methods above (the unprivileged client cannot open a
+    // /dev descriptor; the service opens those by path, which the sandbox
+    // permits).
+    // -----------------------------------------------------------------
+
+    #[zbus(name = "GetKeyslotsFd")]
+    async fn get_keyslots_fd(&self, fd: OwnedFd) -> Result<String, SvcError> {
+        Self::check_fd(&fd, false, false)?;
+        self.touch_idle();
+        blocking(move || keyslots_json(&fd_path(&fd))).await
+    }
+
+    #[zbus(name = "GetTokensByTypeFd")]
+    async fn get_tokens_by_type_fd(
+        &self,
+        fd: OwnedFd,
+        token_type: String,
+    ) -> Result<String, SvcError> {
+        Self::check_fd(&fd, false, false)?;
+        Self::check_lens(&[&token_type])?;
+        self.touch_idle();
+        blocking(move || tokens_json(&fd_path(&fd), &token_type)).await
+    }
+
+    #[zbus(name = "FindPasswordKeyslotsFd")]
+    async fn find_password_keyslots_fd(&self, fd: OwnedFd) -> Result<Vec<i32>, SvcError> {
+        Self::check_fd(&fd, false, false)?;
+        self.touch_idle();
+        blocking(move || luks::password_keyslots(&fd_path(&fd))).await
+    }
+
+    #[zbus(name = "GetDeviceInfoFd")]
+    async fn get_device_info_fd(&self, fd: OwnedFd) -> Result<String, SvcError> {
+        Self::check_fd(&fd, false, false)?;
+        self.touch_idle();
+        blocking(move || devices::get_device_info(&fd_path(&fd)).to_string()).await
+    }
+
+    #[zbus(name = "CheckFido2EnrolledFd")]
+    async fn check_fido2_enrolled_fd(
+        &self,
+        fd: OwnedFd,
+        fido2_dev_paths: Vec<String>,
+    ) -> Result<Vec<String>, SvcError> {
+        Self::check_fd(&fd, false, false)?;
+        self.touch_idle();
+        blocking(move || op_check_fido2_enrolled(&fd_path(&fd), &fido2_dev_paths)).await
+    }
+
+    #[zbus(name = "VerifyPassphraseFd")]
+    async fn verify_passphrase_fd(
+        &self,
+        fd: OwnedFd,
+        passphrase: String,
+    ) -> Result<(bool, i32), SvcError> {
+        // Verify only reads the header, so a read-only descriptor suffices.
+        Self::check_fd(&fd, false, false)?;
+        Self::check_lens(&[&passphrase])?;
+        self.touch_idle();
+        blocking(
+            move || match luks::verify_passphrase(&fd_path(&fd), &passphrase) {
+                Ok(slot) => (true, slot),
+                Err(_) => (false, -1),
+            },
+        )
+        .await
+    }
+
+    #[zbus(name = "UnlockWithTokenFd")]
+    async fn unlock_with_token_fd(
+        &self,
+        fd: OwnedFd,
+        token_type: String,
+        pin: String,
+    ) -> Result<(bool, i32), SvcError> {
+        Self::check_fd(&fd, false, false)?;
+        Self::check_lens(&[&token_type, &pin])?;
+        if token_type != "systemd-fido2" && token_type != "systemd-tpm2" {
+            eprintln!("Method UnlockWithTokenFd failed: Unsupported token type");
+            return Err(SvcError::Failed("Operation failed".into()));
+        }
+        self.touch_idle();
+        blocking(
+            move || match luks::verify_token(&fd_path(&fd), &token_type, &pin) {
+                Ok(slot) => (true, slot),
+                Err(e) => {
+                    eprintln!("UnlockWithTokenFd: {e}");
+                    (false, -1)
+                }
+            },
+        )
+        .await
+    }
+
+    #[zbus(name = "EnrollFido2Fd")]
+    async fn enroll_fido2_fd(
+        &self,
+        fd: OwnedFd,
+        passphrase: String,
+        pin: String,
+        fido2_device: String,
+        unlock_method: String,
+        unlock_pin: String,
+    ) -> Result<Triple, SvcError> {
+        Self::check_fd(&fd, true, false)?;
+        Self::check_lens(&[
+            &passphrase,
+            &pin,
+            &fido2_device,
+            &unlock_method,
+            &unlock_pin,
+        ])?;
+        self.touch_idle();
+        blocking(move || {
+            op_enroll_fido2(
+                &fd_path(&fd),
+                &passphrase,
+                &pin,
+                &fido2_device,
+                &unlock_method,
+                &unlock_pin,
+            )
+        })
+        .await
+    }
+
+    #[zbus(name = "EnrollTpm2Fd")]
+    async fn enroll_tpm2_fd(
+        &self,
+        fd: OwnedFd,
+        passphrase: String,
+        pin: String,
+        pcrs: String,
+        unlock_method: String,
+        unlock_pin: String,
+    ) -> Result<Triple, SvcError> {
+        Self::check_fd(&fd, true, false)?;
+        Self::check_lens(&[&passphrase, &pin, &pcrs, &unlock_method, &unlock_pin])?;
+        self.touch_idle();
+        blocking(move || {
+            op_enroll_tpm2(
+                &fd_path(&fd),
+                &passphrase,
+                &pin,
+                &pcrs,
+                &unlock_method,
+                &unlock_pin,
+            )
+        })
+        .await
+    }
+
+    #[zbus(name = "EnrollRecoveryKeyFd")]
+    async fn enroll_recovery_key_fd(
+        &self,
+        fd: OwnedFd,
+        passphrase: String,
+        unlock_method: String,
+        unlock_pin: String,
+    ) -> Result<Triple, SvcError> {
+        Self::check_fd(&fd, true, false)?;
+        Self::check_lens(&[&passphrase, &unlock_method, &unlock_pin])?;
+        self.touch_idle();
+        blocking(move || {
+            op_enroll_recovery_key(&fd_path(&fd), &passphrase, &unlock_method, &unlock_pin)
+        })
+        .await
+    }
+
+    #[zbus(name = "EnrollPassphraseFd")]
+    async fn enroll_passphrase_fd(
+        &self,
+        fd: OwnedFd,
+        existing_passphrase: String,
+        new_passphrase: String,
+        unlock_method: String,
+        unlock_pin: String,
+    ) -> Result<Triple, SvcError> {
+        Self::check_fd(&fd, true, false)?;
+        Self::check_lens(&[
+            &existing_passphrase,
+            &new_passphrase,
+            &unlock_method,
+            &unlock_pin,
+        ])?;
+        self.touch_idle();
+        blocking(move || {
+            op_enroll_passphrase(
+                &fd_path(&fd),
+                &existing_passphrase,
+                &new_passphrase,
+                &unlock_method,
+                &unlock_pin,
+            )
+        })
+        .await
+    }
+
+    #[zbus(name = "WipeSlotFd")]
+    async fn wipe_slot_fd(
+        &self,
+        fd: OwnedFd,
+        passphrase: String,
+        unlock_method: String,
+        pin: String,
+        slot: i32,
+    ) -> Result<Triple, SvcError> {
+        Self::check_fd(&fd, true, false)?;
+        Self::check_lens(&[&passphrase, &unlock_method, &pin])?;
+        self.touch_idle();
+        blocking(move || op_wipe_slot(&fd_path(&fd), &passphrase, &unlock_method, &pin, slot)).await
+    }
+
+    #[zbus(name = "CreateEncryptedImageFd")]
+    async fn create_encrypted_image_fd(
+        &self,
+        fd: OwnedFd,
+        size_mb: i32,
+        passphrase: String,
+    ) -> Result<(bool, i32, String), SvcError> {
+        // Sizing only makes sense for a fresh regular file the client made.
+        Self::check_fd(&fd, true, true)?;
+        Self::check_lens(&[&passphrase])?;
+        if !(1..=8192).contains(&size_mb) {
+            return Ok((false, -1, "size_mb must be between 1 and 8192".to_string()));
+        }
+        self.touch_idle();
+        blocking(move || {
+            if let Err(e) = nix::unistd::ftruncate(&fd, size_mb as libc::off_t * 1024 * 1024) {
+                eprintln!("CreateEncryptedImageFd ftruncate failed: {e}");
+                return (false, -1, "Operation failed".to_string());
+            }
+            op_create_image_fd(&fd_path(&fd), &passphrase)
+        })
+        .await
     }
 }

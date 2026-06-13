@@ -79,6 +79,39 @@ Status: **Phase A in progress** (backend service). Phase B (GTK client) not star
       dracut initramfs, and cross-validation (Python-enrolled volume managed by Rust service
       and vice versa).
 
+### Post-A test feedback fixes
+- [x] **Issue 2 — container ops fail under the sandbox (fd-passing fix).** Enrolling/wiping/
+      creating an *encrypted file container* under `/home` failed while the same ops on the
+      internal block volume worked. Root cause is the unit's `ProtectHome=read-only`: the
+      service's namespace mounts `/home` read-only (root included), so every LUKS header
+      *write* on a `~/…` container returns `EROFS`; block devices are exempt (`/dev` is not
+      under `ProtectSystem=strict`), which is why they worked. This is config/sandbox, not a
+      Rust bug — it affects the Python service identically.
+
+      Fix (chosen over relaxing the sandbox): **file-descriptor passing.** The client opens the
+      container file it owns and passes the descriptor over D-Bus (type `h`); the service
+      operates on `/proc/self/fd/N`. The reopened path carries the *client's* writable mount,
+      so the write goes through while `ProtectHome=read-only` is kept intact. Verified
+      empirically: in a child mount namespace with the dir re-bound read-only, a direct
+      `open(O_RDWR)` gets `EROFS` while `crypt_init`/`crypt_format`/`crypt_keyslot_add` on
+      `/proc/self/fd/N` succeed and the parent reads back a valid LUKS2 header (see
+      `tests/fd_ops.rs::fd_writes_through_readonly_mount_namespace`, and the standalone
+      libcryptsetup confirmation). Side benefits: removes the `/home`+`/tmp` path allowlist,
+      the TOCTOU window, the chown, and the polkit round-trip — possession of a writable
+      descriptor *is* the capability (strictly stronger than the path-based ownership skip).
+      Also incidentally fixes the latent `PrivateTmp` gotcha (a `/tmp` container created in the
+      service's private tmp would have been invisible to the user). New `*Fd` D-Bus methods are
+      additive; block devices keep the string-path methods (the unprivileged client cannot open
+      a `/dev` descriptor). Interface contract extended in `dbus/net.contemno.LuksEnroll1.xml`.
+- [ ] Issue 2 — Python client: call the `*Fd` methods for regular-file containers (open the fd,
+      pass via `Gio.UnixFDList`); keep string-path methods for block devices.
+- [ ] Issue 2 — Python service: mirror the `*Fd` methods for all-Python parity/rollback.
+- [ ] Issue 1 — TPM2 enroll page tab focus: one tab stop per writable control (GTK client).
+- [ ] Issue 3 — container unlock latency: measure (instrument per-call ms; compare argon2
+      params) and, if confirmed, drop/defer the eager empty-passphrase argon2 probe and scope
+      the libcryptsetup mutex so header reads don't queue behind a multi-second verify.
+      Re-measure after fd-passing (which removes a polkit round-trip per call).
+
 ### Phase B — Rust GTK client (optional; decide after A ships)
 - B0: execute PLAN.md Phases 1–3 deletions in Python first (wizard + first-login, collapse
   Manage pages — ~35 % of the port surface), then PLAN.md Phase 4 (`.ui` templates); the XML is
