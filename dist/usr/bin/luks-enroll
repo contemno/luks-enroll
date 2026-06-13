@@ -52,6 +52,9 @@ class LuksEnrollProxy:
             None,
         )
         self._vanished_callbacks = []
+        # Tracks the fd (if any) of the most recently dispatched async call so
+        # finish_async() can finish it correctly and close the fd.
+        self._pending_fd = None
         self.proxy.connect("notify::g-name-owner", self._on_name_owner_changed)
 
     def _on_name_owner_changed(self, proxy, _pspec):
@@ -62,6 +65,105 @@ class LuksEnrollProxy:
     def on_service_vanished(self, callback):
         """Register a callback to be invoked when the D-Bus service disappears."""
         self._vanished_callbacks.append(callback)
+
+    # -- path-vs-fd dispatch helpers -------------------------------------
+    #
+    # The privileged service runs with ProtectHome=read-only, so it cannot
+    # open user-owned container *files* under /home by path. For regular
+    # files the client (which owns them) opens the file itself and passes
+    # the fd to the matching *Fd method via a Gio.UnixFDList. For block
+    # devices the original string-path methods are used unchanged.
+
+    @staticmethod
+    def _is_regular_file(device):
+        """True for container image files, False for block devices."""
+        try:
+            return os.path.isfile(device)
+        except OSError:
+            return False
+
+    def _call_fd_sync(self, method_fd, signature, fd, extra_args, timeout):
+        """Open-less fd dispatch: append `fd` to a UnixFDList and call
+        `method_fd` synchronously. `signature` must begin with 'h' and the
+        first variant value is the FDList *index*, not the raw fd number.
+        Returns the unpacked result tuple. Does not close `fd`."""
+        fd_list = Gio.UnixFDList.new()
+        idx = fd_list.append(fd)
+        params = GLib.Variant(signature, (idx, *extra_args))
+        res, _out_fdlist = self.proxy.call_with_unix_fd_list_sync(
+            method_fd,
+            params,
+            Gio.DBusCallFlags.NONE,
+            timeout,
+            fd_list,
+            None,
+        )
+        return res.unpack()
+
+    def _call_path_or_fd_sync(self, path_call, method_fd, fd_sig,
+                              device, extra_args, timeout, read_only=False):
+        """Dispatch a device-operating method by path or fd depending on
+        whether `device` is a regular file. `path_call` is a zero-arg callable
+        performing the string-path `call_sync` and returning its result Variant
+        (used for block devices). Returns the unpacked result tuple."""
+        if self._is_regular_file(device):
+            flags = os.O_RDONLY if read_only else os.O_RDWR
+            fd = os.open(device, flags)
+            try:
+                return self._call_fd_sync(method_fd, fd_sig, fd, extra_args,
+                                          timeout)
+            finally:
+                os.close(fd)
+        return path_call().unpack()
+
+    def _call_async(self, path_call, method_fd, fd_sig, device,
+                    extra_args, timeout, callback, read_only=False):
+        """Async dispatch by path or fd. `path_call` is a zero-arg callable that
+        issues the string-path `proxy.call(...)` with `callback`. For the fd
+        case, the fd is kept open until the call is finished (via
+        `finish_async`) so it stays valid for the duration of the D-Bus call.
+        GUI callbacks must finish the call via `finish_async(proxy, result)`
+        rather than `proxy.call_finish`, which both unpacks the right result and
+        closes any fd."""
+        if self._is_regular_file(device):
+            flags = os.O_RDONLY if read_only else os.O_RDWR
+            fd = os.open(device, flags)
+            fd_list = Gio.UnixFDList.new()
+            idx = fd_list.append(fd)
+            params = GLib.Variant(fd_sig, (idx, *extra_args))
+            # Remember this call is fd-based so finish_async closes the fd
+            # and uses the fd-list finish variant. Single-threaded main loop
+            # makes this in-flight state safe between dispatch and finish.
+            self._pending_fd = fd
+            self.proxy.call_with_unix_fd_list(
+                method_fd,
+                params,
+                Gio.DBusCallFlags.NONE,
+                timeout,
+                fd_list,
+                None,
+                callback,
+            )
+            return
+
+        self._pending_fd = None
+        path_call()
+
+    def finish_async(self, proxy, result):
+        """Finish an async call started via `_call_async`, transparently
+        handling both path (`call`) and fd (`call_with_unix_fd_list`) dispatch
+        and closing the fd. Call this from GUI finish callbacks in place of
+        `proxy.call_finish(result)`. Raises GLib.Error on failure, matching the
+        original `call_finish` behaviour."""
+        fd = self._pending_fd
+        self._pending_fd = None
+        if fd is not None:
+            try:
+                variant, _out_fdlist = proxy.call_with_unix_fd_list_finish(result)
+            finally:
+                os.close(fd)
+            return variant
+        return proxy.call_finish(result)
 
     def detect_devices(self):
         result = self.proxy.call_sync(
@@ -74,145 +176,163 @@ class LuksEnrollProxy:
         return result.unpack()[0]
 
     def get_keyslots(self, device):
-        result = self.proxy.call_sync(
-            "GetKeyslots",
-            GLib.Variant("(s)", (device,)),
-            Gio.DBusCallFlags.NONE,
-            30000,
-            None,
-        )
+        raw = self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "GetKeyslots", GLib.Variant("(s)", (device,)),
+                Gio.DBusCallFlags.NONE, 30000, None),
+            "GetKeyslotsFd", "(h)", device, (), 30000, read_only=True,
+        )[0]
         # Service returns JSON with string keys; convert to {int: str}
-        raw = json.loads(result.unpack()[0])
+        raw = json.loads(raw)
         return {int(k): v for k, v in raw.items()}
 
     def get_tokens_by_type(self, device, token_type):
-        result = self.proxy.call_sync(
-            "GetTokensByType",
-            GLib.Variant("(ss)", (device, token_type)),
-            Gio.DBusCallFlags.NONE,
-            30000,
-            None,
-        )
+        raw = self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "GetTokensByType", GLib.Variant("(ss)", (device, token_type)),
+                Gio.DBusCallFlags.NONE, 30000, None),
+            "GetTokensByTypeFd", "(hs)", device, (token_type,), 30000,
+            read_only=True,
+        )[0]
         # Service returns JSON list of [token_id, [keyslot_ids]]
-        raw = json.loads(result.unpack()[0])
+        raw = json.loads(raw)
         return [(int(tid), [int(s) for s in slots]) for tid, slots in raw]
 
     def check_fido2_enrolled(self, device, fido2_dev_paths):
         """Return list of /dev/hidrawN paths already enrolled on this volume."""
-        result = self.proxy.call_sync(
-            "CheckFido2Enrolled",
-            GLib.Variant("(sas)", (device, fido2_dev_paths)),
-            Gio.DBusCallFlags.NONE,
-            30000,
-            None,
-        )
-        return result.unpack()[0]
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "CheckFido2Enrolled",
+                GLib.Variant("(sas)", (device, fido2_dev_paths)),
+                Gio.DBusCallFlags.NONE, 30000, None),
+            "CheckFido2EnrolledFd", "(has)", device, (fido2_dev_paths,), 30000,
+            read_only=True,
+        )[0]
 
     def find_password_keyslots(self, device):
-        result = self.proxy.call_sync(
-            "FindPasswordKeyslots",
-            GLib.Variant("(s)", (device,)),
-            Gio.DBusCallFlags.NONE,
-            30000,
-            None,
-        )
-        return result.unpack()[0]
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "FindPasswordKeyslots", GLib.Variant("(s)", (device,)),
+                Gio.DBusCallFlags.NONE, 30000, None),
+            "FindPasswordKeyslotsFd", "(h)", device, (), 30000, read_only=True,
+        )[0]
 
     def verify_passphrase(self, device, passphrase):
-        result = self.proxy.call_sync(
-            "VerifyPassphrase",
-            GLib.Variant("(ss)", (device, passphrase)),
-            Gio.DBusCallFlags.NONE,
-            30000,
-            None,
-        )
-        return result.unpack()  # (bool, int)
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "VerifyPassphrase", GLib.Variant("(ss)", (device, passphrase)),
+                Gio.DBusCallFlags.NONE, 30000, None),
+            "VerifyPassphraseFd", "(hs)", device, (passphrase,), 30000,
+        )  # (bool, int)
 
     def verify_passphrase_async(self, device, passphrase, callback):
         """Async version — safe for polkit interaction on the main loop."""
-        self.proxy.call(
-            "VerifyPassphrase",
-            GLib.Variant("(ss)", (device, passphrase)),
-            Gio.DBusCallFlags.NONE,
-            60000,
-            None,
-            callback,
+        self._call_async(
+            lambda: self.proxy.call(
+                "VerifyPassphrase", GLib.Variant("(ss)", (device, passphrase)),
+                Gio.DBusCallFlags.NONE, 60000, None, callback),
+            "VerifyPassphraseFd", "(hs)", device, (passphrase,), 60000, callback,
         )
 
     def unlock_with_token_async(self, device, token_type, pin, callback):
         """Async token unlock — TPM2 or FIDO2."""
-        self.proxy.call(
-            "UnlockWithToken",
-            GLib.Variant("(sss)", (device, token_type, pin)),
-            Gio.DBusCallFlags.NONE,
-            60000,
-            None,
+        self._call_async(
+            lambda: self.proxy.call(
+                "UnlockWithToken",
+                GLib.Variant("(sss)", (device, token_type, pin)),
+                Gio.DBusCallFlags.NONE, 60000, None, callback),
+            "UnlockWithTokenFd", "(hss)", device, (token_type, pin), 60000,
             callback,
         )
 
     def enroll_fido2(self, device, passphrase, pin, fido2_device,
                      unlock_method="passphrase", unlock_pin=""):
-        result = self.proxy.call_sync(
-            "EnrollFido2",
-            GLib.Variant("(ssssss)", (device, passphrase, pin, fido2_device,
-                                      unlock_method, unlock_pin)),
-            Gio.DBusCallFlags.NONE,
-            120000,
-            None,
-        )
-        return result.unpack()  # (bool, str, str)
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "EnrollFido2",
+                GLib.Variant("(ssssss)", (device, passphrase, pin, fido2_device,
+                                          unlock_method, unlock_pin)),
+                Gio.DBusCallFlags.NONE, 120000, None),
+            "EnrollFido2Fd", "(hsssss)", device,
+            (passphrase, pin, fido2_device, unlock_method, unlock_pin), 120000,
+        )  # (bool, str, str)
 
     def enroll_tpm2(self, device, passphrase, pin, pcrs,
                     unlock_method="passphrase", unlock_pin=""):
-        result = self.proxy.call_sync(
-            "EnrollTpm2",
-            GLib.Variant("(ssssss)", (device, passphrase, pin, pcrs,
-                                      unlock_method, unlock_pin)),
-            Gio.DBusCallFlags.NONE,
-            120000,
-            None,
-        )
-        return result.unpack()  # (bool, str, str)
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "EnrollTpm2",
+                GLib.Variant("(ssssss)", (device, passphrase, pin, pcrs,
+                                          unlock_method, unlock_pin)),
+                Gio.DBusCallFlags.NONE, 120000, None),
+            "EnrollTpm2Fd", "(hsssss)", device,
+            (passphrase, pin, pcrs, unlock_method, unlock_pin), 120000,
+        )  # (bool, str, str)
 
     def enroll_recovery_key(self, device, passphrase,
                             unlock_method="passphrase", unlock_pin=""):
-        result = self.proxy.call_sync(
-            "EnrollRecoveryKey",
-            GLib.Variant("(ssss)", (device, passphrase, unlock_method,
-                                    unlock_pin)),
-            Gio.DBusCallFlags.NONE,
-            120000,
-            None,
-        )
-        return result.unpack()  # (bool, str, str)
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "EnrollRecoveryKey",
+                GLib.Variant("(ssss)", (device, passphrase, unlock_method,
+                                        unlock_pin)),
+                Gio.DBusCallFlags.NONE, 120000, None),
+            "EnrollRecoveryKeyFd", "(hsss)", device,
+            (passphrase, unlock_method, unlock_pin), 120000,
+        )  # (bool, str, str)
 
     def wipe_slot(self, device, passphrase, unlock_method, pin, slot):
-        result = self.proxy.call_sync(
-            "WipeSlot",
-            GLib.Variant("(ssssi)", (device, passphrase, unlock_method, pin, slot)),
-            Gio.DBusCallFlags.NONE,
-            30000,
-            None,
-        )
-        return result.unpack()  # (bool, str, str)
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "WipeSlot",
+                GLib.Variant("(ssssi)", (device, passphrase, unlock_method, pin,
+                                         slot)),
+                Gio.DBusCallFlags.NONE, 30000, None),
+            "WipeSlotFd", "(hsssi)", device,
+            (passphrase, unlock_method, pin, slot), 30000,
+        )  # (bool, str, str)
 
     def create_encrypted_image(self, path, size_mb, passphrase):
-        result = self.proxy.call_sync(
-            "CreateEncryptedImage",
-            GLib.Variant("(sis)", (path, size_mb, passphrase)),
-            Gio.DBusCallFlags.NONE,
-            60000,
-            None,
-        )
-        return result.unpack()  # (bool, int, str)
+        """Create a new encrypted container. The client owns the target path,
+        so it creates the (not-yet-existing) file and passes the fd to the
+        *Fd service method, which ftruncates and formats it."""
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as e:
+            return (False, -1, f"Could not create '{path}': {e.strerror}")
+        try:
+            return self._call_fd_sync(
+                "CreateEncryptedImageFd", "(his)", fd,
+                (size_mb, passphrase), 60000,
+            )  # (bool, int, str)
+        finally:
+            os.close(fd)
 
     def create_encrypted_image_async(self, path, size_mb, passphrase, callback):
-        """Async version — runs on main loop so polkit can show its auth dialog."""
-        self.proxy.call(
-            "CreateEncryptedImage",
-            GLib.Variant("(sis)", (path, size_mb, passphrase)),
+        """Async version — runs on main loop so polkit can show its auth dialog.
+        The client creates the target file and passes its fd to the service."""
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as e:
+            # Surface the failure through the normal finish path: schedule the
+            # callback with no in-flight D-Bus call. finish_async/call_finish
+            # would fail, so the GUI callback must tolerate this; instead we
+            # raise immediately to match prior synchronous os.open semantics.
+            raise GLib.Error.new_literal(
+                Gio.io_error_quark(),
+                f"Could not create '{path}': {e.strerror}",
+                Gio.IOErrorEnum.FAILED,
+            ) from e
+        fd_list = Gio.UnixFDList.new()
+        idx = fd_list.append(fd)
+        params = GLib.Variant("(his)", (idx, size_mb, passphrase))
+        self._pending_fd = fd
+        self.proxy.call_with_unix_fd_list(
+            "CreateEncryptedImageFd",
+            params,
             Gio.DBusCallFlags.NONE,
             120000,
+            fd_list,
             None,
             callback,
         )
@@ -239,14 +359,13 @@ class LuksEnrollProxy:
         return json.loads(result.unpack()[0])
 
     def get_device_info(self, device):
-        result = self.proxy.call_sync(
-            "GetDeviceInfo",
-            GLib.Variant("(s)", (device,)),
-            Gio.DBusCallFlags.NONE,
-            30000,
-            None,
-        )
-        return json.loads(result.unpack()[0])
+        raw = self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "GetDeviceInfo", GLib.Variant("(s)", (device,)),
+                Gio.DBusCallFlags.NONE, 30000, None),
+            "GetDeviceInfoFd", "(h)", device, (), 30000, read_only=True,
+        )[0]
+        return json.loads(raw)
 
     def format_partition(self, device, passphrase):
         result = self.proxy.call_sync(
@@ -260,15 +379,17 @@ class LuksEnrollProxy:
 
     def enroll_passphrase(self, device, existing_passphrase, new_passphrase,
                           unlock_method="passphrase", unlock_pin=""):
-        result = self.proxy.call_sync(
-            "EnrollPassphrase",
-            GLib.Variant("(sssss)", (device, existing_passphrase, new_passphrase,
-                                     unlock_method, unlock_pin)),
-            Gio.DBusCallFlags.NONE,
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "EnrollPassphrase",
+                GLib.Variant("(sssss)", (device, existing_passphrase,
+                                         new_passphrase, unlock_method,
+                                         unlock_pin)),
+                Gio.DBusCallFlags.NONE, 120000, None),
+            "EnrollPassphraseFd", "(hssss)", device,
+            (existing_passphrase, new_passphrase, unlock_method, unlock_pin),
             120000,
-            None,
-        )
-        return result.unpack()  # (bool, str, str)
+        )  # (bool, str, str)
 
     def get_setting(self, key):
         result = self.proxy.call_sync(
@@ -2565,7 +2686,7 @@ class CreateImagePage(Adw.NavigationPage):
         """Async callback — runs on main thread after D-Bus call completes."""
         path = self._pending_path
         try:
-            res = proxy.call_finish(result)
+            res = self.svc.finish_async(proxy, result)
             ok, _keyslot, error = res.unpack()
         except GLib.Error as e:
             ok, error = False, f"D-Bus error: {e.message}"
@@ -2751,7 +2872,7 @@ class DeviceDetailPage(Adw.NavigationPage):
     def _on_auto_unlock_finish(self, proxy, result):
         self._unlock_spinner.stop()
         try:
-            res = proxy.call_finish(result)
+            res = self.svc.finish_async(proxy, result)
             ok, keyslot = res.unpack()
         except GLib.Error:
             ok, keyslot = False, -1
@@ -2771,7 +2892,7 @@ class DeviceDetailPage(Adw.NavigationPage):
     def _on_empty_pw_finish(self, proxy, result):
         self._unlock_spinner.stop()
         try:
-            res = proxy.call_finish(result)
+            res = self.svc.finish_async(proxy, result)
             ok, keyslot = res.unpack()
         except GLib.Error:
             ok, keyslot = False, -1
@@ -2905,7 +3026,7 @@ class DeviceDetailPage(Adw.NavigationPage):
         self._unlock_spinner.stop()
         self._unlock_btn.set_sensitive(True)
         try:
-            res = proxy.call_finish(result)
+            res = self.svc.finish_async(proxy, result)
             ok, keyslot = res.unpack()
         except GLib.Error:
             ok, keyslot = False, -1
@@ -2933,7 +3054,7 @@ class DeviceDetailPage(Adw.NavigationPage):
     def _on_token_unlock_finish(self, proxy, result):
         self._unlock_spinner.stop()
         try:
-            res = proxy.call_finish(result)
+            res = self.svc.finish_async(proxy, result)
             ok, keyslot = res.unpack()
         except GLib.Error as e:
             ok, keyslot = False, -1
