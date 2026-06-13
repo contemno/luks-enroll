@@ -103,14 +103,22 @@ Status: **Phase A in progress** (backend service). Phase B (GTK client) not star
       service's private tmp would have been invisible to the user). New `*Fd` D-Bus methods are
       additive; block devices keep the string-path methods (the unprivileged client cannot open
       a `/dev` descriptor). Interface contract extended in `dbus/net.contemno.LuksEnroll1.xml`.
-- [ ] Issue 2 — Python client: call the `*Fd` methods for regular-file containers (open the fd,
-      pass via `Gio.UnixFDList`); keep string-path methods for block devices.
-- [ ] Issue 2 — Python service: mirror the `*Fd` methods for all-Python parity/rollback.
-- [ ] Issue 1 — TPM2 enroll page tab focus: one tab stop per writable control (GTK client).
-- [ ] Issue 3 — container unlock latency: measure (instrument per-call ms; compare argon2
-      params) and, if confirmed, drop/defer the eager empty-passphrase argon2 probe and scope
-      the libcryptsetup mutex so header reads don't queue behind a multi-second verify.
-      Re-measure after fd-passing (which removes a polkit round-trip per call).
+- [x] Issue 2 — Python client: calls the `*Fd` methods for regular-file containers (opens the
+      fd, passes via `Gio.UnixFDList`); block devices keep the string-path methods. Public
+      proxy signatures unchanged, so GUI call sites are untouched.
+- [x] Issue 2 — Python service: mirrors the `*Fd` methods for all-Python parity/rollback
+      (shared `_do_*` inner functions guarantee path/fd parity). `INTROSPECTION_XML` symmetric
+      with `dbus/*.xml`; 140 Python tests pass.
+- [x] Issue 1 — TPM2 enroll page tab focus: wrapper rows made non-focusable so Tab lands only
+      on the PCR checkboxes, PIN/Confirm entries, and Enroll button.
+- [ ] Issue 3 — container unlock latency. Diagnosed: opening an *existing* container has no
+      known passphrase, so `DeviceDetailPage` runs `_try_empty_passphrase()` → a full argon2
+      verify against every keyslot (~2–4 s) before failing; the internal volume arrives with a
+      known passphrase and takes the targeted `_auto_unlock_with()` path, skipping that argon2.
+      fd-passing does **not** fix this (it only removed one polkit round-trip/call). Planned
+      fix: run the empty-passphrase probe only after `_fetch_enrolled_methods()` returns and
+      only when the volume looks fresh (single password keyslot, no tokens); otherwise go
+      straight to the prompt. Held pending a re-test to confirm the number (changes unlock UX).
 
 ### Phase B — Rust GTK client (optional; decide after A ships)
 - B0: execute PLAN.md Phases 1–3 deletions in Python first (wizard + first-login, collapse
