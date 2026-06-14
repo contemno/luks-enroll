@@ -111,14 +111,18 @@ Status: **Phase A in progress** (backend service). Phase B (GTK client) not star
       with `dbus/*.xml`; 140 Python tests pass.
 - [x] Issue 1 — TPM2 enroll page tab focus: wrapper rows made non-focusable so Tab lands only
       on the PCR checkboxes, PIN/Confirm entries, and Enroll button.
-- [ ] Issue 3 — container unlock latency. Diagnosed: opening an *existing* container has no
-      known passphrase, so `DeviceDetailPage` runs `_try_empty_passphrase()` → a full argon2
-      verify against every keyslot (~2–4 s) before failing; the internal volume arrives with a
-      known passphrase and takes the targeted `_auto_unlock_with()` path, skipping that argon2.
-      fd-passing does **not** fix this (it only removed one polkit round-trip/call). Planned
-      fix: run the empty-passphrase probe only after `_fetch_enrolled_methods()` returns and
-      only when the volume looks fresh (single password keyslot, no tokens); otherwise go
-      straight to the prompt. Held pending a re-test to confirm the number (changes unlock UX).
+- [x] Issue 3 — container unlock latency. **Fixed.** Opening an existing container ran a
+      speculative `verify_passphrase("")` before showing the prompt; with LUKS2 default
+      argon2id (time=4, memory=1 GiB) that is a ~2-4 s doomed derivation, and on the Rust
+      service it holds the global libcryptsetup mutex so the page's metadata reads queue behind
+      it. The `LUKS_ENROLL_TIMING` instrumentation proves the split: `metadata_json` 1 ms vs
+      `verify_passphrase` ~1.9-3.8 s. Fix: the client no longer runs the empty probe on the
+      open-existing path — it renders the unlock prompt straight from LUKS2 metadata. A blank-
+      password container still auto-unlocks via the known-passphrase path. Note: caching the
+      argon2 result was considered and rejected — the per-keyslot random salt means there's no
+      reusable "blank hash", and the inability to shortcut the check is the KDF's security
+      property by design. Also fixed the `_pending_fd` single-slot bug (overlapping async fd
+      calls shared one slot) via a finish trampoline.
 
 ### Phase B — Rust GTK client (optional; decide after A ships)
 - B0: execute PLAN.md Phases 1–3 deletions in Python first (wizard + first-login, collapse
