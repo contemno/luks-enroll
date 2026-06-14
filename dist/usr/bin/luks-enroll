@@ -52,9 +52,13 @@ class LuksEnrollProxy:
             None,
         )
         self._vanished_callbacks = []
-        # Tracks the fd (if any) of the most recently dispatched async call so
-        # finish_async() can finish it correctly and close the fd.
-        self._pending_fd = None
+        # Depth of the currently-executing fd-based async finish callback.
+        # Set only while _on_fd_async_done invokes the user callback, which
+        # finishes the call synchronously on the single-threaded main loop —
+        # so overlapping in-flight fd calls never clobber each other (each
+        # carries its own fd as user_data) and finish_async() can tell an
+        # fd call from a path call without a shared single-fd slot.
+        self._fd_finish_depth = 0
         self.proxy.connect("notify::g-name-owner", self._on_name_owner_changed)
 
     def _on_name_owner_changed(self, proxy, _pspec):
@@ -120,21 +124,17 @@ class LuksEnrollProxy:
                     extra_args, timeout, callback, read_only=False):
         """Async dispatch by path or fd. `path_call` is a zero-arg callable that
         issues the string-path `proxy.call(...)` with `callback`. For the fd
-        case, the fd is kept open until the call is finished (via
-        `finish_async`) so it stays valid for the duration of the D-Bus call.
-        GUI callbacks must finish the call via `finish_async(proxy, result)`
-        rather than `proxy.call_finish`, which both unpacks the right result and
-        closes any fd."""
+        case the fd travels as user_data through `_on_fd_async_done`, which
+        owns the fd for the call's lifetime and closes it after the callback —
+        so two in-flight fd calls never share state. GUI callbacks must finish
+        the call via `finish_async(proxy, result)` rather than
+        `proxy.call_finish`, which picks the right finish variant."""
         if self._is_regular_file(device):
             flags = os.O_RDONLY if read_only else os.O_RDWR
             fd = os.open(device, flags)
             fd_list = Gio.UnixFDList.new()
             idx = fd_list.append(fd)
             params = GLib.Variant(fd_sig, (idx, *extra_args))
-            # Remember this call is fd-based so finish_async closes the fd
-            # and uses the fd-list finish variant. Single-threaded main loop
-            # makes this in-flight state safe between dispatch and finish.
-            self._pending_fd = fd
             self.proxy.call_with_unix_fd_list(
                 method_fd,
                 params,
@@ -142,26 +142,35 @@ class LuksEnrollProxy:
                 timeout,
                 fd_list,
                 None,
-                callback,
+                self._on_fd_async_done,
+                (callback, fd),
             )
             return
 
-        self._pending_fd = None
         path_call()
+
+    def _on_fd_async_done(self, proxy, result, user_data):
+        """Gio finish trampoline for fd-based async calls. Marks the finish as
+        fd-based for the duration of the user callback (so finish_async uses
+        the fd-list finish), then closes the fd. The marker is scoped to this
+        synchronous callback, so concurrent fd calls don't interfere."""
+        callback, fd = user_data
+        self._fd_finish_depth += 1
+        try:
+            callback(proxy, result)
+        finally:
+            self._fd_finish_depth -= 1
+            os.close(fd)
 
     def finish_async(self, proxy, result):
         """Finish an async call started via `_call_async`, transparently
-        handling both path (`call`) and fd (`call_with_unix_fd_list`) dispatch
-        and closing the fd. Call this from GUI finish callbacks in place of
+        handling both path (`call`) and fd (`call_with_unix_fd_list`) dispatch.
+        Call this from GUI finish callbacks in place of
         `proxy.call_finish(result)`. Raises GLib.Error on failure, matching the
-        original `call_finish` behaviour."""
-        fd = self._pending_fd
-        self._pending_fd = None
-        if fd is not None:
-            try:
-                variant, _out_fdlist = proxy.call_with_unix_fd_list_finish(result)
-            finally:
-                os.close(fd)
+        original `call_finish` behaviour. The fd (if any) is owned and closed
+        by `_on_fd_async_done`, not here."""
+        if self._fd_finish_depth > 0:
+            variant, _out_fdlist = proxy.call_with_unix_fd_list_finish(result)
             return variant
         return proxy.call_finish(result)
 
@@ -326,7 +335,6 @@ class LuksEnrollProxy:
         fd_list = Gio.UnixFDList.new()
         idx = fd_list.append(fd)
         params = GLib.Variant("(his)", (idx, size_mb, passphrase))
-        self._pending_fd = fd
         self.proxy.call_with_unix_fd_list(
             "CreateEncryptedImageFd",
             params,
@@ -334,7 +342,8 @@ class LuksEnrollProxy:
             120000,
             fd_list,
             None,
-            callback,
+            self._on_fd_async_done,
+            (callback, fd),
         )
 
     def authenticate_async(self, callback):
@@ -2852,15 +2861,20 @@ class DeviceDetailPage(Adw.NavigationPage):
         # Track dynamically-added rows for proper cleanup on refresh
         self._dynamic_rows = {}
 
-        # Fetch enrolled methods in background (visible before unlock)
+        # Fetch enrolled methods in background; _apply_enrolled_methods then
+        # renders the unlock prompt straight from the LUKS2 metadata.
         self._fetch_enrolled_methods()
 
-        # If passphrase already known (e.g. just created the file), auto-unlock
+        # If the passphrase is already known (e.g. we just created this
+        # container), auto-unlock. Otherwise show the prompt and let the user
+        # authenticate. We deliberately do NOT speculatively try an empty
+        # passphrase here: for an existing container that is a doomed ~2-4 s
+        # argon2 (1 GiB) on every open, and on the Rust service it holds the
+        # global libcryptsetup lock so the metadata reads above queue behind
+        # it. A genuinely blank-password container still auto-unlocks via the
+        # known-passphrase path (its passphrase, "", is passed in on create).
         if self._initial_passphrase is not None:
             self._auto_unlock_with(self._initial_passphrase)
-        else:
-            # Try empty passphrase in background
-            self._try_empty_passphrase()
 
     def _auto_unlock_with(self, passphrase):
         """Verify the known passphrase asynchronously and auto-unlock."""
@@ -2883,23 +2897,6 @@ class DeviceDetailPage(Adw.NavigationPage):
         else:
             # Passphrase didn't work — fall back to manual unlock
             self._initial_passphrase = None
-
-    def _try_empty_passphrase(self):
-        """Try unlocking with empty passphrase."""
-        self._unlock_spinner.start()
-        self.svc.verify_passphrase_async(self.device, "", self._on_empty_pw_finish)
-
-    def _on_empty_pw_finish(self, proxy, result):
-        self._unlock_spinner.stop()
-        try:
-            res = self.svc.finish_async(proxy, result)
-            ok, keyslot = res.unpack()
-        except GLib.Error:
-            ok, keyslot = False, -1
-        if ok:
-            self.passphrase = ""
-            self.auth_keyslot = keyslot
-            self._show_unlocked()
 
     def _fetch_enrolled_methods(self):
         """Fetch enrolled token/keyslot info in background (no unlock needed)."""
