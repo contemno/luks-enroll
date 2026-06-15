@@ -104,6 +104,18 @@ class TestEnrollSpecConsistency(unittest.TestCase):
         names = {s.name for s in gui.ENROLL_SPECS}
         self.assertEqual(names, {"fido2", "tpm2", "recovery", "passphrase"})
 
+    def test_tpm2_pcr_constants_present(self):
+        # Regression: TPM2_PCRS / TPM2_DEFAULT_PCRS were defined inside the
+        # wizard block deleted in Phase 2; the management TPM2 page needs
+        # them and would crash with NameError on click otherwise.
+        self.assertIsInstance(gui.TPM2_PCRS, dict)
+        self.assertGreater(len(gui.TPM2_PCRS), 0)
+        self.assertIsInstance(gui.TPM2_DEFAULT_PCRS, set)
+        self.assertTrue(
+            gui.TPM2_DEFAULT_PCRS.issubset(gui.TPM2_PCRS.keys()),
+            "every default PCR must be a key in TPM2_PCRS",
+        )
+
     def test_each_spec_has_proxy_method(self):
         for spec in gui.ENROLL_SPECS:
             method = getattr(gui.LuksEnrollProxy, spec.service_method, None)
