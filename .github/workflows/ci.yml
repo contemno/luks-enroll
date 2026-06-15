@@ -43,3 +43,38 @@ jobs:
 
       - name: Run tests
         run: python3 -m pytest tests/ -v
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install C build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcryptsetup-dev libfido2-dev libtss2-dev libblkid-dev
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Tests (includes LUKS2 image-file integration tests)
+        run: cargo test --workspace
+
+      - name: TPM2 seal/unseal roundtrips against swtpm
+        run: |
+          sudo apt-get install -y --no-install-recommends swtpm
+          mkdir -p /tmp/swtpm-state
+          swtpm socket --tpm2 --server port=2321 --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear --tpmstate dir=/tmp/swtpm-state --daemon
+          TCTI="swtpm:host=127.0.0.1,port=2321" \
+            cargo test -p luks-enroll-service tpm2 -- --ignored

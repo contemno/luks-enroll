@@ -1,0 +1,10 @@
+[package]
+name = "fido2-sys"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Minimal bindgen FFI bindings to the system libfido2, covering the API surface used by luks-enroll-service"
+links = "fido2"
+
+[build-dependencies]
+bindgen = "0.71"
