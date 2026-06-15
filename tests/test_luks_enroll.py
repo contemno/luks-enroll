@@ -11,48 +11,20 @@ import ast
 import base64
 import configparser
 import glob  # noqa: F401  pre-import so sys.modules patching doesn't evict it
-import importlib
 import os
 import re
 import struct
-import sys
 import tempfile
 import unittest
-from importlib.machinery import SourceFileLoader
 from unittest import mock
 from xml.etree import ElementTree
 
-
-# ---------------------------------------------------------------------------
-# Import helpers — mock heavy system deps so modules can be imported
-# ---------------------------------------------------------------------------
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVICE_PATH = os.path.join(ROOT, "dist", "usr", "sbin", "luks-enroll-service")
-GUI_PATH = os.path.join(ROOT, "dist", "usr", "bin", "luks-enroll")
-
-
-def _load_module(mod_name, path):
-    loader = SourceFileLoader(mod_name, path)
-    spec = importlib.util.spec_from_loader(mod_name, loader)
-    fake_gi = mock.MagicMock()
-    mod = importlib.util.module_from_spec(spec)
-    # Register the module before exec so dataclass can resolve __module__
-    with mock.patch.dict(
-        sys.modules,
-        {
-            "gi": fake_gi,
-            "gi.repository": fake_gi.repository,
-            mod_name: mod,
-        },
-    ):
-        spec.loader.exec_module(mod)
-    return mod
+from conftest import GUI_PATH, SERVICE_PATH, load_module
 
 
 # Import both modules once at module scope
-svc = _load_module("luks_enroll_service", SERVICE_PATH)
-gui = _load_module("luks_enroll", GUI_PATH)
+svc = load_module("luks_enroll_service", SERVICE_PATH)
+gui = load_module("luks_enroll", GUI_PATH)
 
 
 # ===========================================================================
