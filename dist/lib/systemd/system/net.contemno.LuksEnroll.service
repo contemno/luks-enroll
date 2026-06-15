@@ -9,6 +9,11 @@ User=root
 
 # Hardening
 ProtectSystem=strict
+# ProtectHome stays read-only: the service never opens user-owned
+# encrypted-container files by path. The client opens them (it owns them)
+# and passes a file descriptor over D-Bus; the service operates on
+# /proc/self/fd/N, which writes through the descriptor's mount and so
+# bypasses this read-only view without weakening it.
 ProtectHome=read-only
 PrivateTmp=yes
 NoNewPrivileges=yes

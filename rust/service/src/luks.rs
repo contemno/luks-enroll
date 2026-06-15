@@ -21,6 +21,38 @@ use zeroize::Zeroizing;
 use crate::error::{Error, Result};
 use crate::{bail, fido2, tpm2};
 
+/// Scoped timer that logs elapsed wall-clock for an operation when
+/// `LUKS_ENROLL_TIMING` is set in the environment. Off by default (zero
+/// overhead beyond one env lookup). Logging on drop covers every return
+/// path. Used to quantify where unlock latency goes (argon2 vs. reads).
+pub(crate) struct Timer {
+    label: &'static str,
+    start: std::time::Instant,
+    enabled: bool,
+}
+
+impl Timer {
+    pub(crate) fn new(label: &'static str) -> Self {
+        Timer {
+            label,
+            start: std::time::Instant::now(),
+            enabled: std::env::var_os("LUKS_ENROLL_TIMING").is_some(),
+        }
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        if self.enabled {
+            eprintln!(
+                "[timing] {}: {} ms",
+                self.label,
+                self.start.elapsed().as_millis()
+            );
+        }
+    }
+}
+
 /// A LUKS volume key. Zeroized on drop.
 #[derive(Clone)]
 pub struct VolumeKey(Zeroizing<Vec<u8>>);
@@ -109,6 +141,7 @@ fn open_luks2(device: &str) -> Result<CryptDevice> {
 
 /// Parsed LUKS2 JSON metadata (crypt_dump_json), or None on any failure.
 pub fn metadata_json(device: &str) -> Option<serde_json::Value> {
+    let _t = Timer::new("metadata_json");
     let mut dev = open_luks2(device).ok()?;
     dev.status_handle().dump_json().ok()
 }
@@ -331,6 +364,7 @@ fn tpm2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Tpm2TokenRef>> {
 
 /// Verify a passphrase. Returns the matching keyslot, or an error message.
 pub fn verify_passphrase(device: &str, passphrase: &str) -> std::result::Result<i32, String> {
+    let _t = Timer::new("verify_passphrase");
     let mut dev = open_luks2(device).map_err(|e| e.0)?;
     // name=None: verify only, no dm-crypt activation.
     dev.activate_handle()
@@ -360,6 +394,7 @@ fn derive_passphrase_from_token(
 /// follow-up enrollment operations don't need a second touch/unseal.
 /// Returns the keyslot, or an error message.
 pub fn verify_token(device: &str, token_type: &str, pin: &str) -> std::result::Result<i32, String> {
+    let _t = Timer::new("verify_token");
     const VALID: [&str; 2] = ["systemd-fido2", "systemd-tpm2"];
     if !VALID.contains(&token_type) {
         // Parity: Python raises here (caller turns it into a D-Bus failure).
@@ -391,6 +426,7 @@ pub fn get_volume_key(
     passphrase: &str,
     unlock_pin: &str,
 ) -> Result<VolumeKey> {
+    let _t = Timer::new("get_volume_key");
     const VALID: [&str; 3] = ["passphrase", "systemd-fido2", "systemd-tpm2"];
     if !VALID.contains(&unlock_method) {
         bail!("Invalid unlock method: {unlock_method:?}");
@@ -434,6 +470,7 @@ pub fn add_keyslot_by_volume_key(
     new_passphrase: &[u8],
     minimal_pbkdf: bool,
 ) -> Result<i32> {
+    let _t = Timer::new("add_keyslot_by_volume_key");
     let mut dev = open_luks2(device)?;
     if minimal_pbkdf {
         let pbkdf = CryptPbkdfType {
@@ -499,6 +536,7 @@ pub fn destroy_keyslot(device: &str, slot: i32) -> Result<()> {
 /// LUKS2-format a device or image file (aes-xts-plain64, 512-bit volume
 /// key) and add the passphrase. Returns the keyslot number.
 pub fn format_luks2(path: &str, passphrase: &str) -> Result<i32> {
+    let _t = Timer::new("format_luks2");
     let mut dev = CryptInit::init(Path::new(path)).map_err(|_| Error::from("crypt_init failed"))?;
     dev.context_handle()
         .format::<()>(
