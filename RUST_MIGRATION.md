@@ -79,6 +79,51 @@ Status: **Phase A in progress** (backend service). Phase B (GTK client) not star
       dracut initramfs, and cross-validation (Python-enrolled volume managed by Rust service
       and vice versa).
 
+### Post-A test feedback fixes
+- [x] **Issue 2 — container ops fail under the sandbox (fd-passing fix).** Enrolling/wiping/
+      creating an *encrypted file container* under `/home` failed while the same ops on the
+      internal block volume worked. Root cause is the unit's `ProtectHome=read-only`: the
+      service's namespace mounts `/home` read-only (root included), so every LUKS header
+      *write* on a `~/…` container returns `EROFS`; block devices are exempt (`/dev` is not
+      under `ProtectSystem=strict`), which is why they worked. This is config/sandbox, not a
+      Rust bug — it affects the Python service identically.
+
+      Fix (chosen over relaxing the sandbox): **file-descriptor passing.** The client opens the
+      container file it owns and passes the descriptor over D-Bus (type `h`); the service
+      operates on `/proc/self/fd/N`. The reopened path carries the *client's* writable mount,
+      so the write goes through while `ProtectHome=read-only` is kept intact. Verified
+      empirically: in a child mount namespace with the dir re-bound read-only, a direct
+      `open(O_RDWR)` gets `EROFS` while `crypt_init`/`crypt_format`/`crypt_keyslot_add` on
+      `/proc/self/fd/N` succeed and the parent reads back a valid LUKS2 header (see
+      `tests/fd_ops.rs::fd_writes_through_readonly_mount_namespace`, and the standalone
+      libcryptsetup confirmation). Side benefits: removes the `/home`+`/tmp` path allowlist,
+      the TOCTOU window, the chown, and the polkit round-trip — possession of a writable
+      descriptor *is* the capability (strictly stronger than the path-based ownership skip).
+      Also incidentally fixes the latent `PrivateTmp` gotcha (a `/tmp` container created in the
+      service's private tmp would have been invisible to the user). New `*Fd` D-Bus methods are
+      additive; block devices keep the string-path methods (the unprivileged client cannot open
+      a `/dev` descriptor). Interface contract extended in `dbus/net.contemno.LuksEnroll1.xml`.
+- [x] Issue 2 — Python client: calls the `*Fd` methods for regular-file containers (opens the
+      fd, passes via `Gio.UnixFDList`); block devices keep the string-path methods. Public
+      proxy signatures unchanged, so GUI call sites are untouched.
+- [x] Issue 2 — Python service: mirrors the `*Fd` methods for all-Python parity/rollback
+      (shared `_do_*` inner functions guarantee path/fd parity). `INTROSPECTION_XML` symmetric
+      with `dbus/*.xml`; 140 Python tests pass.
+- [x] Issue 1 — TPM2 enroll page tab focus: wrapper rows made non-focusable so Tab lands only
+      on the PCR checkboxes, PIN/Confirm entries, and Enroll button.
+- [x] Issue 3 — container unlock latency. **Fixed.** Opening an existing container ran a
+      speculative `verify_passphrase("")` before showing the prompt; with LUKS2 default
+      argon2id (time=4, memory=1 GiB) that is a ~2-4 s doomed derivation, and on the Rust
+      service it holds the global libcryptsetup mutex so the page's metadata reads queue behind
+      it. The `LUKS_ENROLL_TIMING` instrumentation proves the split: `metadata_json` 1 ms vs
+      `verify_passphrase` ~1.9-3.8 s. Fix: the client no longer runs the empty probe on the
+      open-existing path — it renders the unlock prompt straight from LUKS2 metadata. A blank-
+      password container still auto-unlocks via the known-passphrase path. Note: caching the
+      argon2 result was considered and rejected — the per-keyslot random salt means there's no
+      reusable "blank hash", and the inability to shortcut the check is the KDF's security
+      property by design. Also fixed the `_pending_fd` single-slot bug (overlapping async fd
+      calls shared one slot) via a finish trampoline.
+
 ### Phase B — Rust GTK client (optional; decide after A ships)
 - B0: execute PLAN.md Phases 1–3 deletions in Python first (wizard + first-login, collapse
   Manage pages — ~35 % of the port surface), then PLAN.md Phase 4 (`.ui` templates); the XML is
