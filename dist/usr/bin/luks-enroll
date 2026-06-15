@@ -1719,51 +1719,27 @@ class DeviceDetailPage(Adw.NavigationPage):
         """Build 'Add Enrollment' rows."""
         self._clear_dynamic_rows("add:")
 
-        row_fido2 = Adw.ActionRow(
-            title="Add FIDO2 Key", subtitle="Security key with PIN"
-        )
-        row_fido2.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-        row_fido2.set_activatable(True)
-        row_fido2.connect(
-            "activated", lambda _: self._push_enroll_page(ManageFido2EnrollPage)
-        )
-        self._add_row(self._add_group, row_fido2, "add:fido2")
+        rows = [
+            ("Add FIDO2 Key", "Security key with PIN", FIDO2_SPEC, "add:fido2"),
+            ("Add TPM2", "TPM2 chip with optional PIN", TPM2_SPEC, "add:tpm2"),
+            ("Add Recovery Key", "Generate a new recovery key",
+             RECOVERY_SPEC, "add:recovery"),
+            ("Add Password", "Add a passphrase keyslot",
+             PASSPHRASE_SPEC, "add:password"),
+        ]
+        for title, subtitle, spec, key in rows:
+            row = Adw.ActionRow(title=title, subtitle=subtitle)
+            row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+            row.set_activatable(True)
+            row.connect("activated",
+                        lambda _, s=spec: self._push_enroll_page(s))
+            self._add_row(self._add_group, row, key)
 
-        row_tpm2 = Adw.ActionRow(
-            title="Add TPM2", subtitle="TPM2 chip with optional PIN"
-        )
-        row_tpm2.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-        row_tpm2.set_activatable(True)
-        row_tpm2.connect(
-            "activated", lambda _: self._push_enroll_page(ManageTpm2EnrollPage)
-        )
-        self._add_row(self._add_group, row_tpm2, "add:tpm2")
-
-        row_recovery = Adw.ActionRow(
-            title="Add Recovery Key", subtitle="Generate a new recovery key"
-        )
-        row_recovery.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-        row_recovery.set_activatable(True)
-        row_recovery.connect(
-            "activated", lambda _: self._push_enroll_page(ManageRecoveryEnrollPage)
-        )
-        self._add_row(self._add_group, row_recovery, "add:recovery")
-
-        row_pw = Adw.ActionRow(
-            title="Add Password", subtitle="Add a passphrase keyslot"
-        )
-        row_pw.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-        row_pw.set_activatable(True)
-        row_pw.connect(
-            "activated", lambda _: self._push_enroll_page(ManagePassphraseEnrollPage)
-        )
-        self._add_row(self._add_group, row_pw, "add:password")
-
-    def _push_enroll_page(self, page_class):
+    def _push_enroll_page(self, spec):
         nav = self.get_ancestor(Adw.NavigationView)
         if nav:
-            page = page_class(self.svc, self.device, self.passphrase, self,
-                              self.unlock_method, self.unlock_pin)
+            page = EnrollPage(spec, self.svc, self.device, self.passphrase,
+                              self, self.unlock_method, self.unlock_pin)
             nav.push(page)
 
     def refresh_after_enroll(self):
@@ -1772,22 +1748,74 @@ class DeviceDetailPage(Adw.NavigationPage):
             self._fetch_detail_data()
 
 
-class ManageFido2EnrollPage(Adw.NavigationPage):
-    """FIDO2 enrollment page for the management view."""
+# ---------------------------------------------------------------------------
+# Enrollment pages — one EnrollPage class parametrized by an EnrollSpec
+# ---------------------------------------------------------------------------
 
-    def __init__(self, svc, device, passphrase, detail_page,
+
+class EnrollSpec:
+    """Bundle of per-method-type knobs that EnrollPage reads.
+
+    Attributes:
+        name:               short tag used in tests (e.g. "fido2")
+        title:              page title in the headerbar
+        group_title:        Adw.PreferencesGroup title
+        group_description:  group subtitle
+        button_label:       enroll button label
+        enrolling_label:    status label while the worker thread is running
+        success_label:      status label on success
+        failure_default:    fallback error message when stderr is empty
+        service_method:     LuksEnrollProxy method name to call
+        show_recovery_key:  if True, display stdout's recovery key after success
+        setup_inputs(page, group):
+            populate `group` with input rows; stash widgets on `page`
+        validate_and_collect(page) -> (extra_args_tuple, error_msg_or_None):
+            read inputs off `page`; return the args tuple inserted between
+            (device, passphrase) and (unlock_method, unlock_pin) on the
+            service call; return (None, msg) to abort with an error
+        on_enroll_start(page):  per-spec UI lockdown beyond the default
+        on_enroll_done(page, ok):  per-spec UI re-enable after the call
+        post_init(page):  one-shot setup hook (FIDO2's udev subscription)
+    """
+
+    def __init__(self, *, name, title, group_title, group_description,
+                 button_label, enrolling_label, success_label, failure_default,
+                 service_method, show_recovery_key=False,
+                 setup_inputs=lambda page, group: None,
+                 validate_and_collect=lambda page: ((), None),
+                 on_enroll_start=lambda page: None,
+                 on_enroll_done=lambda page, ok: None,
+                 post_init=lambda page: None):
+        self.name = name
+        self.title = title
+        self.group_title = group_title
+        self.group_description = group_description
+        self.button_label = button_label
+        self.enrolling_label = enrolling_label
+        self.success_label = success_label
+        self.failure_default = failure_default
+        self.service_method = service_method
+        self.show_recovery_key = show_recovery_key
+        self.setup_inputs = setup_inputs
+        self.validate_and_collect = validate_and_collect
+        self.on_enroll_start = on_enroll_start
+        self.on_enroll_done = on_enroll_done
+        self.post_init = post_init
+
+
+class EnrollPage(Adw.NavigationPage):
+    """Generic enrollment page shared by FIDO2/TPM2/Recovery/Passphrase."""
+
+    def __init__(self, spec, svc, device, passphrase, detail_page,
                  unlock_method="passphrase", unlock_pin=""):
-        super().__init__(title="Add FIDO2 Key")
+        super().__init__(title=spec.title)
+        self.spec = spec
         self.svc = svc
         self.device = device
         self.passphrase = passphrase
         self.detail_page = detail_page
         self.unlock_method = unlock_method
         self.unlock_pin = unlock_pin
-        self._fido2_devices = []  # all detected (hidraw_name, hid_name)
-        self._enrolled_devs = set()  # hidraw names already enrolled
-        self._is_enrolling = False
-        self._checking_status = False
 
         toolbar_view = Adw.ToolbarView()
         self.set_child(toolbar_view)
@@ -1804,46 +1832,32 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
         self._content_box.append(prefs)
 
         self._group = Adw.PreferencesGroup(
-            title="FIDO2 Security Key",
-            description="Enter your FIDO2 token's PIN. You may need to touch the key.",
+            title=spec.group_title,
+            description=spec.group_description,
         )
         prefs.add(self._group)
+        self._prefs = prefs
 
-        # FIDO2 device row — always created, visibility managed by refresh
-        self._fido2_row = Adw.ActionRow(title="FIDO2 Device")
-        self._fido2_dropdown = Gtk.DropDown()
-        self._fido2_dropdown.set_valign(Gtk.Align.CENTER)
-        self._fido2_dropdown.connect("notify::selected", self._on_dropdown_changed)
-        self._fido2_row.add_suffix(self._fido2_dropdown)
-        self._group.add(self._fido2_row)
+        spec.setup_inputs(self, self._group)
 
-        # Single-device / no-device status row
-        self._det_row = Adw.ActionRow(title="No FIDO2 device detected",
-                                      subtitle="Plug in a FIDO2 security key")
-        self._group.add(self._det_row)
-
-        # PIN entry
-        self._pin_row = Adw.ActionRow(title="PIN")
-        self._pin_entry = Gtk.PasswordEntry()
-        self._pin_entry.set_show_peek_icon(True)
-        self._pin_entry.set_valign(Gtk.Align.CENTER)
-        self._pin_entry.set_hexpand(True)
-        self._pin_entry.connect("activate", lambda _: self._do_enroll())
-        self._pin_row.add_suffix(self._pin_entry)
-        self._group.add(self._pin_row)
-
-        # Enroll button
+        # Enroll button — sits in its own row inside the (last) prefs group
         btn_row = Adw.ActionRow()
-        self._enroll_btn = Gtk.Button(label="Enroll")
+        btn_row.set_focusable(False)
+        self._enroll_btn = Gtk.Button(label=spec.button_label)
         self._enroll_btn.add_css_class("suggested-action")
         self._enroll_btn.set_valign(Gtk.Align.CENTER)
         self._enroll_btn.connect("clicked", lambda _: self._do_enroll())
         btn_row.add_suffix(self._enroll_btn)
-        self._group.add(btn_row)
+        # If setup_inputs created additional groups, prefer the last one for
+        # the button (matches the pre-refactor layout for TPM2). Otherwise use
+        # the main group.
+        button_group = getattr(self, "_button_group", None) or self._group
+        button_group.add(btn_row)
 
-        # Status (outside PreferencesGroup for full-width text)
+        # Status row (full width, outside any prefs group)
         self._spinner = Gtk.Spinner()
-        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
+        self._status_label = Gtk.Label(label="", wrap=True, xalign=0,
+                                       selectable=True)
         self._status_label.set_hexpand(True)
         status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         status_box.set_margin_start(16)
@@ -1854,439 +1868,58 @@ class ManageFido2EnrollPage(Adw.NavigationPage):
         status_box.append(self._status_label)
         self._content_box.append(status_box)
 
-        # Initial scan and subscribe to hidraw udev events
-        self._refresh_devices()
-        self._fetch_enrolled_status()
-        self._udev_client = GUdev.Client(subsystems=["hidraw"])
-        self._udev_signal_id = self._udev_client.connect(
-            "uevent", self._on_udev_event
-        )
+        if spec.show_recovery_key:
+            self._key_label = Gtk.Label(label="", selectable=True, wrap=True,
+                                        xalign=0)
+            self._key_label.add_css_class("title-3")
+            self._key_label.add_css_class("monospace")
+            self._key_label.set_margin_start(16)
+            self._key_label.set_margin_end(16)
+            self._key_label.set_margin_bottom(16)
+            self._content_box.append(self._key_label)
 
-    def _on_udev_event(self, _client, action, _device):
-        """Handle hidraw device add/remove via udev."""
-        if self._is_enrolling:
-            return
-        if action in ("add", "remove"):
-            self._refresh_devices()
-            self._fetch_enrolled_status()
+        spec.post_init(self)
 
-    def _fetch_enrolled_status(self):
-        """Query service for which connected tokens are already enrolled."""
-        dev_paths = [f"/dev/{d[0]}" for d in self._fido2_devices]
-        if not dev_paths:
-            return
-        self._checking_status = True
-        self._enroll_btn.set_sensitive(False)
-        self._pin_row.set_sensitive(False)
-        self._status_label.set_text("Checking enrollment status…")
-        self._status_label.remove_css_class("error")
-        self._status_label.remove_css_class("success")
-        self._spinner.start()
-        def fetch():
-            try:
-                paths = self.svc.check_fido2_enrolled(self.device, dev_paths)
-                names = {p.replace("/dev/", "") for p in paths if p}
-                GLib.idle_add(self._apply_enrolled_status, names)
-            except GLib.Error:
-                GLib.idle_add(self._apply_enrolled_status, set())
-        threading.Thread(target=fetch, daemon=True).start()
-
-    def _apply_enrolled_status(self, server_enrolled):
-        self._checking_status = False
-        self._spinner.stop()
-        self._status_label.set_text("")
-        self._enrolled_devs = server_enrolled
-        self._update_device_ui()
-
-    def _refresh_devices(self):
-        self._fido2_devices = detect_fido2_devices()
-        self._update_device_ui()
-
-    def _update_device_ui(self):
-        """Update the device selector and button sensitivity."""
-        unenrolled = [d for d in self._fido2_devices
-                      if d[0] not in self._enrolled_devs]
-
-        if self._fido2_devices:
-            self._fido2_row.set_visible(True)
-            self._det_row.set_visible(False)
-            labels = []
-            for dev, name in self._fido2_devices:
-                if dev in self._enrolled_devs:
-                    labels.append(f"\u2713 /dev/{dev} — {name}")
-                else:
-                    labels.append(f"/dev/{dev} — {name}")
-            self._fido2_dropdown.set_model(Gtk.StringList.new(labels))
-            self._fido2_dropdown.set_sensitive(len(self._fido2_devices) > 1)
-            # Select the first unenrolled device
-            for i, (dev, _) in enumerate(self._fido2_devices):
-                if dev not in self._enrolled_devs:
-                    self._fido2_dropdown.set_selected(i)
-                    break
-        else:
-            self._fido2_row.set_visible(False)
-            self._det_row.set_visible(True)
-            self._det_row.set_title("No FIDO2 device detected")
-            self._det_row.set_subtitle("Plug in a FIDO2 security key")
-
-        has_unenrolled = len(unenrolled) > 0
-        self._enroll_btn.set_sensitive(has_unenrolled)
-        self._pin_row.set_sensitive(has_unenrolled)
-        self._update_pin_enrolled_hint()
-
-    def _update_pin_enrolled_hint(self):
-        """Show 'Already enrolled' in PIN placeholder when selected device is enrolled."""
-        is_enrolled = False
-        if self._fido2_devices:
-            idx = self._fido2_dropdown.get_selected()
-            if idx is not None and idx < len(self._fido2_devices):
-                dev, _ = self._fido2_devices[idx]
-                is_enrolled = dev in self._enrolled_devs
-
-        if is_enrolled or not self._fido2_devices:
-            self._pin_entry.set_text("")
-            self._pin_entry.set_property(
-                "placeholder-text", "Already enrolled"
-                if is_enrolled else "")
-        else:
-            self._pin_entry.set_property("placeholder-text", "PIN")
-
-    def _on_dropdown_changed(self, dropdown, _pspec):
-        if self._is_enrolling:
-            return
-        idx = dropdown.get_selected()
-        if idx is not None and idx < len(self._fido2_devices):
-            dev, _ = self._fido2_devices[idx]
-            is_enrolled = dev in self._enrolled_devs
-            self._enroll_btn.set_sensitive(not is_enrolled)
-            self._pin_row.set_sensitive(not is_enrolled)
-            if is_enrolled:
-                self._pin_entry.set_text("")
-                self._pin_entry.set_property(
-                    "placeholder-text", "Already enrolled")
-            else:
-                self._pin_entry.set_property("placeholder-text", "PIN")
-
-    def _get_selected_fido2_device(self):
-        unenrolled = [d for d in self._fido2_devices
-                      if d[0] not in self._enrolled_devs]
-        if self._fido2_devices:
-            idx = self._fido2_dropdown.get_selected()
-            if idx is not None and idx < len(self._fido2_devices):
-                dev, _ = self._fido2_devices[idx]
-                if dev not in self._enrolled_devs:
-                    return f"/dev/{dev}"
-            # Fallback: first unenrolled
-            if unenrolled:
-                return f"/dev/{unenrolled[0][0]}"
-        return "auto"
+    def _set_status(self, text, css=None):
+        self._status_label.set_text(text)
+        for cls in ("error", "success"):
+            self._status_label.remove_css_class(cls)
+        if css:
+            self._status_label.add_css_class(css)
 
     def _do_enroll(self):
-        pin = self._pin_entry.get_text()
-        if not pin:
-            self._status_label.set_text("PIN cannot be empty.")
-            self._status_label.add_css_class("error")
+        extra_args, err = self.spec.validate_and_collect(self)
+        if err is not None:
+            self._set_status(err, "error")
             return
-        fido2_dev = self._get_selected_fido2_device()
-        self._is_enrolling = True
-        self._enroll_btn.set_sensitive(False)
-        self._pin_row.set_sensitive(False)
-        self._fido2_row.set_sensitive(False)
-        self._spinner.start()
-        self._status_label.set_text("Enrolling... touch your key if prompted.")
-        self._status_label.remove_css_class("error")
-        self._status_label.remove_css_class("success")
 
-        def do_enroll():
+        self._enroll_btn.set_sensitive(False)
+        self.spec.on_enroll_start(self)
+        self._spinner.start()
+        self._set_status(self.spec.enrolling_label)
+        if self.spec.show_recovery_key:
+            self._key_label.set_text("")
+
+        method = getattr(self.svc, self.spec.service_method)
+        args = (self.device, self.passphrase or "", *extra_args,
+                self.unlock_method, self.unlock_pin)
+
+        def worker():
             try:
-                ok, stdout, stderr = self.svc.enroll_fido2(
-                    self.device, self.passphrase or "", pin, fido2_dev,
-                    self.unlock_method, self.unlock_pin
-                )
+                ok, stdout, stderr = method(*args)
             except GLib.Error as e:
                 ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
             GLib.idle_add(self._on_enroll_done, ok, stdout, stderr)
 
-        threading.Thread(target=do_enroll, daemon=True).start()
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_enroll_done(self, ok, stdout, stderr):
-        self._is_enrolling = False
-        self._spinner.stop()
-        self._fido2_row.set_sensitive(True)
-        self._pin_entry.set_text("")
-        if ok:
-            self._status_label.set_text("FIDO2 key enrolled successfully.")
-            self._status_label.add_css_class("success")
-            self._status_label.remove_css_class("error")
-            self.detail_page.refresh_after_enroll()
-            # Re-fetch enrolled status to update UI
-            self._fetch_enrolled_status()
-        else:
-            msg = stderr or "Enrollment failed."
-            self._status_label.set_text(msg)
-            self._status_label.add_css_class("error")
-            self._status_label.remove_css_class("success")
-            self._enroll_btn.set_sensitive(True)
-            self._pin_row.set_sensitive(True)
-
-
-class ManageTpm2EnrollPage(Adw.NavigationPage):
-    """TPM2 enrollment page for the management view (PIN optional)."""
-
-    def __init__(self, svc, device, passphrase, detail_page,
-                 unlock_method="passphrase", unlock_pin=""):
-        super().__init__(title="Add TPM2")
-        self.svc = svc
-        self.device = device
-        self.passphrase = passphrase
-        self.detail_page = detail_page
-        self.unlock_method = unlock_method
-        self.unlock_pin = unlock_pin
-
-        toolbar_view = Adw.ToolbarView()
-        self.set_child(toolbar_view)
-        toolbar_view.add_top_bar(Adw.HeaderBar())
-
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        toolbar_view.set_content(scroll)
-
-        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        scroll.set_child(content_box)
-
-        prefs = Adw.PreferencesPage()
-        content_box.append(prefs)
-
-        group = Adw.PreferencesGroup(
-            title="TPM2 Enrollment",
-            description="Bind to the TPM2 chip. Select PCR registers to bind.",
-        )
-        prefs.add(group)
-
-        # TPM2 detection
-        tpm2_info = detect_tpm2_device()
-        if tpm2_info:
-            det_row = Adw.ActionRow(title="Detected", subtitle=tpm2_info)
-            group.add(det_row)
-        else:
-            det_row = Adw.ActionRow(title="No TPM2 device detected")
-            group.add(det_row)
-        # Display-only: keep it out of the keyboard tab order.
-        det_row.set_focusable(False)
-
-        # PCR checkboxes
-        self._pcr_group = Adw.PreferencesGroup(title="PCR Registers")
-        pcr_group = self._pcr_group
-        prefs.add(pcr_group)
-        self._pcr_checks = {}
-        for pcr_num, pcr_desc in sorted(TPM2_PCRS.items()):
-            row = Adw.ActionRow(title=f"PCR {pcr_num}", subtitle=pcr_desc)
-            chk = Gtk.CheckButton()
-            chk.set_active(pcr_num in TPM2_DEFAULT_PCRS)
-            chk.set_valign(Gtk.Align.CENTER)
-            row.add_prefix(chk)
-            # Tab should stop on the checkbox itself, not also on the row;
-            # a click anywhere on the row still toggles it (activatable).
-            row.set_focusable(False)
-            row.set_activatable_widget(chk)
-            pcr_group.add(row)
-            self._pcr_checks[pcr_num] = chk
-
-        # PIN (optional)
-        self._pin_group = Adw.PreferencesGroup(
-            title="PIN (Optional)",
-            description="Leave blank to unlock without a PIN.",
-        )
-        pin_group = self._pin_group
-        prefs.add(pin_group)
-
-        self._pin_row = Adw.ActionRow(title="PIN")
-        # The row wraps a text input; Tab should land on the entry, not the row.
-        self._pin_row.set_focusable(False)
-        self._pin_entry = Gtk.PasswordEntry()
-        self._pin_entry.set_show_peek_icon(True)
-        self._pin_entry.set_valign(Gtk.Align.CENTER)
-        self._pin_entry.set_hexpand(True)
-        self._pin_row.add_suffix(self._pin_entry)
-        pin_group.add(self._pin_row)
-
-        self._pin_confirm_row = Adw.ActionRow(title="Confirm PIN")
-        self._pin_confirm_row.set_focusable(False)
-        self._pin_confirm = Gtk.PasswordEntry()
-        self._pin_confirm.set_show_peek_icon(True)
-        self._pin_confirm.set_valign(Gtk.Align.CENTER)
-        self._pin_confirm.set_hexpand(True)
-        self._pin_confirm.connect("activate", lambda _: self._do_enroll())
-        self._pin_confirm_row.add_suffix(self._pin_confirm)
-        pin_group.add(self._pin_confirm_row)
-
-        btn_row = Adw.ActionRow()
-        btn_row.set_focusable(False)
-        self._enroll_btn = Gtk.Button(label="Enroll")
-        self._enroll_btn.add_css_class("suggested-action")
-        self._enroll_btn.set_valign(Gtk.Align.CENTER)
-        self._enroll_btn.connect("clicked", lambda _: self._do_enroll())
-        if not tpm2_info:
-            self._enroll_btn.set_sensitive(False)
-        btn_row.add_suffix(self._enroll_btn)
-        pin_group.add(btn_row)
-
-        # Status (outside PreferencesGroup for full-width text)
-        self._spinner = Gtk.Spinner()
-        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
-        self._status_label.set_hexpand(True)
-        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        status_box.set_margin_start(16)
-        status_box.set_margin_end(16)
-        status_box.set_margin_top(8)
-        status_box.set_margin_bottom(8)
-        status_box.append(self._spinner)
-        status_box.append(self._status_label)
-        content_box.append(status_box)
-
-    def _do_enroll(self):
-        pin = self._pin_entry.get_text()
-        confirm = self._pin_confirm.get_text()
-        if pin and pin != confirm:
-            self._status_label.set_text("PINs do not match.")
-            self._status_label.add_css_class("error")
-            return
-        selected = sorted(n for n, chk in self._pcr_checks.items() if chk.get_active())
-        if not selected:
-            self._status_label.set_text("Select at least one PCR register.")
-            self._status_label.add_css_class("error")
-            return
-        pcrs = "+".join(str(p) for p in selected)
-        self._enroll_btn.set_sensitive(False)
-        self._pcr_group.set_sensitive(False)
-        self._pin_group.set_sensitive(False)
-        self._spinner.start()
-        self._status_label.set_text("Enrolling...")
-        self._status_label.remove_css_class("error")
-        self._status_label.remove_css_class("success")
-
-        def do_enroll():
-            try:
-                ok, stdout, stderr = self.svc.enroll_tpm2(
-                    self.device, self.passphrase or "", pin, pcrs,
-                    self.unlock_method, self.unlock_pin
-                )
-            except GLib.Error as e:
-                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
-            GLib.idle_add(self._on_done, ok, stdout, stderr)
-
-        threading.Thread(target=do_enroll, daemon=True).start()
-
-    def _on_done(self, ok, stdout, stderr):
         self._spinner.stop()
         self._enroll_btn.set_sensitive(True)
-        self._pcr_group.set_sensitive(True)
-        self._pin_group.set_sensitive(True)
+        self.spec.on_enroll_done(self, ok)
         if ok:
-            self._status_label.set_text("TPM2 enrolled successfully.")
-            self._status_label.add_css_class("success")
-            self._status_label.remove_css_class("error")
-            self.detail_page.refresh_after_enroll()
-        else:
-            msg = stderr or "Enrollment failed."
-            self._status_label.set_text(msg)
-            self._status_label.add_css_class("error")
-            self._status_label.remove_css_class("success")
-
-
-class ManageRecoveryEnrollPage(Adw.NavigationPage):
-    """Recovery key enrollment page for the management view."""
-
-    def __init__(self, svc, device, passphrase, detail_page,
-                 unlock_method="passphrase", unlock_pin=""):
-        super().__init__(title="Add Recovery Key")
-        self.svc = svc
-        self.device = device
-        self.passphrase = passphrase
-        self.unlock_method = unlock_method
-        self.unlock_pin = unlock_pin
-        self.detail_page = detail_page
-
-        toolbar_view = Adw.ToolbarView()
-        self.set_child(toolbar_view)
-        toolbar_view.add_top_bar(Adw.HeaderBar())
-
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        toolbar_view.set_content(scroll)
-
-        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        scroll.set_child(content_box)
-
-        prefs = Adw.PreferencesPage()
-        content_box.append(prefs)
-
-        group = Adw.PreferencesGroup(
-            title="Recovery Key",
-            description=(
-                "Generate a recovery key. You MUST write it down and store it safely.\n"
-                "This is your last resort if all other unlock methods are unavailable."
-            ),
-        )
-        prefs.add(group)
-
-        btn_row = Adw.ActionRow()
-        self._enroll_btn = Gtk.Button(label="Generate Recovery Key")
-        self._enroll_btn.add_css_class("suggested-action")
-        self._enroll_btn.set_valign(Gtk.Align.CENTER)
-        self._enroll_btn.connect("clicked", lambda _: self._do_enroll())
-        btn_row.add_suffix(self._enroll_btn)
-        group.add(btn_row)
-
-        # Status and recovery key display (outside PreferencesGroup for full width)
-        self._spinner = Gtk.Spinner()
-        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
-        self._status_label.set_hexpand(True)
-        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        status_box.set_margin_start(16)
-        status_box.set_margin_end(16)
-        status_box.set_margin_top(8)
-        status_box.append(self._spinner)
-        status_box.append(self._status_label)
-        content_box.append(status_box)
-
-        self._key_label = Gtk.Label(label="", selectable=True, wrap=True, xalign=0)
-        self._key_label.add_css_class("title-3")
-        self._key_label.add_css_class("monospace")
-        self._key_label.set_margin_start(16)
-        self._key_label.set_margin_end(16)
-        self._key_label.set_margin_bottom(16)
-        content_box.append(self._key_label)
-
-    def _do_enroll(self):
-        self._enroll_btn.set_sensitive(False)
-        self._spinner.start()
-        self._status_label.set_text("Generating recovery key...")
-        self._status_label.remove_css_class("error")
-        self._status_label.remove_css_class("success")
-        self._key_label.set_text("")
-
-        def do_enroll():
-            try:
-                ok, stdout, stderr = self.svc.enroll_recovery_key(
-                    self.device, self.passphrase or "",
-                    self.unlock_method, self.unlock_pin
-                )
-            except GLib.Error as e:
-                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
-            GLib.idle_add(self._on_done, ok, stdout, stderr)
-
-        threading.Thread(target=do_enroll, daemon=True).start()
-
-    def _on_done(self, ok, stdout, stderr):
-        self._spinner.stop()
-        self._enroll_btn.set_sensitive(True)
-        if ok:
-            self._status_label.set_text("Recovery key generated. Write it down!")
-            self._status_label.add_css_class("success")
-            self._status_label.remove_css_class("error")
-            # Extract recovery key from stdout
-            if stdout:
+            self._set_status(self.spec.success_label, "success")
+            if self.spec.show_recovery_key and stdout:
                 for line in stdout.splitlines():
                     line = line.strip()
                     if line and len(line) > 20 and "-" in line:
@@ -2294,129 +1927,384 @@ class ManageRecoveryEnrollPage(Adw.NavigationPage):
                         break
             self.detail_page.refresh_after_enroll()
         else:
-            msg = stderr or "Failed to generate recovery key."
-            self._status_label.set_text(msg)
-            self._status_label.add_css_class("error")
-            self._status_label.remove_css_class("success")
+            self._set_status(stderr or self.spec.failure_default, "error")
 
 
-class ManagePassphraseEnrollPage(Adw.NavigationPage):
-    """Passphrase enrollment page for the management view."""
+# --- FIDO2 spec ------------------------------------------------------------
 
-    def __init__(self, svc, device, passphrase, detail_page,
-                 unlock_method="passphrase", unlock_pin=""):
-        super().__init__(title="Add Password")
-        self.svc = svc
-        self.device = device
-        self.passphrase = passphrase
-        self.detail_page = detail_page
-        self.unlock_method = unlock_method
-        self.unlock_pin = unlock_pin
 
-        toolbar_view = Adw.ToolbarView()
-        self.set_child(toolbar_view)
-        toolbar_view.add_top_bar(Adw.HeaderBar())
+def _fido2_setup_inputs(page, group):
+    page._fido2_devices = []
+    page._enrolled_devs = set()
+    page._is_enrolling = False
+    page._checking_status = False
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        toolbar_view.set_content(scroll)
+    page._fido2_row = Adw.ActionRow(title="FIDO2 Device")
+    page._fido2_dropdown = Gtk.DropDown()
+    page._fido2_dropdown.set_valign(Gtk.Align.CENTER)
+    page._fido2_dropdown.connect("notify::selected",
+                                 lambda d, p: _fido2_on_dropdown_changed(page, d))
+    page._fido2_row.add_suffix(page._fido2_dropdown)
+    group.add(page._fido2_row)
 
-        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        scroll.set_child(content_box)
+    page._det_row = Adw.ActionRow(title="No FIDO2 device detected",
+                                  subtitle="Plug in a FIDO2 security key")
+    group.add(page._det_row)
 
-        prefs = Adw.PreferencesPage()
-        content_box.append(prefs)
+    page._pin_row = Adw.ActionRow(title="PIN")
+    page._pin_entry = Gtk.PasswordEntry()
+    page._pin_entry.set_show_peek_icon(True)
+    page._pin_entry.set_valign(Gtk.Align.CENTER)
+    page._pin_entry.set_hexpand(True)
+    page._pin_entry.connect("activate", lambda _: page._do_enroll())
+    page._pin_row.add_suffix(page._pin_entry)
+    group.add(page._pin_row)
 
-        group = Adw.PreferencesGroup(
-            title="Add Password",
-            description="Add a new passphrase keyslot to the device.",
-        )
-        prefs.add(group)
 
-        self._pw_row = Adw.ActionRow(title="New Passphrase")
-        self._pw_entry = Gtk.PasswordEntry()
-        self._pw_entry.set_show_peek_icon(True)
-        self._pw_entry.set_valign(Gtk.Align.CENTER)
-        self._pw_entry.set_hexpand(True)
-        self._pw_row.add_suffix(self._pw_entry)
-        group.add(self._pw_row)
+def _fido2_get_selected_device(page):
+    unenrolled = [d for d in page._fido2_devices
+                  if d[0] not in page._enrolled_devs]
+    if page._fido2_devices:
+        idx = page._fido2_dropdown.get_selected()
+        if idx is not None and idx < len(page._fido2_devices):
+            dev, _ = page._fido2_devices[idx]
+            if dev not in page._enrolled_devs:
+                return f"/dev/{dev}"
+        if unenrolled:
+            return f"/dev/{unenrolled[0][0]}"
+    return "auto"
 
-        self._pw_confirm_row = Adw.ActionRow(title="Confirm Passphrase")
-        self._pw_confirm = Gtk.PasswordEntry()
-        self._pw_confirm.set_show_peek_icon(True)
-        self._pw_confirm.set_valign(Gtk.Align.CENTER)
-        self._pw_confirm.set_hexpand(True)
-        self._pw_confirm.connect("activate", lambda _: self._do_enroll())
-        self._pw_confirm_row.add_suffix(self._pw_confirm)
-        group.add(self._pw_confirm_row)
 
-        btn_row = Adw.ActionRow()
-        self._enroll_btn = Gtk.Button(label="Add Password")
-        self._enroll_btn.add_css_class("suggested-action")
-        self._enroll_btn.set_valign(Gtk.Align.CENTER)
-        self._enroll_btn.connect("clicked", lambda _: self._do_enroll())
-        btn_row.add_suffix(self._enroll_btn)
-        group.add(btn_row)
+def _fido2_validate(page):
+    pin = page._pin_entry.get_text()
+    if not pin:
+        return None, "PIN cannot be empty."
+    return (pin, _fido2_get_selected_device(page)), None
 
-        # Status (outside PreferencesGroup for full-width text)
-        self._spinner = Gtk.Spinner()
-        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
-        self._status_label.set_hexpand(True)
-        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        status_box.set_margin_start(16)
-        status_box.set_margin_end(16)
-        status_box.set_margin_top(8)
-        status_box.set_margin_bottom(8)
-        status_box.append(self._spinner)
-        status_box.append(self._status_label)
-        content_box.append(status_box)
 
-    def _do_enroll(self):
-        pw = self._pw_entry.get_text()
-        confirm = self._pw_confirm.get_text()
-        if not pw:
-            self._status_label.set_text("Passphrase cannot be empty.")
-            self._status_label.add_css_class("error")
-            return
-        if pw != confirm:
-            self._status_label.set_text("Passphrases do not match.")
-            self._status_label.add_css_class("error")
-            return
-        self._enroll_btn.set_sensitive(False)
-        self._pw_row.set_sensitive(False)
-        self._pw_confirm_row.set_sensitive(False)
-        self._spinner.start()
-        self._status_label.set_text("Adding passphrase...")
-        self._status_label.remove_css_class("error")
-        self._status_label.remove_css_class("success")
+def _fido2_on_enroll_start(page):
+    page._is_enrolling = True
+    page._pin_row.set_sensitive(False)
+    page._fido2_row.set_sensitive(False)
 
-        def do_enroll():
-            try:
-                ok, stdout, stderr = self.svc.enroll_passphrase(
-                    self.device, self.passphrase or "", pw,
-                    self.unlock_method, self.unlock_pin
-                )
-            except GLib.Error as e:
-                ok, stdout, stderr = False, "", f"D-Bus error: {e.message}"
-            GLib.idle_add(self._on_done, ok, stdout, stderr)
 
-        threading.Thread(target=do_enroll, daemon=True).start()
+def _fido2_on_enroll_done(page, ok):
+    page._is_enrolling = False
+    page._fido2_row.set_sensitive(True)
+    page._pin_entry.set_text("")
+    if ok:
+        _fido2_fetch_enrolled_status(page)
+    else:
+        page._pin_row.set_sensitive(True)
 
-    def _on_done(self, ok, stdout, stderr):
-        self._spinner.stop()
-        self._enroll_btn.set_sensitive(True)
-        self._pw_row.set_sensitive(True)
-        self._pw_confirm_row.set_sensitive(True)
-        if ok:
-            self._status_label.set_text("Passphrase added successfully.")
-            self._status_label.add_css_class("success")
-            self._status_label.remove_css_class("error")
-            self.detail_page.refresh_after_enroll()
+
+def _fido2_update_pin_hint(page):
+    is_enrolled = False
+    if page._fido2_devices:
+        idx = page._fido2_dropdown.get_selected()
+        if idx is not None and idx < len(page._fido2_devices):
+            dev, _ = page._fido2_devices[idx]
+            is_enrolled = dev in page._enrolled_devs
+    if is_enrolled or not page._fido2_devices:
+        page._pin_entry.set_text("")
+        page._pin_entry.set_property(
+            "placeholder-text", "Already enrolled" if is_enrolled else "")
+    else:
+        page._pin_entry.set_property("placeholder-text", "PIN")
+
+
+def _fido2_update_device_ui(page):
+    unenrolled = [d for d in page._fido2_devices
+                  if d[0] not in page._enrolled_devs]
+    if page._fido2_devices:
+        page._fido2_row.set_visible(True)
+        page._det_row.set_visible(False)
+        labels = []
+        for dev, name in page._fido2_devices:
+            mark = "✓ " if dev in page._enrolled_devs else ""
+            labels.append(f"{mark}/dev/{dev} — {name}")
+        page._fido2_dropdown.set_model(Gtk.StringList.new(labels))
+        page._fido2_dropdown.set_sensitive(len(page._fido2_devices) > 1)
+        for i, (dev, _) in enumerate(page._fido2_devices):
+            if dev not in page._enrolled_devs:
+                page._fido2_dropdown.set_selected(i)
+                break
+    else:
+        page._fido2_row.set_visible(False)
+        page._det_row.set_visible(True)
+        page._det_row.set_title("No FIDO2 device detected")
+        page._det_row.set_subtitle("Plug in a FIDO2 security key")
+    has_unenrolled = len(unenrolled) > 0
+    page._enroll_btn.set_sensitive(has_unenrolled)
+    page._pin_row.set_sensitive(has_unenrolled)
+    _fido2_update_pin_hint(page)
+
+
+def _fido2_on_dropdown_changed(page, dropdown):
+    if page._is_enrolling:
+        return
+    idx = dropdown.get_selected()
+    if idx is not None and idx < len(page._fido2_devices):
+        dev, _ = page._fido2_devices[idx]
+        is_enrolled = dev in page._enrolled_devs
+        page._enroll_btn.set_sensitive(not is_enrolled)
+        page._pin_row.set_sensitive(not is_enrolled)
+        if is_enrolled:
+            page._pin_entry.set_text("")
+            page._pin_entry.set_property("placeholder-text", "Already enrolled")
         else:
-            msg = stderr or "Failed to add passphrase."
-            self._status_label.set_text(msg)
-            self._status_label.add_css_class("error")
-            self._status_label.remove_css_class("success")
+            page._pin_entry.set_property("placeholder-text", "PIN")
+
+
+def _fido2_fetch_enrolled_status(page):
+    dev_paths = [f"/dev/{d[0]}" for d in page._fido2_devices]
+    if not dev_paths:
+        return
+    page._checking_status = True
+    page._enroll_btn.set_sensitive(False)
+    page._pin_row.set_sensitive(False)
+    page._set_status("Checking enrollment status…")
+    page._spinner.start()
+
+    def fetch():
+        try:
+            paths = page.svc.check_fido2_enrolled(page.device, dev_paths)
+            names = {p.replace("/dev/", "") for p in paths if p}
+        except GLib.Error:
+            names = set()
+        GLib.idle_add(_fido2_apply_status, page, names)
+
+    threading.Thread(target=fetch, daemon=True).start()
+
+
+def _fido2_apply_status(page, server_enrolled):
+    page._checking_status = False
+    page._spinner.stop()
+    page._set_status("")
+    page._enrolled_devs = server_enrolled
+    _fido2_update_device_ui(page)
+
+
+def _fido2_refresh_devices(page):
+    page._fido2_devices = detect_fido2_devices()
+    _fido2_update_device_ui(page)
+
+
+def _fido2_post_init(page):
+    _fido2_refresh_devices(page)
+    _fido2_fetch_enrolled_status(page)
+    page._udev_client = GUdev.Client(subsystems=["hidraw"])
+
+    def on_uevent(_client, action, _device):
+        if page._is_enrolling:
+            return
+        if action in ("add", "remove"):
+            _fido2_refresh_devices(page)
+            _fido2_fetch_enrolled_status(page)
+
+    page._udev_signal_id = page._udev_client.connect("uevent", on_uevent)
+
+
+FIDO2_SPEC = EnrollSpec(
+    name="fido2",
+    title="Add FIDO2 Key",
+    group_title="FIDO2 Security Key",
+    group_description="Enter your FIDO2 token's PIN. You may need to touch the key.",
+    button_label="Enroll",
+    enrolling_label="Enrolling... touch your key if prompted.",
+    success_label="FIDO2 key enrolled successfully.",
+    failure_default="Enrollment failed.",
+    service_method="enroll_fido2",
+    setup_inputs=_fido2_setup_inputs,
+    validate_and_collect=_fido2_validate,
+    on_enroll_start=_fido2_on_enroll_start,
+    on_enroll_done=_fido2_on_enroll_done,
+    post_init=_fido2_post_init,
+)
+
+
+# --- TPM2 spec -------------------------------------------------------------
+
+
+def _tpm2_setup_inputs(page, group):
+    tpm2_info = detect_tpm2_device()
+    if tpm2_info:
+        det_row = Adw.ActionRow(title="Detected", subtitle=tpm2_info)
+    else:
+        det_row = Adw.ActionRow(title="No TPM2 device detected")
+    det_row.set_focusable(False)
+    group.add(det_row)
+    page._tpm2_present = bool(tpm2_info)
+
+    page._pcr_group = Adw.PreferencesGroup(title="PCR Registers")
+    page._prefs.add(page._pcr_group)
+    page._pcr_checks = {}
+    for pcr_num, pcr_desc in sorted(TPM2_PCRS.items()):
+        row = Adw.ActionRow(title=f"PCR {pcr_num}", subtitle=pcr_desc)
+        row.set_focusable(False)
+        chk = Gtk.CheckButton()
+        chk.set_active(pcr_num in TPM2_DEFAULT_PCRS)
+        chk.set_valign(Gtk.Align.CENTER)
+        row.add_prefix(chk)
+        row.set_activatable_widget(chk)
+        page._pcr_group.add(row)
+        page._pcr_checks[pcr_num] = chk
+
+    page._pin_group = Adw.PreferencesGroup(
+        title="PIN (Optional)",
+        description="Leave blank to unlock without a PIN.",
+    )
+    page._prefs.add(page._pin_group)
+
+    page._pin_row = Adw.ActionRow(title="PIN")
+    page._pin_row.set_focusable(False)
+    page._pin_entry = Gtk.PasswordEntry()
+    page._pin_entry.set_show_peek_icon(True)
+    page._pin_entry.set_valign(Gtk.Align.CENTER)
+    page._pin_entry.set_hexpand(True)
+    page._pin_row.add_suffix(page._pin_entry)
+    page._pin_group.add(page._pin_row)
+
+    page._pin_confirm_row = Adw.ActionRow(title="Confirm PIN")
+    page._pin_confirm_row.set_focusable(False)
+    page._pin_confirm = Gtk.PasswordEntry()
+    page._pin_confirm.set_show_peek_icon(True)
+    page._pin_confirm.set_valign(Gtk.Align.CENTER)
+    page._pin_confirm.set_hexpand(True)
+    page._pin_confirm.connect("activate", lambda _: page._do_enroll())
+    page._pin_confirm_row.add_suffix(page._pin_confirm)
+    page._pin_group.add(page._pin_confirm_row)
+
+    # Place the enroll button inside the PIN group
+    page._button_group = page._pin_group
+
+
+def _tpm2_validate(page):
+    pin = page._pin_entry.get_text()
+    confirm = page._pin_confirm.get_text()
+    if pin and pin != confirm:
+        return None, "PINs do not match."
+    selected = sorted(n for n, chk in page._pcr_checks.items()
+                      if chk.get_active())
+    if not selected:
+        return None, "Select at least one PCR register."
+    pcrs = "+".join(str(p) for p in selected)
+    return (pin, pcrs), None
+
+
+def _tpm2_on_enroll_start(page):
+    page._pcr_group.set_sensitive(False)
+    page._pin_group.set_sensitive(False)
+
+
+def _tpm2_on_enroll_done(page, ok):
+    page._pcr_group.set_sensitive(True)
+    page._pin_group.set_sensitive(True)
+
+
+def _tpm2_post_init(page):
+    if not page._tpm2_present:
+        page._enroll_btn.set_sensitive(False)
+
+
+TPM2_SPEC = EnrollSpec(
+    name="tpm2",
+    title="Add TPM2",
+    group_title="TPM2 Enrollment",
+    group_description="Bind to the TPM2 chip. Select PCR registers to bind.",
+    button_label="Enroll",
+    enrolling_label="Enrolling...",
+    success_label="TPM2 enrolled successfully.",
+    failure_default="Enrollment failed.",
+    service_method="enroll_tpm2",
+    setup_inputs=_tpm2_setup_inputs,
+    validate_and_collect=_tpm2_validate,
+    on_enroll_start=_tpm2_on_enroll_start,
+    on_enroll_done=_tpm2_on_enroll_done,
+    post_init=_tpm2_post_init,
+)
+
+
+# --- Recovery spec ---------------------------------------------------------
+
+
+RECOVERY_SPEC = EnrollSpec(
+    name="recovery",
+    title="Add Recovery Key",
+    group_title="Recovery Key",
+    group_description=(
+        "Generate a recovery key. You MUST write it down and store it safely.\n"
+        "This is your last resort if all other unlock methods are unavailable."
+    ),
+    button_label="Generate Recovery Key",
+    enrolling_label="Generating recovery key...",
+    success_label="Recovery key generated. Write it down!",
+    failure_default="Failed to generate recovery key.",
+    service_method="enroll_recovery_key",
+    show_recovery_key=True,
+)
+
+
+# --- Passphrase spec -------------------------------------------------------
+
+
+def _passphrase_setup_inputs(page, group):
+    page._pw_row = Adw.ActionRow(title="New Passphrase")
+    page._pw_entry = Gtk.PasswordEntry()
+    page._pw_entry.set_show_peek_icon(True)
+    page._pw_entry.set_valign(Gtk.Align.CENTER)
+    page._pw_entry.set_hexpand(True)
+    page._pw_row.add_suffix(page._pw_entry)
+    group.add(page._pw_row)
+
+    page._pw_confirm_row = Adw.ActionRow(title="Confirm Passphrase")
+    page._pw_confirm = Gtk.PasswordEntry()
+    page._pw_confirm.set_show_peek_icon(True)
+    page._pw_confirm.set_valign(Gtk.Align.CENTER)
+    page._pw_confirm.set_hexpand(True)
+    page._pw_confirm.connect("activate", lambda _: page._do_enroll())
+    page._pw_confirm_row.add_suffix(page._pw_confirm)
+    group.add(page._pw_confirm_row)
+
+
+def _passphrase_validate(page):
+    pw = page._pw_entry.get_text()
+    confirm = page._pw_confirm.get_text()
+    if not pw:
+        return None, "Passphrase cannot be empty."
+    if pw != confirm:
+        return None, "Passphrases do not match."
+    return (pw,), None
+
+
+def _passphrase_on_enroll_start(page):
+    page._pw_row.set_sensitive(False)
+    page._pw_confirm_row.set_sensitive(False)
+
+
+def _passphrase_on_enroll_done(page, ok):
+    page._pw_row.set_sensitive(True)
+    page._pw_confirm_row.set_sensitive(True)
+
+
+PASSPHRASE_SPEC = EnrollSpec(
+    name="passphrase",
+    title="Add Password",
+    group_title="Add Password",
+    group_description="Add a new passphrase keyslot to the device.",
+    button_label="Add Password",
+    enrolling_label="Adding passphrase...",
+    success_label="Passphrase added successfully.",
+    failure_default="Failed to add passphrase.",
+    service_method="enroll_passphrase",
+    setup_inputs=_passphrase_setup_inputs,
+    validate_and_collect=_passphrase_validate,
+    on_enroll_start=_passphrase_on_enroll_start,
+    on_enroll_done=_passphrase_on_enroll_done,
+)
+
+
+ENROLL_SPECS = [FIDO2_SPEC, TPM2_SPEC, RECOVERY_SPEC, PASSPHRASE_SPEC]
 
 
 class ManagementWindow(Adw.ApplicationWindow):
