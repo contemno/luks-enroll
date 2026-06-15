@@ -490,6 +490,26 @@ def detect_tpm2_device():
         return "TPM2 detected"
 
 
+# TPM2 PCR descriptions, used by the TPM2 enrollment page.
+TPM2_PCRS = {
+    0: "Core system firmware (BIOS/UEFI)",
+    1: "Platform configuration (firmware settings)",
+    2: "Option ROM code",
+    3: "Option ROM configuration and data",
+    4: "Boot loader and additional components",
+    5: "Boot loader configuration (e.g. GRUB config)",
+    7: "Secure Boot state (certificates, keys)",
+    8: "Kernel command line (grub.cfg entries)",
+    9: "Kernel image, initrd, and other boot files",
+    11: "Unified kernel image components",
+    12: "Kernel command line (overrides)",
+    14: "MOK certificates and shim state",
+}
+
+# Default PCRs that systemd-cryptenroll uses.
+TPM2_DEFAULT_PCRS = {7}
+
+
 # ---------------------------------------------------------------------------
 # Management Window
 # ---------------------------------------------------------------------------
