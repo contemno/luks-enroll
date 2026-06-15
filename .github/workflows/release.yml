@@ -112,9 +112,22 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Create GitHub Release
+      # This repository uses immutable releases: assets can only be
+      # attached while the release is a draft, so create the draft with
+      # the assets first and flip it to published as a separate step.
+      - name: Create draft release with assets
+        id: draft_release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe  # v2.6.1
         with:
           files: artifacts/*.deb
           generate_release_notes: true
           prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
+          draft: true
+
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${{ steps.draft_release.outputs.id }}" \
+            -F draft=false --jq .html_url
