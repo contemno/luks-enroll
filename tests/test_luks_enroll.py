@@ -97,6 +97,43 @@ class TestProxyServiceConsistency(unittest.TestCase):
         self.assertEqual(missing, set(), f"Proxy calls methods not in XML: {missing}")
 
 
+class TestEnrollSpecConsistency(unittest.TestCase):
+    """Every enrollment spec must point at a real proxy method."""
+
+    def test_specs_cover_all_four_enrollment_types(self):
+        names = {s.name for s in gui.ENROLL_SPECS}
+        self.assertEqual(names, {"fido2", "tpm2", "recovery", "passphrase"})
+
+    def test_each_spec_has_proxy_method(self):
+        for spec in gui.ENROLL_SPECS:
+            method = getattr(gui.LuksEnrollProxy, spec.service_method, None)
+            self.assertTrue(
+                callable(method),
+                f"spec {spec.name!r} references "
+                f"missing proxy method {spec.service_method!r}",
+            )
+
+    def test_each_spec_required_attrs_are_strings(self):
+        required = (
+            "name",
+            "title",
+            "group_title",
+            "group_description",
+            "button_label",
+            "enrolling_label",
+            "success_label",
+            "failure_default",
+            "service_method",
+        )
+        for spec in gui.ENROLL_SPECS:
+            for attr in required:
+                self.assertIsInstance(
+                    getattr(spec, attr),
+                    str,
+                    f"spec {spec.name!r} attr {attr!r} must be a str",
+                )
+
+
 # ===========================================================================
 # Recovery key generation
 # ===========================================================================
