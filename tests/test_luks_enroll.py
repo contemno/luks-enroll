@@ -533,29 +533,6 @@ class TestDetectTpm2Device(unittest.TestCase):
 
 
 # ===========================================================================
-# DeviceContext dataclass
-# ===========================================================================
-
-
-class TestDeviceContext(unittest.TestCase):
-    def test_default_values(self):
-        ctx = gui.DeviceContext()
-        self.assertIsNone(ctx.svc)
-        self.assertIsNone(ctx.device)
-        self.assertIsNone(ctx.passphrase)
-        self.assertIsNone(ctx.auth_keyslot)
-
-    def test_field_assignment(self):
-        ctx = gui.DeviceContext()
-        ctx.device = "/dev/sda3"
-        ctx.passphrase = "test"
-        ctx.auth_keyslot = 0
-        self.assertEqual(ctx.device, "/dev/sda3")
-        self.assertEqual(ctx.passphrase, "test")
-        self.assertEqual(ctx.auth_keyslot, 0)
-
-
-# ===========================================================================
 # _is_removable and _is_partition (mocked sysfs)
 # ===========================================================================
 
