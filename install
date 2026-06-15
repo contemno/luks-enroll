@@ -8,7 +8,6 @@
 set -euo pipefail
 
 CHROOT="${1:-}"
-AUTOSTART_DIR="${CHROOT}/etc/xdg/autostart"
 POLKIT_DIR="${CHROOT}/usr/share/polkit-1/actions"
 DBUS_CONF_DIR="${CHROOT}/usr/share/dbus-1/system.d"
 DBUS_SERVICE_DIR="${CHROOT}/usr/share/dbus-1/system-services"
@@ -29,9 +28,6 @@ install -Dm644 "${SCRIPT_DIR}/data/net.contemno.luks_enroll.conf" "${DBUS_CONF_D
 
 # Install D-Bus system service activation file
 install -Dm644 "${SCRIPT_DIR}/data/net.contemno.LuksEnroll.service" "${DBUS_SERVICE_DIR}/net.contemno.LuksEnroll.service"
-
-# Install desktop autostart entry (first-login wizard)
-install -Dm644 "${SCRIPT_DIR}/data/luks-enroll-firstlogin.desktop" "${AUTOSTART_DIR}/luks-enroll-firstlogin.desktop"
 
 # Install desktop launcher entry (management view)
 APPS_DIR="${CHROOT}/usr/share/applications"
@@ -61,5 +57,4 @@ if [ -n "${CHROOT}" ]; then
     fi
 fi
 
-echo "==> Done. The wizard will launch on first login via autostart."
-echo "    To run manually: luks-enroll"
+echo "==> Done. To run: luks-enroll"

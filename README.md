@@ -123,11 +123,8 @@ sudo ./install /mnt/chroot  # into a chroot
 ## Usage
 
 ```sh
-luks-enroll                 # management view (default)
-luks-enroll --first-login   # first-login enrollment wizard
+luks-enroll                 # management view
 ```
-
-The wizard launches automatically on first login via the XDG autostart entry.
 
 ## Development
 

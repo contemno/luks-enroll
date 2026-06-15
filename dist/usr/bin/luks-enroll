@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""LUKS Enroll Wizard — guides first-login enrollment of FIDO2, TPM2, and
-recovery key into the LUKS root volume, then removes the password keyslot.
+"""LUKS Enroll — manage FIDO2, TPM2, recovery, and passphrase enrollments
+on LUKS volumes.
 
 This is an unprivileged GUI client that talks to the luks-enroll-service
 D-Bus system service for all privileged operations."""
@@ -4024,12 +4024,11 @@ CSS = b"""
 
 
 class LuksEnrollApp(Adw.Application):
-    def __init__(self, mode="manage"):
+    def __init__(self):
         super().__init__(
             application_id="net.contemno.luks-enroll",
             flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
         )
-        self.mode = mode
 
     def do_activate(self):
         css = Gtk.CssProvider()
@@ -4043,24 +4042,14 @@ class LuksEnrollApp(Adw.Application):
             css,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
-        if self.mode == "first-login":
-            win = WizardWindow(self)
-        else:
-            win = ManagementWindow(self)
+        win = ManagementWindow(self)
         win.present()
 
 
 def main():
     parser = argparse.ArgumentParser(description="LUKS Disk Encryption Manager")
-    parser.add_argument(
-        "--first-login",
-        action="store_true",
-        help="Run the first-login enrollment wizard",
-    )
-    args, gtk_args = parser.parse_known_args()
-
-    mode = "first-login" if args.first_login else "manage"
-    app = LuksEnrollApp(mode=mode)
+    _, gtk_args = parser.parse_known_args()
+    app = LuksEnrollApp()
     app.run([sys.argv[0]] + gtk_args)
 
 
