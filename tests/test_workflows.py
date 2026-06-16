@@ -10,44 +10,17 @@ Run: python3 -m pytest test_workflows.py -v
 """
 
 import base64
-import importlib.util
 import json
 import os
-import sys
 import tempfile
 import time
 import unittest
-from importlib.machinery import SourceFileLoader
 from unittest import mock
 
-
-# ---------------------------------------------------------------------------
-# Module import — same approach as test_luks_enroll.py
-# ---------------------------------------------------------------------------
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVICE_PATH = os.path.join(ROOT, "dist", "usr", "sbin", "luks-enroll-service")
+from conftest import SERVICE_PATH, load_module
 
 
-def _import_service():
-    mod_name = "luks_enroll_service"
-    loader = SourceFileLoader(mod_name, SERVICE_PATH)
-    spec = importlib.util.spec_from_loader(mod_name, loader)
-    fake_gi = mock.MagicMock()
-    mod = importlib.util.module_from_spec(spec)
-    with mock.patch.dict(
-        sys.modules,
-        {
-            "gi": fake_gi,
-            "gi.repository": fake_gi.repository,
-            mod_name: mod,
-        },
-    ):
-        spec.loader.exec_module(mod)
-    return mod
-
-
-svc = _import_service()
+svc = load_module("luks_enroll_service", SERVICE_PATH)
 
 
 # ---------------------------------------------------------------------------

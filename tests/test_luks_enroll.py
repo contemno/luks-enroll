@@ -11,48 +11,20 @@ import ast
 import base64
 import configparser
 import glob  # noqa: F401  pre-import so sys.modules patching doesn't evict it
-import importlib
 import os
 import re
 import struct
-import sys
 import tempfile
 import unittest
-from importlib.machinery import SourceFileLoader
 from unittest import mock
 from xml.etree import ElementTree
 
-
-# ---------------------------------------------------------------------------
-# Import helpers — mock heavy system deps so modules can be imported
-# ---------------------------------------------------------------------------
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVICE_PATH = os.path.join(ROOT, "dist", "usr", "sbin", "luks-enroll-service")
-GUI_PATH = os.path.join(ROOT, "dist", "usr", "bin", "luks-enroll")
-
-
-def _load_module(mod_name, path):
-    loader = SourceFileLoader(mod_name, path)
-    spec = importlib.util.spec_from_loader(mod_name, loader)
-    fake_gi = mock.MagicMock()
-    mod = importlib.util.module_from_spec(spec)
-    # Register the module before exec so dataclass can resolve __module__
-    with mock.patch.dict(
-        sys.modules,
-        {
-            "gi": fake_gi,
-            "gi.repository": fake_gi.repository,
-            mod_name: mod,
-        },
-    ):
-        spec.loader.exec_module(mod)
-    return mod
+from conftest import GUI_PATH, SERVICE_PATH, load_module
 
 
 # Import both modules once at module scope
-svc = _load_module("luks_enroll_service", SERVICE_PATH)
-gui = _load_module("luks_enroll", GUI_PATH)
+svc = load_module("luks_enroll_service", SERVICE_PATH)
+gui = load_module("luks_enroll", GUI_PATH)
 
 
 # ===========================================================================
@@ -123,6 +95,55 @@ class TestProxyServiceConsistency(unittest.TestCase):
 
         missing = called_methods - xml_methods
         self.assertEqual(missing, set(), f"Proxy calls methods not in XML: {missing}")
+
+
+class TestEnrollSpecConsistency(unittest.TestCase):
+    """Every enrollment spec must point at a real proxy method."""
+
+    def test_specs_cover_all_four_enrollment_types(self):
+        names = {s.name for s in gui.ENROLL_SPECS}
+        self.assertEqual(names, {"fido2", "tpm2", "recovery", "passphrase"})
+
+    def test_tpm2_pcr_constants_present(self):
+        # Regression: TPM2_PCRS / TPM2_DEFAULT_PCRS were defined inside the
+        # wizard block deleted in Phase 2; the management TPM2 page needs
+        # them and would crash with NameError on click otherwise.
+        self.assertIsInstance(gui.TPM2_PCRS, dict)
+        self.assertGreater(len(gui.TPM2_PCRS), 0)
+        self.assertIsInstance(gui.TPM2_DEFAULT_PCRS, set)
+        self.assertTrue(
+            gui.TPM2_DEFAULT_PCRS.issubset(gui.TPM2_PCRS.keys()),
+            "every default PCR must be a key in TPM2_PCRS",
+        )
+
+    def test_each_spec_has_proxy_method(self):
+        for spec in gui.ENROLL_SPECS:
+            method = getattr(gui.LuksEnrollProxy, spec.service_method, None)
+            self.assertTrue(
+                callable(method),
+                f"spec {spec.name!r} references "
+                f"missing proxy method {spec.service_method!r}",
+            )
+
+    def test_each_spec_required_attrs_are_strings(self):
+        required = (
+            "name",
+            "title",
+            "group_title",
+            "group_description",
+            "button_label",
+            "enrolling_label",
+            "success_label",
+            "failure_default",
+            "service_method",
+        )
+        for spec in gui.ENROLL_SPECS:
+            for attr in required:
+                self.assertIsInstance(
+                    getattr(spec, attr),
+                    str,
+                    f"spec {spec.name!r} attr {attr!r} must be a str",
+                )
 
 
 # ===========================================================================
@@ -558,29 +579,6 @@ class TestDetectTpm2Device(unittest.TestCase):
         with mock.patch("builtins.open", mock.mock_open(read_data="1\n")):
             result = gui.detect_tpm2_device()
         self.assertIsNone(result)
-
-
-# ===========================================================================
-# DeviceContext dataclass
-# ===========================================================================
-
-
-class TestDeviceContext(unittest.TestCase):
-    def test_default_values(self):
-        ctx = gui.DeviceContext()
-        self.assertIsNone(ctx.svc)
-        self.assertIsNone(ctx.device)
-        self.assertIsNone(ctx.passphrase)
-        self.assertIsNone(ctx.auth_keyslot)
-
-    def test_field_assignment(self):
-        ctx = gui.DeviceContext()
-        ctx.device = "/dev/sda3"
-        ctx.passphrase = "test"
-        ctx.auth_keyslot = 0
-        self.assertEqual(ctx.device, "/dev/sda3")
-        self.assertEqual(ctx.passphrase, "test")
-        self.assertEqual(ctx.auth_keyslot, 0)
 
 
 # ===========================================================================
