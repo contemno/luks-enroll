@@ -397,6 +397,57 @@ class TestFindTokensByType(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+class TestExtractVolumeKey(unittest.TestCase):
+    """Token unlock should target the token's keyslot, not try all (issue #16)."""
+
+    class _FakeLib:
+        """Models crypt_volume_key_get: a query of -1 (try all) or the exact
+        unlocking keyslot succeeds and returns that keyslot; anything else
+        fails with -1."""
+
+        def __init__(self, success_slot):
+            self.success_slot = success_slot
+            self.tried = []
+
+        def crypt_get_volume_key_size(self, cd):
+            return 64
+
+        def crypt_volume_key_get(self, cd, slot, vk_buf, key_size, pw, pwlen):
+            self.tried.append(slot)
+            if slot in (-1, self.success_slot):
+                return self.success_slot
+            return -1
+
+    @mock.patch.object(svc, "_get_luks_json", return_value=SAMPLE_LUKS_JSON)
+    def test_targets_token_keyslot_only(self, _mock):
+        # systemd-tpm2 token is bound to keyslot 1; should try only slot 1.
+        lib = self._FakeLib(success_slot=1)
+        ret, vk = svc._extract_volume_key(lib, object(), "/dev/fake",
+                                          "systemd-tpm2", b"pw")
+        self.assertEqual(ret, 1)
+        self.assertEqual(len(vk), 64)
+        self.assertEqual(lib.tried, [1])  # never fell back to -1 (slow path)
+
+    @mock.patch.object(svc, "_get_luks_json", return_value=SAMPLE_LUKS_JSON)
+    def test_falls_back_to_all_slots_when_token_slot_fails(self, _mock):
+        # Token claims slot 1 but the key actually lives in slot 2; the
+        # helper must retry with -1 so correctness is preserved.
+        lib = self._FakeLib(success_slot=2)
+        ret, vk = svc._extract_volume_key(lib, object(), "/dev/fake",
+                                          "systemd-tpm2", b"pw")
+        self.assertEqual(ret, 2)
+        self.assertEqual(lib.tried, [1, -1])
+
+    @mock.patch.object(svc, "_get_luks_json", return_value=SAMPLE_LUKS_JSON)
+    def test_uses_all_slots_when_no_token_keyslots(self, _mock):
+        # No systemd-recovery token in sample -> no candidates -> try -1.
+        lib = self._FakeLib(success_slot=0)
+        ret, vk = svc._extract_volume_key(lib, object(), "/dev/fake",
+                                          "systemd-recovery", b"pw")
+        self.assertEqual(ret, 0)
+        self.assertEqual(lib.tried, [-1])
+
+
 class TestFindPasswordKeyslots(unittest.TestCase):
     @mock.patch.object(svc, "_get_luks_json", return_value=SAMPLE_LUKS_JSON)
     def test_finds_unmanaged_slots(self, _mock):
