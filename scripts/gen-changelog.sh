@@ -72,8 +72,26 @@ emit_stanza() {
 tags="$(git tag --list 'v*' --sort=-v:refname)"
 out=""
 
-# UNRELEASED stanza for commits past the most recent tag.
-if [ -n "$tags" ]; then
+# A tag pointing exactly at HEAD means we're building that tagged release (the
+# auto-tag/release workflow tags the very commit it builds). Prefer a plain
+# vX.Y.Z release tag over a prerelease tag sitting on the same commit.
+head_tag="$(git tag --points-at HEAD --list 'v*' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+if [ -z "$head_tag" ]; then
+    head_tag="$(git tag --points-at HEAD --list 'v*' | sort -V | tail -n1 || true)"
+fi
+
+if [ -n "$head_tag" ]; then
+    # Building exactly at a tag: that tag's version is the package version, with
+    # no UNRELEASED ~git suffix. Force its stanza to the top of the loop below so
+    # dpkg reads it as the package version — the -v:refname sort otherwise ranks
+    # a prerelease (e.g. -dev.*) above its corresponding release, which would
+    # mis-version a real release as <release>~dev...~git... (sorting below it).
+    tags="$head_tag"$'\n'"$(printf '%s\n' "$tags" | grep -vxF "$head_tag")"
+elif [ -n "$tags" ]; then
+    # Building past the latest tag (e.g. a local working-tree build): emit an
+    # UNRELEASED stanza versioned <latest>~git<sha> so it sorts below the next
+    # real release.
     latest_tag="$(printf '%s\n' "$tags" | head -n1)"
     if [ -n "$(git log --oneline "${latest_tag}..HEAD" 2>/dev/null)" ]; then
         upstream="$(tag_to_upstream "$latest_tag")"
