@@ -452,7 +452,15 @@ pub fn get_volume_key(
         .get(None, &mut vk_buf, Some(&pw))
         .map_err(|e| Error(format!("Failed to get volume key ({e})")))?;
     vk_buf.truncate(size);
-    Ok(VolumeKey::new(vk_buf.to_vec()))
+    let vk = VolumeKey::new(vk_buf.to_vec());
+    // Prime the cache for token unlocks so a sequence of enroll/wipe ops from
+    // a single FIDO2 tap / TPM2 unseal does not re-prompt. Passphrase unlocks
+    // are deliberately not cached: each op should re-validate the supplied
+    // passphrase rather than trust a prior unlock.
+    if token_based {
+        cache_volume_key(device, vk.clone());
+    }
+    Ok(vk)
 }
 
 // ---------------------------------------------------------------------------
@@ -637,5 +645,54 @@ mod tests {
         let meta = serde_json::json!({"keyslots": {}});
         assert!(tpm2_refs_from_meta(&meta).unwrap().is_empty());
         assert!(fido2_refs_from_meta(&meta).unwrap().is_empty());
+    }
+
+    // Regression for issue #15: a single token unlock must serve a *sequence*
+    // of enroll/wipe ops without re-prompting. The cache is therefore not
+    // consumed by a read and is only dropped by an explicit clear or the TTL —
+    // never eagerly after each op.
+    #[test]
+    fn volume_key_cache_serves_repeated_reads_until_cleared() {
+        // Unique key so parallel tests don't touch the same global entry.
+        let dev = "/dev/luks-enroll-vk-cache-test-repeat";
+        clear_volume_key_cache(dev);
+        assert!(cached_volume_key(dev).is_none(), "starts empty");
+
+        cache_volume_key(dev, VolumeKey::new(vec![1, 2, 3, 4]));
+
+        // Multiple reads all hit: this is what lets two enrollments run from
+        // one FIDO2 tap. A read does not consume the entry.
+        for _ in 0..3 {
+            let got = cached_volume_key(dev).expect("cache hit");
+            assert_eq!(got.as_bytes(), &[1, 2, 3, 4]);
+        }
+
+        clear_volume_key_cache(dev);
+        assert!(cached_volume_key(dev).is_none(), "cleared explicitly");
+    }
+
+    #[test]
+    fn volume_key_cache_expires_after_ttl() {
+        let dev = "/dev/luks-enroll-vk-cache-test-ttl";
+        clear_volume_key_cache(dev);
+
+        // Insert with a timestamp already older than the TTL.
+        let stale = Instant::now()
+            .checked_sub(VOLUME_KEY_CACHE_TTL + Duration::from_secs(1))
+            .expect("instant in range");
+        VOLUME_KEY_CACHE
+            .lock()
+            .unwrap()
+            .insert(realpath(dev), (VolumeKey::new(vec![9, 9]), stale));
+
+        assert!(
+            cached_volume_key(dev).is_none(),
+            "stale entry is treated as a miss"
+        );
+        // And the expired entry is evicted on access.
+        assert!(!VOLUME_KEY_CACHE
+            .lock()
+            .unwrap()
+            .contains_key(&realpath(dev)));
     }
 }
