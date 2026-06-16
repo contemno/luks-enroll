@@ -652,6 +652,66 @@ def _clear_volume_key_cache(device):
         _volume_key_cache.pop(real_dev, None)
 
 
+def _token_keyslots(device, token_type):
+    """Ordered, de-duplicated list of keyslots bound to tokens of a given type.
+
+    Used to target crypt_volume_key_get at the keyslot a token actually
+    unlocks, instead of letting libcryptsetup try every keyslot.
+    """
+    slots = []
+    for _tid, ks in find_tokens_by_type(device, token_type):
+        for s in ks:
+            if s not in slots:
+                slots.append(s)
+    return slots
+
+
+def _extract_volume_key(lib, cd, device, token_type, pw):
+    """Extract the volume key for a token-derived passphrase.
+
+    Tries the keyslot(s) bound to the token first. crypt_volume_key_get with
+    keyslot -1 tries every keyslot in turn, and each non-matching keyslot
+    still runs its full KDF before failing -- the argon2id passphrase slot
+    alone costs 1-2 s. Token keyslots use fast pbkdf2, so targeting them
+    directly avoids that cost (issue #16: 2-4 s in-app unlock delay).
+
+    Falls back to -1 (try all) if the token has no recorded keyslots or the
+    targeted slots all fail, so correctness is never worse than before.
+    Returns (ret, vk_bytes_or_None); ret is the keyslot on success, <0 on fail.
+    """
+    base_size = lib.crypt_get_volume_key_size(cd)
+    candidates = _token_keyslots(device, token_type)
+    tried_all = not candidates
+    if not candidates:
+        candidates = [-1]
+
+    last_ret = -1
+    for slot in candidates:
+        key_size = ctypes.c_size_t(base_size)
+        vk_buf = ctypes.create_string_buffer(base_size)
+        ret = lib.crypt_volume_key_get(
+            cd, slot, vk_buf, ctypes.byref(key_size), pw, len(pw),
+        )
+        if ret >= 0:
+            return ret, vk_buf.raw[:key_size.value]
+        last_ret = ret
+        if slot == -1:
+            tried_all = True
+
+    # Safety net: if we only tried specific slots, try all keyslots once.
+    if not tried_all:
+        key_size = ctypes.c_size_t(base_size)
+        vk_buf = ctypes.create_string_buffer(base_size)
+        ret = lib.crypt_volume_key_get(
+            cd, -1, vk_buf, ctypes.byref(key_size), pw, len(pw),
+        )
+        if ret >= 0:
+            return ret, vk_buf.raw[:key_size.value]
+        last_ret = ret
+
+    return last_ret, None
+
+
 def verify_luks_token(device, token_type, pin=""):
     """Verify unlock via a LUKS2 token (TPM2/FIDO2). Returns (ok, keyslot_or_error).
 
@@ -683,17 +743,11 @@ def verify_luks_token(device, token_type, pin=""):
         if lib.crypt_load(cd, b"LUKS2", None) != 0:
             return False, "Failed to load LUKS2 header"
 
-        key_size = ctypes.c_size_t(lib.crypt_get_volume_key_size(cd))
-        vk_buf = ctypes.create_string_buffer(key_size.value)
-        ret = lib.crypt_volume_key_get(
-            cd, -1, vk_buf, ctypes.byref(key_size), pw, len(pw),
-        )
+        ret, vk = _extract_volume_key(lib, cd, device, token_type, pw)
         if ret >= 0:
             real_dev = os.path.realpath(device)
             with _volume_key_cache_lock:
-                _volume_key_cache[real_dev] = (
-                    vk_buf.raw[:key_size.value], key_size.value, time.monotonic()
-                )
+                _volume_key_cache[real_dev] = (vk, len(vk), time.monotonic())
             return True, ret  # ret is the keyslot number
         return False, f"Token unlock failed (error {ret})"
     finally:
@@ -793,9 +847,14 @@ def _get_volume_key(device, unlock_method, passphrase, unlock_pin=""):
         # Determine the passphrase to use for volume key extraction
         if unlock_method in ("systemd-fido2", "systemd-tpm2"):
             pw = _derive_passphrase_from_token(device, unlock_method, unlock_pin)
-        else:
-            pw = passphrase.encode() if passphrase else b""
+            # Target the token's own keyslot(s) to avoid slow KDF attempts
+            # against unrelated keyslots (issue #16).
+            ret, vk = _extract_volume_key(lib, cd, device, unlock_method, pw)
+            if ret < 0:
+                raise RuntimeError(f"Failed to get volume key (error {ret})")
+            return vk, len(vk)
 
+        pw = passphrase.encode() if passphrase else b""
         key_size = ctypes.c_size_t(lib.crypt_get_volume_key_size(cd))
         vk_buf = ctypes.create_string_buffer(key_size.value)
         ret = lib.crypt_volume_key_get(
