@@ -1,12 +1,23 @@
 #!/usr/bin/make -f
 
+# Keep cargo's registry/cache inside the build tree so the build works under
+# restricted-$HOME builders and is removed by `clean`.
+export CARGO_HOME = $(CURDIR)/debian/.cargo
+
 %:
 	dh $@
 
+# Build the privileged service from the Rust workspace. The compiled binary
+# (rust/target/release/luks-enroll-service) is shipped to /usr/sbin via
+# debian/luks-enroll.install. cargo/rustc come from rustup in CI; --locked
+# pins the dependency versions recorded in rust/Cargo.lock.
 override_dh_auto_build:
-	@true
+	cargo build --release --locked --manifest-path rust/Cargo.toml
 
-# Tests run in CI; don't invoke the top-level Makefile's `test` target
-# during dpkg-buildpackage (the build container has no pytest).
+# Tests run in CI (cargo test + pytest); don't invoke them during
+# dpkg-buildpackage.
 override_dh_auto_test:
 	@true
+
+override_dh_auto_clean:
+	rm -rf rust/target debian/.cargo
