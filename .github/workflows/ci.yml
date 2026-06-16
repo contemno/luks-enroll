@@ -1,8 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # PR-only: pushes to main are validated by the release pipeline
+  # (autotag.yml -> build-release.yml, which runs the same lint/test), so
+  # gating here too would just duplicate that work on every merge.
   pull_request:
     branches: [main]
 

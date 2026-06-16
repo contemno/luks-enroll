@@ -4,6 +4,9 @@ updates:
   # rewrites the SHA and updates the trailing version comment in lockstep.
   - package-ecosystem: github-actions
     directory: /
+    # Open update PRs against dev: merges to main auto-publish a release, so
+    # dependency bumps flow through dev like everything else.
+    target-branch: dev
     schedule:
       interval: weekly
     groups:
@@ -14,6 +17,7 @@ updates:
   # requirements-dev.txt. Dependabot regenerates the file with new hashes.
   - package-ecosystem: pip
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
     groups:
