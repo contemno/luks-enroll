@@ -5,3 +5,8 @@
 
 override_dh_auto_build:
 	@true
+
+# Tests run in CI; don't invoke the top-level Makefile's `test` target
+# during dpkg-buildpackage (the build container has no pytest).
+override_dh_auto_test:
+	@true

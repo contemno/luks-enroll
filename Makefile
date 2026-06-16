@@ -1,6 +1,6 @@
 TARGET := target
 
-.PHONY: package changelog clean
+.PHONY: package changelog clean test lint
 
 package: changelog
 	dpkg-buildpackage -us -uc -b
@@ -9,6 +9,13 @@ package: changelog
 
 changelog:
 	./scripts/gen-changelog.sh
+
+test:
+	python3 -m pytest tests/ -v
+
+lint:
+	ruff check .
+	ruff format --check .
 
 clean:
 	rm -rf $(TARGET)
