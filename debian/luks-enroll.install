@@ -1,3 +1,7 @@
-dist/usr/ /
 dist/etc/ /
 dist/lib/ /
+dist/usr/bin/ /usr/
+dist/usr/share/ /usr/
+# The privileged service is the compiled Rust binary, not the Python script
+# under dist/usr/sbin/ (which is kept in-tree for one release as rollback).
+rust/target/release/luks-enroll-service /usr/sbin/
