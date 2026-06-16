@@ -38,13 +38,19 @@ format_date() {
     git log -1 --format=%aD "$1"
 }
 
-# Convert "v1.2.3-dev.4" -> "1.2.3~dev4", "v1.2.3" -> "1.2.3"
+# Convert a tag to a Debian upstream version:
+#   "v1.2.3"                      -> "1.2.3"
+#   "v1.2.3-dev.20260616.2eaa4ff" -> "1.2.3~dev.20260616.2eaa4ff"
+# Any prerelease suffix after the X.Y.Z core has its leading '-' turned into
+# '~' so the prerelease sorts *below* the corresponding release in dpkg's
+# version ordering, and the upstream version carries no '-' (which would
+# otherwise be read as the debian-revision separator).
 tag_to_upstream() {
     local tag="${1#v}"
     if echo "$tag" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
         printf '%s' "$tag"
     else
-        printf '%s' "$tag" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-(.+)\.([0-9]+)$/\1~\2\3/'
+        printf '%s' "$tag" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-/\1~/'
     fi
 }
 
