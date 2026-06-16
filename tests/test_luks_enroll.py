@@ -422,8 +422,9 @@ class TestExtractVolumeKey(unittest.TestCase):
     def test_targets_token_keyslot_only(self, _mock):
         # systemd-tpm2 token is bound to keyslot 1; should try only slot 1.
         lib = self._FakeLib(success_slot=1)
-        ret, vk = svc._extract_volume_key(lib, object(), "/dev/fake",
-                                          "systemd-tpm2", b"pw")
+        ret, vk = svc._extract_volume_key(
+            lib, object(), "/dev/fake", "systemd-tpm2", b"pw"
+        )
         self.assertEqual(ret, 1)
         self.assertEqual(len(vk), 64)
         self.assertEqual(lib.tried, [1])  # never fell back to -1 (slow path)
@@ -433,8 +434,9 @@ class TestExtractVolumeKey(unittest.TestCase):
         # Token claims slot 1 but the key actually lives in slot 2; the
         # helper must retry with -1 so correctness is preserved.
         lib = self._FakeLib(success_slot=2)
-        ret, vk = svc._extract_volume_key(lib, object(), "/dev/fake",
-                                          "systemd-tpm2", b"pw")
+        ret, vk = svc._extract_volume_key(
+            lib, object(), "/dev/fake", "systemd-tpm2", b"pw"
+        )
         self.assertEqual(ret, 2)
         self.assertEqual(lib.tried, [1, -1])
 
@@ -442,8 +444,9 @@ class TestExtractVolumeKey(unittest.TestCase):
     def test_uses_all_slots_when_no_token_keyslots(self, _mock):
         # No systemd-recovery token in sample -> no candidates -> try -1.
         lib = self._FakeLib(success_slot=0)
-        ret, vk = svc._extract_volume_key(lib, object(), "/dev/fake",
-                                          "systemd-recovery", b"pw")
+        ret, vk = svc._extract_volume_key(
+            lib, object(), "/dev/fake", "systemd-recovery", b"pw"
+        )
         self.assertEqual(ret, 0)
         self.assertEqual(lib.tried, [-1])
 
