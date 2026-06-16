@@ -1,0 +1,87 @@
+name: Auto-tag
+
+# Automatically tag (and release) on every push/merge to a tracked branch:
+#   * dev  -> prerelease tag  vX.Y.Z-dev.<UTC-date>.<short-sha>, published as a
+#             GitHub *prerelease*.
+#   * main -> release tag     vX.Y.Z (patch auto-bumped from the latest release),
+#             published as a full release.
+#
+# The version base is the latest plain vX.Y.Z release tag (prerelease tags are
+# ignored); if none exists yet it is seeded from rust/service/Cargo.toml. The
+# tag is created with the default GITHUB_TOKEN — which intentionally does NOT
+# trigger release.yml's `on: push: tags` — so this workflow drives the build
+# itself by calling the build-release.yml reusable workflow. That also keeps the
+# whole flow within one run (no PAT/App token needed) and avoids double builds.
+on:
+  push:
+    branches: [dev, main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      prerelease: ${{ steps.compute.outputs.prerelease }}
+      created: ${{ steps.create.outputs.created }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0  # need all tags to find the latest release
+
+      - name: Compute next version and tag
+        id: compute
+        run: |
+          set -euo pipefail
+          # Base = latest plain vX.Y.Z release tag (ignore prereleases like -dev),
+          # else seed from the workspace crate version.
+          latest="$(git tag -l 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          if [ -n "$latest" ]; then
+            base="${latest#v}"
+          else
+            base="$(grep -m1 -E '^version[[:space:]]*=' rust/service/Cargo.toml \
+              | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')"
+          fi
+          IFS=. read -r major minor patch <<<"$base"
+          next="${major}.${minor}.$((patch + 1))"
+
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            tag="v${next}"
+            prerelease=false
+          else
+            tag="v${next}-dev.$(date -u +%Y%m%d).$(git rev-parse --short HEAD)"
+            prerelease=true
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "Branch ${GITHUB_REF_NAME}: base=${base} -> tag=${tag} (prerelease=${prerelease})"
+
+      - name: Create and push tag
+        id: create
+        env:
+          TAG: ${{ steps.compute.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on origin; skipping."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: tag
+    if: needs.tag.outputs.created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-release.yml
+    with:
+      ref: ${{ needs.tag.outputs.tag }}
+      prerelease: ${{ needs.tag.outputs.prerelease == 'true' }}
