@@ -2,7 +2,21 @@ Source: luks-enroll
 Section: admin
 Priority: optional
 Maintainer: Josh <josh@contemno.net>
-Build-Depends: debhelper-compat (= 13)
+# The privileged service is built from the Rust workspace under rust/. The
+# C -dev packages below are needed to link libcryptsetup/libblkid/libfido2/
+# libtss2; clang/libclang-dev are needed by fido2-sys's bindgen build script.
+# The Rust toolchain (cargo/rustc) is provided via rustup in CI rather than
+# the distro packages, because the workspace's Cargo.lock is v4 and several
+# crates' MSRV exceeds the rustc shipped by stable Debian/Ubuntu; see
+# debian/rules.
+Build-Depends: debhelper-compat (= 13),
+               pkg-config,
+               clang,
+               libclang-dev,
+               libcryptsetup-dev,
+               libblkid-dev,
+               libfido2-dev,
+               libtss2-dev
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 Homepage: https://github.com/contemno/luks-enroll
@@ -10,7 +24,11 @@ Vcs-Git: https://github.com/contemno/luks-enroll.git
 Vcs-Browser: https://github.com/contemno/luks-enroll
 
 Package: luks-enroll
-Architecture: all
+# Was "all" while the service was pure-Python; the service is now a compiled
+# Rust binary, so the package is architecture-dependent. The GUI client at
+# /usr/bin/luks-enroll is still Python (Rust client is Phase B), so the
+# python3/GTK deps remain.
+Architecture: any
 Depends: python3,
          python3-gi,
          gir1.2-gtk-4.0,
@@ -18,14 +36,14 @@ Depends: python3,
          systemd (>= 248),
          libcryptsetup12,
          libblkid1,
-         libfdisk1,
+         libfido2-1,
+         libtss2-esys-3.0.2-0 | libtss2-esys0,
+         libtss2-mu-4.0.1-0 | libtss2-mu0,
          polkitd | policykit-1,
+         ${shlibs:Depends},
          ${misc:Depends}
 Suggests: dracut
-Recommends: libfido2-1,
-            tpm2-tools,
-            libtss2-esys-3.0.2-0 | libtss2-esys0,
-            libtss2-mu-4.0.1-0 | libtss2-mu0
+Recommends: tpm2-tools
 Description: LUKS Enroll Wizard for LUKS disk encryption
  A GTK4 wizard that guides users through enrolling FIDO2 tokens,
  TPM2 chips, and recovery keys into a LUKS-encrypted root volume,
