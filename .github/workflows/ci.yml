@@ -10,8 +10,51 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs for the same PR when new commits are pushed.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Detect whether this PR is docs-only. The lint/test/rust jobs below are
+  # required status checks, so we can't drop them with `paths-ignore` (a check
+  # that never reports leaves the PR stuck "waiting"). Instead they stay
+  # reachable but skip when only docs changed — a *skipped* required job still
+  # satisfies branch protection, so docs-only PRs merge without burning CI on a
+  # full Rust build + TPM roundtrips.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0  # need the base commit to diff against
+
+      - name: Detect docs-only change
+        id: filter
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          files="$(git diff --name-only "${BASE}"...HEAD)"
+          echo "Changed files:"
+          echo "${files:-<none>}"
+          docs_only=true
+          [ -z "$files" ] && docs_only=false  # empty diff -> run everything
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *.md|LICENSE) ;;            # documentation, ignore
+              *) docs_only=false ;;       # anything else -> real CI
+            esac
+          done <<< "$files"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "docs_only=$docs_only"
+
   lint:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -30,7 +73,8 @@ jobs:
         run: ruff format --check .
 
   test:
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -46,6 +90,8 @@ jobs:
         run: python3 -m pytest tests/ -v
 
   rust:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
