@@ -70,10 +70,16 @@ Status: **Phase A in progress** (backend service). Phase B (GTK client) not star
 - [x] A5: formatting paths — wipefs via libblkid probe loop, GPT via `gpt` crate
       (type GUID CA7D7CCB-63ED-4C53-861C-1742536059CC), partprobe ioctl, FormatPartition,
       CreateEncryptedImage (+ chown to caller).
-- [ ] A6: packaging swap — debian `Architecture: all` → `any`, dh-cargo or vendored crates,
-      Build-Depends on C `-dev` packages + libclang, per-arch release builds (amd64/arm64).
-      Ship Rust binary at `/usr/sbin/luks-enroll-service`; keep the Python service in-tree for
-      one release as rollback.
+- [x] A6: packaging swap — debian `Architecture: all` → `any`; `debian/rules` builds the Rust
+      workspace (`cargo build --release --locked`, toolchain via rustup in CI since Cargo.lock is
+      v4 and crate MSRVs exceed the distro rustc); Build-Depends on the C `-dev` packages +
+      clang/libclang-dev; runtime libs (libfido2/libtss2) moved from Recommends to Depends and
+      libfdisk1 dropped (pure-Rust `gpt` crate). The compiled binary ships at
+      `/usr/sbin/luks-enroll-service` via `debian/luks-enroll.install`. **Single-arch (amd64) for now;**
+      arm64 matrix deferred. systemd unit, D-Bus activation, polkit/bus policy unchanged.
+- [x] A6 follow-up: removed the Python service (`dist/usr/sbin/luks-enroll-service`) and its
+      service-only tests now that the Rust service ships; `tests/` keeps the GUI client tests.
+- [ ] A6 follow-up: arm64 release build (matrix) once amd64 is validated on hardware.
 - [ ] Hardware validation gate before A6 lands: real FIDO2 token (with and without PIN),
       real TPM2 (PCR 7 and 7+11, with and without PIN), enroll-with-Rust → boot-unlock via
       dracut initramfs, and cross-validation (Python-enrolled volume managed by Rust service

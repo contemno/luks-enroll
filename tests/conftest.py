@@ -1,10 +1,9 @@
 """Shared test fixtures and module-loading shim.
 
-Both test_luks_enroll.py and test_workflows.py need to import the GUI/service
-scripts directly from `dist/`. They aren't real Python modules — they're
-shebang-style scripts that pull in `gi` for GTK at the top, which we don't
-have available in the test environment. This module provides one importer
-shared by all test files.
+test_luks_enroll.py imports the GUI client script directly from `dist/`. It
+isn't a real Python module — it's a shebang-style script that pulls in `gi`
+for GTK at the top, which we don't have available in the test environment.
+This module provides the importer that mocks `gi` out.
 """
 
 import importlib
@@ -16,7 +15,6 @@ from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVICE_PATH = os.path.join(ROOT, "dist", "usr", "sbin", "luks-enroll-service")
 GUI_PATH = os.path.join(ROOT, "dist", "usr", "bin", "luks-enroll")
 
 
