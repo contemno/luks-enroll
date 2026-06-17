@@ -16,22 +16,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Detect whether this PR is docs-only. The lint/test/rust jobs below are
-  # required status checks, so we can't drop them with `paths-ignore` (a check
-  # that never reports leaves the PR stuck "waiting"). Instead they stay
-  # reachable but skip when only docs changed — a *skipped* required job still
-  # satisfies branch protection, so docs-only PRs merge without burning CI on a
-  # full Rust build + TPM roundtrips.
+  # Classify the diff so each job runs only when its area changed. The
+  # lint/test/rust jobs are required status checks, so we can't drop them with
+  # `paths-ignore` (a check that never reports leaves the PR stuck "waiting").
+  # Instead they stay reachable but skip when their area is untouched — a
+  # *skipped* required job still satisfies branch protection.
+  #
+  # Mapping:
+  #   *.md / LICENSE        -> docs, ignored
+  #   rust/**               -> Rust (build/clippy/test + TPM roundtrips)
+  #   *.py / pyproject.toml / requirements-dev.txt / tests/**
+  #                         -> Python (ruff lint + pytest)
+  #   anything else         -> shared/build infra (debian/, scripts/, Makefile,
+  #                            CI itself, …): conservatively run BOTH so a build
+  #                            change can't slip through misclassified.
   changes:
     runs-on: ubuntu-latest
     outputs:
-      docs_only: ${{ steps.filter.outputs.docs_only }}
+      python: ${{ steps.filter.outputs.python }}
+      rust: ${{ steps.filter.outputs.rust }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0  # need the base commit to diff against
 
-      - name: Detect docs-only change
+      - name: Classify changed paths
         id: filter
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -40,21 +49,27 @@ jobs:
           files="$(git diff --name-only "${BASE}"...HEAD)"
           echo "Changed files:"
           echo "${files:-<none>}"
-          docs_only=true
-          [ -z "$files" ] && docs_only=false  # empty diff -> run everything
+          python=false rust=false other=false
+          # Empty diff -> treat as infra change and run everything.
+          [ -z "$files" ] && other=true
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
-              *.md|LICENSE) ;;            # documentation, ignore
-              *) docs_only=false ;;       # anything else -> real CI
+              *.md|LICENSE) ;;                                   # docs, ignore
+              rust/*) rust=true ;;                               # Rust workspace
+              *.py|pyproject.toml|requirements-dev.txt|tests/*)  # Python
+                python=true ;;
+              *) other=true ;;                                   # infra -> run both
             esac
           done <<< "$files"
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
-          echo "docs_only=$docs_only"
+          $other && { python=true; rust=true; }
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "python=$python rust=$rust (other=$other)"
 
   lint:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -74,7 +89,7 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -91,7 +106,7 @@ jobs:
 
   rust:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
