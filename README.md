@@ -38,7 +38,7 @@ The application is split between an unprivileged GTK client and a privileged D-B
 ```
 
 - **`/usr/bin/luks-enroll`** — unprivileged GTK4/libadwaita client. Talks to the service over the system bus, runs all blocking calls in background threads, and updates the UI via `GLib.idle_add()`.
-- **`/usr/sbin/luks-enroll-service`** — bus-activated D-Bus service running as root. Performs all crypto operations through direct ctypes bindings.
+- **`/usr/sbin/luks-enroll-service`** — bus-activated D-Bus service running as root, implemented in Rust. Performs all crypto operations against libcryptsetup/libfido2/libtss2.
 - **D-Bus name:** `net.contemno.LuksEnroll`, object `/net/contemno/LuksEnroll`, interface `net.contemno.LuksEnroll1`
 - **Polkit actions:** `net.contemno.luks-enroll.read` (auth-cached for inspection), `net.contemno.luks-enroll.manage` (required for any destructive change)
 - **systemd hardening:** the service unit runs with `ProtectSystem=strict`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies=AF_UNIX`, a minimal capability bounding set, and explicit `DeviceAllow` rules for block, hidraw, tpm, and tpmrm device classes.
@@ -80,8 +80,7 @@ debian/                            Debian packaging
   control / copyright / changelog
 
 tests/
-  test_luks_enroll.py              Unit tests
-  test_workflows.py                End-to-end workflow tests
+  test_luks_enroll.py              GUI client unit tests
 
 scripts/                           Developer tooling (git hooks)
 .github/workflows/                 CI (lint, tests) and tagged releases

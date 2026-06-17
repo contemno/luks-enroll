@@ -7,4 +7,4 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "W"]
 # dist/ files use gi.require_version before imports (unavoidable with PyGObject)
-per-file-ignores = {"dist/usr/bin/luks-enroll" = ["E402"], "dist/usr/sbin/luks-enroll-service" = ["E402"]}
+per-file-ignores = {"dist/usr/bin/luks-enroll" = ["E402"]}
