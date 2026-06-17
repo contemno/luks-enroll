@@ -22,7 +22,6 @@ fi
 
 echo "pre-push: syntax check..."
 python3 -c "import ast; ast.parse(open('dist/usr/bin/luks-enroll').read())"
-python3 -c "import ast; ast.parse(open('dist/usr/sbin/luks-enroll-service').read())"
 
 echo "pre-push: OK"
 HOOK

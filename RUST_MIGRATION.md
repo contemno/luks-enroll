@@ -75,9 +75,10 @@ Status: **Phase A in progress** (backend service). Phase B (GTK client) not star
       v4 and crate MSRVs exceed the distro rustc); Build-Depends on the C `-dev` packages +
       clang/libclang-dev; runtime libs (libfido2/libtss2) moved from Recommends to Depends and
       libfdisk1 dropped (pure-Rust `gpt` crate). The compiled binary ships at
-      `/usr/sbin/luks-enroll-service` via `debian/luks-enroll.install`; the Python service stays
-      in-tree (`dist/usr/sbin/`) for one release as rollback. **Single-arch (amd64) for now;**
+      `/usr/sbin/luks-enroll-service` via `debian/luks-enroll.install`. **Single-arch (amd64) for now;**
       arm64 matrix deferred. systemd unit, D-Bus activation, polkit/bus policy unchanged.
+- [x] A6 follow-up: removed the Python service (`dist/usr/sbin/luks-enroll-service`) and its
+      service-only tests now that the Rust service ships; `tests/` keeps the GUI client tests.
 - [ ] A6 follow-up: arm64 release build (matrix) once amd64 is validated on hardware.
 - [ ] Hardware validation gate before A6 lands: real FIDO2 token (with and without PIN),
       real TPM2 (PCR 7 and 7+11, with and without PIN), enroll-with-Rust → boot-unlock via
