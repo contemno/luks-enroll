@@ -15,9 +15,22 @@ name: Auto-tag
 on:
   push:
     branches: [dev, main]
+    # Docs-only pushes don't change what we'd ship, so don't cut a tag/release
+    # for them (a full container build + .deb + publish is wasteful for a README
+    # edit). Anything else — code, debian/, scripts/, build files — still tags.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
 
 permissions:
   contents: write
+
+# Serialize releases per branch so two quick pushes don't race to tag/build.
+# Never cancel in-progress: aborting a half-done tag/release is worse than
+# letting it finish.
+concurrency:
+  group: autotag-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   tag:
