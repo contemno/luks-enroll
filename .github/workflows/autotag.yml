@@ -15,9 +15,32 @@ name: Auto-tag
 on:
   push:
     branches: [dev, main]
+    # Don't cut a tag/release for pushes that can't change the shipped .deb or
+    # its runtime behavior (a full container build + publish is wasteful, and it
+    # inflates the patch version for nothing). paths-ignore is all-or-nothing:
+    # any of these bundled with real code still releases normally.
+    #   docs            — **.md, LICENSE
+    #   CI/automation   — .github/**
+    #   Python tests    — tests/** (Rust tests live in rust/** and can't be split)
+    #   dev tooling     — requirements-dev.txt
+    # NOTE: pyproject.toml is the Python package metadata, not just lint config,
+    # so it is intentionally NOT ignored.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'tests/**'
+      - 'requirements-dev.txt'
 
 permissions:
   contents: write
+
+# Serialize releases per branch so two quick pushes don't race to tag/build.
+# Never cancel in-progress: aborting a half-done tag/release is worse than
+# letting it finish.
+concurrency:
+  group: autotag-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   tag:
