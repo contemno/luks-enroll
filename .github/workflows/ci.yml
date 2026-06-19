@@ -1,11 +1,13 @@
 name: CI
 
 on:
-  # PR-only: pushes to main are validated by the release pipeline
-  # (autotag.yml -> build-release.yml, which runs the same lint/test), so
-  # gating here too would just duplicate that work on every merge.
+  # Promotion flow: feature branch -> dev -> main. Gate PRs into BOTH:
+  # feature->dev PRs (keep dev green) and the dev->main release PR (validate
+  # the release candidate before it merges). This stays PR-only -- pushes to
+  # dev/main are validated post-merge by the release pipeline (autotag.yml ->
+  # build-release.yml, same lint/test), so a push trigger here would duplicate it.
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 permissions:
   contents: read
