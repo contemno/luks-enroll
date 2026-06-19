@@ -4,9 +4,10 @@
 //! Object:    /net/contemno/LuksEnroll
 //! Interface: net.contemno.LuksEnroll1
 //!
-//! Rust port of dist/usr/sbin/luks-enroll-service (Python). The D-Bus
-//! interface is frozen in dbus/net.contemno.LuksEnroll1.xml; behavior is
-//! intentionally parity-preserving (see RUST_MIGRATION.md).
+//! The D-Bus interface is frozen in dbus/net.contemno.LuksEnroll1.xml; behavior
+//! intentionally preserves parity with systemd-cryptenroll's token conventions.
+//! See the "Rust Migration" page in the project wiki for the full parity
+//! contract and accepted divergences.
 
 use futures_util::StreamExt;
 use luks_enroll_service::service;
