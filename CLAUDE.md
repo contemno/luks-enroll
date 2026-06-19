@@ -82,8 +82,8 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
   anything else → both. Keep diffs scoped so the right checks run.
 - The release pipeline (`autotag.yml` → `build-release.yml`) runs on push to `dev` (prerelease)
   and `main` (release).
-- Note: `ci.yml`'s PR trigger currently keys on base `main`, so PRs into `dev` are validated
-  post-merge by the release pipeline rather than at PR time.
+- `ci.yml` gates PRs into **both** `dev` and `main` (feature→dev PRs and the dev→main release
+  PR); it stays PR-only, since the release pipeline already validates the post-merge push.
 
 ## Don't
 
