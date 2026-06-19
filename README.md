@@ -181,12 +181,15 @@ Tags trigger GitHub Actions builds. Version scheme:
 | `v1.0.0`        | `1.0.0-1`       | Production                                       |
 | `v1.0.0-dev.1`  | `1.0.0~dev1-1`  | Development (sorts lower, won't overwrite prod)  |
 
-## Design notes & history
+## Design notes, reference & roadmap
 
-Longer-form design and planning documents live in the project wiki:
+Longer-form documentation lives in the [project wiki](https://github.com/contemno/luks-enroll/wiki):
 
-- **[Refactor Plan](https://github.com/contemno/luks-enroll/wiki/Refactor-Plan)** — the client-shrink plan: removing the Python first-login wizard, collapsing the four `Manage*` enroll pages into one, and migrating widget construction to `.ui` templates.
-- **[Rust Migration](https://github.com/contemno/luks-enroll/wiki/Rust-Migration)** — why and how the privileged service was ported to Rust, the C-library → crate mapping, the behavioral-parity contract with systemd-cryptenroll (token JSON shapes, recovery-key format, auth caching), and the accepted divergences.
+- **[Rust service — parity & design](https://github.com/contemno/luks-enroll/wiki/Rust-Service-Parity-and-Design)** — reference for the as-built service: the systemd-cryptenroll parity contract (token JSON shapes, recovery-key format, auth caching), accepted divergences, implementation findings, and testing strategy.
+- **[Rust Migration](https://github.com/contemno/luks-enroll/wiki/Rust-Migration)** — why and how the privileged service was ported to Rust, and the C-library → crate mapping.
+- **[Refactor Plan](https://github.com/contemno/luks-enroll/wiki/Refactor-Plan)** *(archived)* — the plan that slimmed the Python client (wizard removal, page consolidation, `.ui` templates).
+
+The living roadmap is tracked as GitHub [milestones](https://github.com/contemno/luks-enroll/milestones) and the [Roadmap issue](https://github.com/contemno/luks-enroll/issues/28).
 
 ## License
 
