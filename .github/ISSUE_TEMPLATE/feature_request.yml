@@ -1,0 +1,73 @@
+name: ✨ Feature request
+description: Suggest a new capability or improvement
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! The privileged service is Rust and the D-Bus interface
+        contract (`dbus/net.contemno.LuksEnroll1.xml`) is frozen — a feature that
+        changes the service interface needs the client and service updated together,
+        so it may take longer. Check the
+        [Roadmap (#28)](https://github.com/contemno/luks-enroll/issues/28) first; the
+        service internals are described on the
+        [parity & design](https://github.com/contemno/luks-enroll/wiki/Rust-Service-Parity-and-Design)
+        wiki page.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this isn't already proposed
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and what's getting in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should luks-enroll do? Sketch the UX or workflow if you can.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - GTK4 client / UX
+        - FIDO2
+        - TPM2 (PCR selection, PIN, etc.)
+        - Recovery keys
+        - Passphrase / keyslot management
+        - Encrypted USB / image files
+        - Initramfs unlock
+        - Packaging / distro support
+        - D-Bus / service API
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, or other approaches you weighed.
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      description: This tool guards against lockout (auth-keyslot protection). Consider it.
+      options:
+        - label: This change preserves the "you can never lock yourself out" guarantee, or I've noted how it affects it.

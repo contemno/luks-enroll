@@ -1,0 +1,86 @@
+name: 🔑 Hardware compatibility report
+description: A FIDO2 token or TPM2 chip isn't detected or won't enroll
+labels: ["hardware", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for "my YubiKey isn't detected", "TPM enrollment fails on this
+        laptop", hotplug not working, or initramfs unlock failing for a specific
+        device. Hardware identifiers below help us track what's known-good.
+
+        ⚠️ Never paste PINs, passphrases, or recovery keys.
+
+  - type: dropdown
+    id: device-class
+    attributes:
+      label: Device type
+      options:
+        - FIDO2 / U2F security token
+        - TPM2 chip (firmware fTPM)
+        - TPM2 chip (discrete dTPM)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: device-model
+    attributes:
+      label: Device make & model
+      placeholder: "e.g. YubiKey 5 NFC, Nitrokey 3, fTPM on AMD Ryzen 7840U, Infineon SLB9670"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where does it fail?
+      options:
+        - Not detected / doesn't appear in the device list
+        - Hotplug not detected (only after restart)
+        - Enrollment fails partway
+        - Enrolls fine, but initramfs/boot unlock fails
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: identifiers
+    attributes:
+      label: Device identifiers
+      description: >-
+        For FIDO2: `lsusb` line and `fido2-token -L`.
+        For TPM2: `tpm2_getcap properties-fixed | head` and the TPM in `dmesg`.
+      render: shell
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Service logs
+      description: "`journalctl -u luks-enroll-service -b --no-pager` around the failure."
+      render: shell
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution & version
+      placeholder: "e.g. Fedora 41, Debian 13"
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Relevant library versions
+      placeholder: "libfido2, tpm2-tools / libtss2, cryptsetup --version"
+
+  - type: input
+    id: pcr
+    attributes:
+      label: PCR selection (TPM2 only)
+      placeholder: "e.g. default, or 0+7"
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
