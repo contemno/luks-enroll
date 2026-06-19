@@ -32,8 +32,7 @@ body:
       multiple: true
       options:
         - GTK4 client (luks-enroll, the GUI)
-        - D-Bus service (luks-enroll-service, Python)
-        - Rust service (rust/, Phase A port)
+        - Privileged D-Bus service (luks-enroll-service, Rust)
         - FIDO2 enrollment
         - TPM2 enrollment
         - Recovery keys
@@ -41,7 +40,7 @@ body:
         - Encrypted USB / image-file workflow
         - Initramfs unlock (dracut / crypttab)
         - Polkit / authorization
-        - Packaging / install (.deb, install script, chroot)
+        - Packaging / install (.deb, chroot)
         - Other / not sure
     validations:
       required: true
@@ -113,7 +112,6 @@ body:
       label: Where was it run?
       options:
         - Normal desktop session
-        - First-login autostart
         - Installer chroot (bind-mounted /dev, /sys, /proc)
         - Other
     validations:
