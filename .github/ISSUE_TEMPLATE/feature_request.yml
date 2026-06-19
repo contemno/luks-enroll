@@ -5,10 +5,14 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the idea! Note that the privileged service is mid-port to Rust
-        (see [RUST_MIGRATION.md](../blob/main/RUST_MIGRATION.md)) and the D-Bus
-        interface contract is frozen — features touching the service interface may
-        be deferred until after the swap.
+        Thanks for the idea! The privileged service is Rust and the D-Bus interface
+        contract (`dbus/net.contemno.LuksEnroll1.xml`) is frozen — a feature that
+        changes the service interface needs the client and service updated together,
+        so it may take longer. Check the
+        [Roadmap (#28)](https://github.com/contemno/luks-enroll/issues/28) first; the
+        service internals are described on the
+        [parity & design](https://github.com/contemno/luks-enroll/wiki/Rust-Service-Parity-and-Design)
+        wiki page.
 
   - type: checkboxes
     id: preflight
