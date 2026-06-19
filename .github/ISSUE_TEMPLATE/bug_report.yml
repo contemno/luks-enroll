@@ -1,0 +1,124 @@
+name: 🐞 Bug report
+description: Something is broken or behaves unexpectedly
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please fill in as much as you can — logs from the
+        privileged service (`journalctl`) and the device/hardware details are the
+        most useful parts for diagnosing crypto and enrollment problems.
+
+        ⚠️ **Do not paste passphrases, recovery keys, or LUKS master keys.**
+        It is safe to share device UUIDs, keyslot numbers, and token IDs.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this isn't a duplicate
+          required: true
+        - label: This is a bug, not a usage question (those go to Discussions)
+          required: true
+        - label: This is not a security vulnerability (those go to a private advisory)
+          required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: Where does the problem appear? Pick the closest match.
+      multiple: true
+      options:
+        - GTK4 client (luks-enroll, the GUI)
+        - Privileged D-Bus service (luks-enroll-service, Rust)
+        - FIDO2 enrollment
+        - TPM2 enrollment
+        - Recovery keys
+        - Passphrase management (add/remove/change keyslot)
+        - Encrypted USB / image-file workflow
+        - Initramfs unlock (dracut / crypttab)
+        - Polkit / authorization
+        - Packaging / install (.deb, chroot)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior, including any error text shown in the GUI.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Launch `luks-enroll`
+        2. Select device /dev/...
+        3. Choose "Enroll FIDO2 token"
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: service-logs
+    attributes:
+      label: Service logs
+      description: >-
+        Output of `journalctl -u luks-enroll-service -b --no-pager` (or
+        `sudo journalctl -t luks-enroll-service`) covering the failed operation.
+        Scrub anything secret.
+      render: shell
+
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution & version
+      placeholder: "e.g. Debian 13, Ubuntu 24.04, Fedora 41"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: luks-enroll version
+      description: From the .deb (`dpkg -l luks-enroll`), the git commit, or a tag.
+      placeholder: "e.g. 1.0.0-1, or commit af37d21"
+    validations:
+      required: true
+
+  - type: input
+    id: stack-versions
+    attributes:
+      label: Crypto stack versions (if relevant)
+      description: Helps for crypto/initramfs bugs.
+      placeholder: "cryptsetup --version; GTK4/libadwaita; tpm2-tools; libfido2"
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Where was it run?
+      options:
+        - Normal desktop session
+        - Installer chroot (bind-mounted /dev, /sys, /proc)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Screenshots, the relevant `crypttab` line, dracut output, etc.

@@ -1,0 +1,22 @@
+# The structured forms below are the recommended starting points, but blank
+# issues stay enabled so maintainers can open planning / roadmap / epic / spike
+# issues that don't fit a triage form. How planned work is tracked: see the
+# Roadmap issue (#28) and the milestones.
+blank_issues_enabled: true
+contact_links:
+  - name: 🗺️ Roadmap & milestones
+    url: https://github.com/contemno/luks-enroll/issues/28
+    about: >-
+      Planned and in-progress work is tracked in the Roadmap issue (#28) and the
+      GitHub milestones. Check there before proposing long-horizon work.
+  - name: 🔒 Security vulnerability (do NOT open a public issue)
+    url: https://github.com/contemno/luks-enroll/security/advisories/new
+    about: >-
+      luks-enroll handles disk-encryption keys. Report anything that could
+      weaken a keyslot, leak key material, or bypass polkit/authorization
+      privately via a GitHub security advisory — or email josh@contemno.net.
+  - name: 💬 Question / usage help
+    url: https://github.com/contemno/luks-enroll/discussions
+    about: >-
+      Not sure if it's a bug? Ask in Discussions. Setup, crypttab, and
+      initramfs questions are a better fit there than the issue tracker.
