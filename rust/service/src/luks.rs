@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use libcryptsetup_rs::consts::flags::{CryptActivate, CryptPbkdf, CryptVolumeKey};
+use libcryptsetup_rs::consts::flags::{CryptPbkdf, CryptVolumeKey};
 use libcryptsetup_rs::consts::vals::{CryptKdf, EncryptionFormat};
 use libcryptsetup_rs::{CryptDevice, CryptInit, CryptPbkdfType, Either, TokenInput};
 use zeroize::Zeroizing;
@@ -366,11 +366,22 @@ fn tpm2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Tpm2TokenRef>> {
 pub fn verify_passphrase(device: &str, passphrase: &str) -> std::result::Result<i32, String> {
     let _t = Timer::new("verify_passphrase");
     let mut dev = open_luks2(device).map_err(|e| e.0)?;
-    // name=None: verify only, no dm-crypt activation.
-    dev.activate_handle()
-        .activate_by_passphrase(None, None, passphrase.as_bytes(), CryptActivate::empty())
-        .map(|slot| slot as i32)
-        .map_err(|_| "Incorrect passphrase or recovery key".to_string())
+    // Extract (and thereby verify) the volume key without activating dm-crypt
+    // (name=None), then cache it so follow-up enroll/wipe ops run from this
+    // single unlock -- mirroring verify_token.
+    let key_size = dev.status_handle().get_volume_key_size().max(0) as usize;
+    let mut vk_buf = Zeroizing::new(vec![0u8; key_size.max(1)]);
+    match dev
+        .volume_key_handle()
+        .get(None, &mut vk_buf, Some(passphrase.as_bytes()))
+    {
+        Ok((slot, size)) => {
+            vk_buf.truncate(size);
+            cache_volume_key(device, VolumeKey::new(vk_buf.to_vec()));
+            Ok(slot)
+        }
+        Err(_) => Err("Incorrect passphrase or recovery key".to_string()),
+    }
 }
 
 /// Derive the LUKS passphrase bytes from a token (FIDO2 assertion or TPM2
@@ -418,8 +429,10 @@ pub fn verify_token(device: &str, token_type: &str, pin: &str) -> std::result::R
 /// Get the volume key for a device using the given unlock method
 /// ("passphrase", "systemd-fido2" or "systemd-tpm2").
 ///
-/// Token methods consult the volume-key cache first (populated by
-/// `verify_token`) to avoid a second FIDO2 touch / TPM2 unseal.
+/// All methods consult the volume-key cache first (populated here, by
+/// `verify_token`, or by `verify_passphrase`) so a sequence of ops runs from a
+/// single extraction -- avoiding a second FIDO2 touch / TPM2 unseal, or a
+/// repeated argon2id pass for a passphrase.
 pub fn get_volume_key(
     device: &str,
     unlock_method: &str,
@@ -432,10 +445,10 @@ pub fn get_volume_key(
         bail!("Invalid unlock method: {unlock_method:?}");
     }
     let token_based = unlock_method != "passphrase";
-    if token_based {
-        if let Some(vk) = cached_volume_key(device) {
-            return Ok(vk);
-        }
+    // Reuse a cached volume key (from a prior unlock or op) for any unlock
+    // method, so a sequence of enroll/wipe ops runs from a single extraction.
+    if let Some(vk) = cached_volume_key(device) {
+        return Ok(vk);
     }
 
     let mut dev = open_luks2(device)?;
@@ -453,13 +466,10 @@ pub fn get_volume_key(
         .map_err(|e| Error(format!("Failed to get volume key ({e})")))?;
     vk_buf.truncate(size);
     let vk = VolumeKey::new(vk_buf.to_vec());
-    // Prime the cache for token unlocks so a sequence of enroll/wipe ops from
-    // a single FIDO2 tap / TPM2 unseal does not re-prompt. Passphrase unlocks
-    // are deliberately not cached: each op should re-validate the supplied
-    // passphrase rather than trust a prior unlock.
-    if token_based {
-        cache_volume_key(device, vk.clone());
-    }
+    // Prime the cache for every unlock method so a sequence of enroll/wipe ops
+    // runs from a single extraction -- one FIDO2 tap / TPM2 unseal, or one
+    // argon2id pass for a passphrase. Entries expire after VOLUME_KEY_CACHE_TTL.
+    cache_volume_key(device, vk.clone());
     Ok(vk)
 }
 
