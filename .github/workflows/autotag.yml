@@ -3,11 +3,14 @@ name: Auto-tag
 # Automatically tag (and release) on every push/merge to a tracked branch:
 #   * dev  -> prerelease tag  vX.Y.Z-dev.<UTC-date>.<short-sha>, published as a
 #             GitHub *prerelease*.
-#   * main -> release tag     vX.Y.Z (patch auto-bumped from the latest release),
+#   * main -> release tag     vX.Y.Z (next version per scripts/next-version.sh),
 #             published as a full release.
 #
-# The version base is the latest plain vX.Y.Z release tag (prerelease tags are
-# ignored); if none exists yet it is seeded from rust/service/Cargo.toml. The
+# The next version is computed by scripts/next-version.sh as max(patch-bump of
+# the latest plain vX.Y.Z release tag, the hand-maintained ./VERSION floor), so
+# bumping ./VERSION's minor/major cuts exactly one such release and patch
+# releases resume afterward (prerelease -dev.* tags are ignored; ./VERSION falls
+# back to rust/service/Cargo.toml). The
 # tag is created with the default GITHUB_TOKEN — which intentionally does NOT
 # trigger release.yml's `on: push: tags` — so this workflow drives the build
 # itself by calling the build-release.yml reusable workflow. That also keeps the
@@ -24,7 +27,8 @@ on:
     #   Python tests    — tests/** (Rust tests live in rust/** and can't be split)
     #   dev tooling     — requirements-dev.txt
     # NOTE: pyproject.toml is the Python package metadata, not just lint config,
-    # so it is intentionally NOT ignored.
+    # so it is intentionally NOT ignored; nor is ./VERSION (the release floor),
+    # so a lone version bump still cuts the release.
     paths-ignore:
       - '**.md'
       - 'LICENSE'
@@ -58,18 +62,9 @@ jobs:
         id: compute
         run: |
           set -euo pipefail
-          # Base = latest plain vX.Y.Z release tag (ignore prereleases like -dev),
-          # else seed from the workspace crate version.
-          latest="$(git tag -l 'v*' \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
-          if [ -n "$latest" ]; then
-            base="${latest#v}"
-          else
-            base="$(grep -m1 -E '^version[[:space:]]*=' rust/service/Cargo.toml \
-              | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')"
-          fi
-          IFS=. read -r major minor patch <<<"$base"
-          next="${major}.${minor}.$((patch + 1))"
+          # next = max(patch-bump of the latest release, ./VERSION floor);
+          # see scripts/next-version.sh.
+          next="$(./scripts/next-version.sh)"
 
           if [ "${GITHUB_REF_NAME}" = "main" ]; then
             tag="v${next}"
@@ -80,7 +75,7 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-          echo "Branch ${GITHUB_REF_NAME}: base=${base} -> tag=${tag} (prerelease=${prerelease})"
+          echo "Branch ${GITHUB_REF_NAME}: next=${next} -> tag=${tag} (prerelease=${prerelease})"
 
       - name: Create and push tag
         id: create

@@ -25,6 +25,9 @@ and recovery keys into LUKS2 volumes.
 - **Open every PR against `dev`. Never PR or push directly to `main`.** `main` is
   release-only; `dev → main` is the release promotion step.
 - Branch from `dev`; name `claude/<topic>`. Reach `dev` through a PR, not a direct push.
+- Releases are auto-tagged; the version is `max(patch-bump, ./VERSION)`. Patch releases are
+  automatic — to cut a **minor/major** release, bump **`VERSION`** (e.g. `0.2.0`) in the `dev`
+  PR, and merging `dev → main` releases it.
 
 ## Work loop
 
@@ -91,6 +94,8 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
 - `tests/` — Python GUI-client tests (`conftest.py` is the GTK-shim importer).
 - `debian/` — packaging; `debian/rules` builds the Rust service. `debian/changelog` is
   generated, not tracked.
+- `VERSION` — release-version floor (X.Y.Z); bump for a minor/major release. `scripts/` —
+  release helpers: `next-version.sh` (computes the next tag) and `gen-changelog.sh`.
 
 ## Build / test / lint
 
@@ -116,7 +121,8 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
   release profile), building with `dpkg-buildpackage -nc` so the Debian `clean` step doesn't
   wipe the restored cache.
 - The release pipeline (`autotag.yml` → `build-release.yml`) runs on push to `dev` (prerelease)
-  and `main` (release).
+  and `main` (release). The version is `max(patch-bump of the latest release tag, ./VERSION)`
+  (`scripts/next-version.sh`); bump **`VERSION`** for a minor/major release, patch is automatic.
 - `ci.yml` gates PRs into **both** `dev` and `main` (feature→dev PRs and the dev→main release
   PR); it stays PR-only, since the release pipeline already validates the post-merge push.
 
