@@ -33,6 +33,30 @@ and recovery keys into LUKS2 volumes.
 3. Open a PR with **base `dev`**, body containing `Closes #<issue>`.
 4. On merge, GitHub closes the issue and ticks #28.
 
+## Before a PR is ready (and after each conflict resolution)
+
+A clean diff against a *stale* base hides regressions: if another PR changed the
+same code on `dev` after you branched, your hunks can silently revert it (the
+#29/#35 volume-key-cache near-miss). Before marking a PR ready — and again after
+resolving any conflict:
+
+1. **Re-sync with base.** `git fetch origin dev` and rebase; a branch behind `dev`
+   hasn't been tested against the code it will merge into.
+2. **Check what else touched your files.** For each changed file:
+   `git log --oneline <branch-point>..origin/dev -- <file>`. If another PR changed
+   it, read the **current `dev` version** of the functions you're editing — not
+   your branch's copy — and reconcile *intent*, don't just re-apply your hunks.
+3. **Treat the conflict resolution as authored code** (the least-reviewed logic in
+   the PR): a test from **each** side's intent must pass; if a reconciled behavior
+   isn't pinned by a test, add one.
+4. **Pin must-keep behavior as a test at the entry point**, named so the intent
+   shows in a diff — not only in a commit message (e.g.
+   `passphrase_volume_key_is_cached_and_reused`).
+5. **Confirm gates ran and are green** — the **Build / test / lint** commands
+   locally (the pre-push hook covers only Python lint), and the PR's required
+   checks actually reported; a required check that never ran is not a pass.
+6. **Move the docs** — see **Done = docs updated**.
+
 ## Done = docs updated
 
 Every change moves the matching artifact (or explicitly notes N/A):
