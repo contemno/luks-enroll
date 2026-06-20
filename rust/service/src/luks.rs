@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use libcryptsetup_rs::consts::flags::{CryptActivate, CryptPbkdf, CryptVolumeKey};
+use libcryptsetup_rs::consts::flags::{CryptPbkdf, CryptVolumeKey};
 use libcryptsetup_rs::consts::vals::{CryptKdf, EncryptionFormat};
 use libcryptsetup_rs::{CryptDevice, CryptInit, CryptPbkdfType, Either, TokenInput};
 use zeroize::Zeroizing;
@@ -366,11 +366,22 @@ fn tpm2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Tpm2TokenRef>> {
 pub fn verify_passphrase(device: &str, passphrase: &str) -> std::result::Result<i32, String> {
     let _t = Timer::new("verify_passphrase");
     let mut dev = open_luks2(device).map_err(|e| e.0)?;
-    // name=None: verify only, no dm-crypt activation.
-    dev.activate_handle()
-        .activate_by_passphrase(None, None, passphrase.as_bytes(), CryptActivate::empty())
-        .map(|slot| slot as i32)
-        .map_err(|_| "Incorrect passphrase or recovery key".to_string())
+    // Extract (and thereby verify) the volume key without activating dm-crypt
+    // (name=None), then cache it so follow-up enroll/wipe ops run from this
+    // single unlock -- mirroring verify_token.
+    let key_size = dev.status_handle().get_volume_key_size().max(0) as usize;
+    let mut vk_buf = Zeroizing::new(vec![0u8; key_size.max(1)]);
+    match dev
+        .volume_key_handle()
+        .get(None, &mut vk_buf, Some(passphrase.as_bytes()))
+    {
+        Ok((slot, size)) => {
+            vk_buf.truncate(size);
+            cache_volume_key(device, VolumeKey::new(vk_buf.to_vec()));
+            Ok(slot)
+        }
+        Err(_) => Err("Incorrect passphrase or recovery key".to_string()),
+    }
 }
 
 /// Derive the LUKS passphrase bytes from a token (FIDO2 assertion or TPM2
@@ -418,8 +429,10 @@ pub fn verify_token(device: &str, token_type: &str, pin: &str) -> std::result::R
 /// Get the volume key for a device using the given unlock method
 /// ("passphrase", "systemd-fido2" or "systemd-tpm2").
 ///
-/// Token methods consult the volume-key cache first (populated by
-/// `verify_token`) to avoid a second FIDO2 touch / TPM2 unseal.
+/// All methods consult the volume-key cache first (populated here, by
+/// `verify_token`, or by `verify_passphrase`) so a sequence of ops runs from a
+/// single extraction -- avoiding a second FIDO2 touch / TPM2 unseal, or a
+/// repeated argon2id pass for a passphrase.
 pub fn get_volume_key(
     device: &str,
     unlock_method: &str,
@@ -432,10 +445,10 @@ pub fn get_volume_key(
         bail!("Invalid unlock method: {unlock_method:?}");
     }
     let token_based = unlock_method != "passphrase";
-    if token_based {
-        if let Some(vk) = cached_volume_key(device) {
-            return Ok(vk);
-        }
+    // Reuse a cached volume key (from a prior unlock or op) for any unlock
+    // method, so a sequence of enroll/wipe ops runs from a single extraction.
+    if let Some(vk) = cached_volume_key(device) {
+        return Ok(vk);
     }
 
     let mut dev = open_luks2(device)?;
@@ -452,7 +465,12 @@ pub fn get_volume_key(
         .get(None, &mut vk_buf, Some(&pw))
         .map_err(|e| Error(format!("Failed to get volume key ({e})")))?;
     vk_buf.truncate(size);
-    Ok(VolumeKey::new(vk_buf.to_vec()))
+    let vk = VolumeKey::new(vk_buf.to_vec());
+    // Prime the cache for every unlock method so a sequence of enroll/wipe ops
+    // runs from a single extraction -- one FIDO2 tap / TPM2 unseal, or one
+    // argon2id pass for a passphrase. Entries expire after VOLUME_KEY_CACHE_TTL.
+    cache_volume_key(device, vk.clone());
+    Ok(vk)
 }
 
 // ---------------------------------------------------------------------------
@@ -637,5 +655,54 @@ mod tests {
         let meta = serde_json::json!({"keyslots": {}});
         assert!(tpm2_refs_from_meta(&meta).unwrap().is_empty());
         assert!(fido2_refs_from_meta(&meta).unwrap().is_empty());
+    }
+
+    // Regression for issue #15: a single token unlock must serve a *sequence*
+    // of enroll/wipe ops without re-prompting. The cache is therefore not
+    // consumed by a read and is only dropped by an explicit clear or the TTL —
+    // never eagerly after each op.
+    #[test]
+    fn volume_key_cache_serves_repeated_reads_until_cleared() {
+        // Unique key so parallel tests don't touch the same global entry.
+        let dev = "/dev/luks-enroll-vk-cache-test-repeat";
+        clear_volume_key_cache(dev);
+        assert!(cached_volume_key(dev).is_none(), "starts empty");
+
+        cache_volume_key(dev, VolumeKey::new(vec![1, 2, 3, 4]));
+
+        // Multiple reads all hit: this is what lets two enrollments run from
+        // one FIDO2 tap. A read does not consume the entry.
+        for _ in 0..3 {
+            let got = cached_volume_key(dev).expect("cache hit");
+            assert_eq!(got.as_bytes(), &[1, 2, 3, 4]);
+        }
+
+        clear_volume_key_cache(dev);
+        assert!(cached_volume_key(dev).is_none(), "cleared explicitly");
+    }
+
+    #[test]
+    fn volume_key_cache_expires_after_ttl() {
+        let dev = "/dev/luks-enroll-vk-cache-test-ttl";
+        clear_volume_key_cache(dev);
+
+        // Insert with a timestamp already older than the TTL.
+        let stale = Instant::now()
+            .checked_sub(VOLUME_KEY_CACHE_TTL + Duration::from_secs(1))
+            .expect("instant in range");
+        VOLUME_KEY_CACHE
+            .lock()
+            .unwrap()
+            .insert(realpath(dev), (VolumeKey::new(vec![9, 9]), stale));
+
+        assert!(
+            cached_volume_key(dev).is_none(),
+            "stale entry is treated as a miss"
+        );
+        // And the expired entry is evicted on access.
+        assert!(!VOLUME_KEY_CACHE
+            .lock()
+            .unwrap()
+            .contains_key(&realpath(dev)));
     }
 }

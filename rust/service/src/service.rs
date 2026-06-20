@@ -343,7 +343,6 @@ pub fn op_enroll_fido2(
             "fido2-uv-required": false,
         });
         luks::set_token(device, -1, Some(&token_json.to_string()))?;
-        luks::clear_volume_key_cache(device);
         Ok((true, String::new(), String::new()))
     };
     run().unwrap_or_else(|e| op_failed("EnrollFido2", e))
@@ -397,7 +396,6 @@ pub fn op_enroll_tpm2(
             "tpm2_srk": B64.encode(&sealed.srk_blob),
         });
         luks::set_token(device, -1, Some(&token_json.to_string()))?;
-        luks::clear_volume_key_cache(device);
         Ok((true, String::new(), String::new()))
     };
     run().unwrap_or_else(|e| op_failed("EnrollTpm2", e))
@@ -418,7 +416,6 @@ pub fn op_enroll_recovery_key(
             "keyslots": [keyslot.to_string()],
         });
         luks::set_token(device, -1, Some(&token_json.to_string()))?;
-        luks::clear_volume_key_cache(device);
         // The GUI parses the recovery key from the stdout field.
         Ok((true, recovery_key, String::new()))
     };
@@ -435,7 +432,6 @@ pub fn op_enroll_passphrase(
     let run = || -> crate::error::Result<Triple> {
         let vk = luks::get_volume_key(device, unlock_method, existing_passphrase, unlock_pin)?;
         luks::add_keyslot_by_volume_key(device, &vk, new_passphrase.as_bytes(), false)?;
-        luks::clear_volume_key_cache(device);
         Ok((true, String::new(), String::new()))
     };
     run().unwrap_or_else(|e| op_failed("EnrollPassphrase", e))
@@ -468,7 +464,6 @@ pub fn op_wipe_slot(
             luks::set_token(device, token_id, None)?;
         }
         luks::destroy_keyslot(device, slot)?;
-        luks::clear_volume_key_cache(device);
         Ok((true, String::new(), String::new()))
     };
     run().unwrap_or_else(|e| op_failed("WipeSlot", e))
