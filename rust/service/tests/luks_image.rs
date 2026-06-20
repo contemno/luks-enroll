@@ -270,3 +270,32 @@ fn tpm2_token_full_shape_roundtrip() {
     assert_eq!(refs[0].pcr_bank, "sha256");
     assert!(refs[0].pin_required);
 }
+
+/// The volume-key cache is no longer gated on token-based unlock: a passphrase
+/// extraction primes the cache (write gate gone) and a subsequent call is
+/// served from it (read gate gone). Proven by a second call with a *wrong*
+/// passphrase succeeding and returning the same key.
+#[test]
+fn passphrase_volume_key_is_cached_and_reused() {
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
+    luks::clear_volume_key_cache(&img);
+
+    let vk1 = luks::get_volume_key(&img, "passphrase", PASSPHRASE, "").expect("vk");
+    let vk2 = luks::get_volume_key(&img, "passphrase", "definitely-wrong", "")
+        .expect("served from cache, not re-validated");
+    assert_eq!(vk1.as_bytes(), vk2.as_bytes());
+}
+
+/// verify_passphrase now primes the cache (mirroring verify_token), so a
+/// follow-up get_volume_key is served even with a wrong passphrase.
+#[test]
+fn verify_passphrase_primes_volume_key_cache() {
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
+    luks::clear_volume_key_cache(&img);
+
+    let slot = luks::verify_passphrase(&img, PASSPHRASE).expect("verify");
+    assert!(slot >= 0);
+    assert!(luks::get_volume_key(&img, "passphrase", "definitely-wrong", "").is_ok());
+}
