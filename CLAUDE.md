@@ -78,8 +78,19 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
 ## CI
 
 - `ci.yml` validates PRs and **classifies the diff** so unrelated jobs skip: `*.md`/LICENSE →
-  docs (lint/test/rust skip); `rust/**` → Rust job; `*.py` / `tests/**` → Python jobs;
+  docs (lint/test/rust skip); `rust/**` → Rust jobs; `*.py` / `tests/**` → Python jobs;
   anything else → both. Keep diffs scoped so the right checks run.
+- The Rust check fans out into two **parallel, cached** jobs — `rust-build`
+  (fmt/clippy/build/`cargo test --workspace`) and `swtpm` (the TPM2 seal/unseal roundtrips
+  against `swtpm`) — aggregated by the required `rust` check, which passes only if both do, so
+  TPM failures still gate merges with no branch-protection change. Both share a
+  `Swatinem/rust-cache` workspace (cargo registry + `rust/target`, keyed on `rust/Cargo.lock`).
+  `swtpm` runs on every `rust/**` change (not path-gated): it's the only real-TPM coverage and
+  guards the parity-critical systemd token format, which shared code can break without touching
+  `tpm2.rs`.
+- The release build (`build-release.yml`) caches cargo + `rust/target` too (distinct key,
+  release profile), building with `dpkg-buildpackage -nc` so the Debian `clean` step doesn't
+  wipe the restored cache.
 - The release pipeline (`autotag.yml` → `build-release.yml`) runs on push to `dev` (prerelease)
   and `main` (release).
 - `ci.yml` gates PRs into **both** `dev` and `main` (feature→dev PRs and the dev→main release
