@@ -7,6 +7,7 @@
 //! the crate's `mutex` feature (libcryptsetup is not thread-safe).
 
 use std::collections::{BTreeMap, HashMap};
+use std::os::raw::c_uint;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use libcryptsetup_rs::consts::flags::{CryptPbkdf, CryptVolumeKey};
 use libcryptsetup_rs::consts::vals::{CryptKdf, EncryptionFormat};
-use libcryptsetup_rs::{CryptDevice, CryptInit, CryptPbkdfType, Either, TokenInput};
+use libcryptsetup_rs::{CryptDevice, CryptInit, CryptPbkdfType, Either, LibcryptErr, TokenInput};
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
@@ -202,6 +203,26 @@ fn token_keyslots(tinfo: &serde_json::Value) -> Vec<i32> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Ordered, de-duplicated keyslots bound to tokens of `token_type` in the
+/// given LUKS2 metadata. Empty when the type has no tokens / no recorded
+/// keyslots — the signal for `extract_token_volume_key` to try every slot.
+fn token_type_keyslots(meta: &serde_json::Value, token_type: &str) -> Vec<i32> {
+    let mut slots = Vec::new();
+    let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) else {
+        return slots;
+    };
+    for tinfo in tokens.values() {
+        if tinfo.get("type").and_then(|t| t.as_str()) == Some(token_type) {
+            for s in token_keyslots(tinfo) {
+                if !slots.contains(&s) {
+                    slots.push(s);
+                }
+            }
+        }
+    }
+    slots
 }
 
 /// Keyslot numbers not referenced by any token (i.e. plain password slots).
@@ -401,6 +422,51 @@ fn derive_passphrase_from_token(
     Ok(encoded)
 }
 
+/// Extract the volume key for a token-derived passphrase `pw`, querying the
+/// keyslot(s) the token unlocks before falling back to "try all keyslots".
+///
+/// crypt_volume_key_get with keyslot -1 (None) tries every keyslot in turn,
+/// and each non-matching slot still runs its full KDF before failing — the
+/// argon2id passphrase slot alone costs 1–2 s. Token keyslots use fast
+/// pbkdf2, so targeting them directly avoids that cost (issue #16: 2–4 s
+/// in-app unlock). Falls back to None (-1, try all) when the token records
+/// no keyslots or the targeted slots don't match, so correctness is never
+/// worse than before. Returns (keyslot, volume key).
+pub fn extract_token_volume_key(
+    device: &str,
+    token_type: &str,
+    pw: &[u8],
+) -> Result<(i32, VolumeKey)> {
+    let mut dev = open_luks2(device)?;
+    let meta = dev
+        .status_handle()
+        .dump_json()
+        .unwrap_or(serde_json::Value::Null);
+    let key_size = dev.status_handle().get_volume_key_size().max(0) as usize;
+
+    // Targeted token keyslots first, then None (-1, try all) as a safety net.
+    let mut candidates: Vec<Option<c_uint>> = token_type_keyslots(&meta, token_type)
+        .into_iter()
+        .map(|s| Some(s as c_uint))
+        .collect();
+    candidates.push(None);
+
+    let mut last_err: Option<LibcryptErr> = None;
+    for slot in candidates {
+        let mut vk_buf = Zeroizing::new(vec![0u8; key_size.max(1)]);
+        match dev.volume_key_handle().get(slot, &mut vk_buf, Some(pw)) {
+            Ok((found, size)) => {
+                vk_buf.truncate(size);
+                return Ok((found, VolumeKey::new(vk_buf.to_vec())));
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err
+        .map(Error::from)
+        .unwrap_or_else(|| Error::from("volume key extraction failed")))
+}
+
 /// Verify unlock via a LUKS2 token (FIDO2/TPM2) and cache the volume key so
 /// follow-up enrollment operations don't need a second touch/unseal.
 /// Returns the keyslot, or an error message.
@@ -413,16 +479,12 @@ pub fn verify_token(device: &str, token_type: &str, pin: &str) -> std::result::R
     }
     let pw = derive_passphrase_from_token(device, token_type, pin).map_err(|e| e.0)?;
 
-    let mut dev = open_luks2(device).map_err(|e| e.0)?;
-    let key_size = dev.status_handle().get_volume_key_size().max(0) as usize;
-    let mut vk_buf = Zeroizing::new(vec![0u8; key_size.max(1)]);
-    match dev.volume_key_handle().get(None, &mut vk_buf, Some(&pw)) {
-        Ok((slot, size)) => {
-            vk_buf.truncate(size);
-            cache_volume_key(device, VolumeKey::new(vk_buf.to_vec()));
+    match extract_token_volume_key(device, token_type, &pw) {
+        Ok((slot, vk)) => {
+            cache_volume_key(device, vk);
             Ok(slot)
         }
-        Err(e) => Err(format!("Token unlock failed ({e})")),
+        Err(e) => Err(format!("Token unlock failed ({})", e.0)),
     }
 }
 
@@ -451,21 +513,25 @@ pub fn get_volume_key(
         return Ok(vk);
     }
 
-    let mut dev = open_luks2(device)?;
-    let pw: Zeroizing<Vec<u8>> = if token_based {
-        derive_passphrase_from_token(device, unlock_method, unlock_pin)?
+    let vk = if token_based {
+        // Target the token's own keyslot(s) to skip slow KDF attempts against
+        // unrelated keyslots (issue #16).
+        let pw = derive_passphrase_from_token(device, unlock_method, unlock_pin)?;
+        let (_slot, vk) = extract_token_volume_key(device, unlock_method, &pw)
+            .map_err(|e| Error(format!("Failed to get volume key ({})", e.0)))?;
+        vk
     } else {
-        Zeroizing::new(passphrase.as_bytes().to_vec())
+        let mut dev = open_luks2(device)?;
+        let pw = Zeroizing::new(passphrase.as_bytes().to_vec());
+        let key_size = dev.status_handle().get_volume_key_size().max(0) as usize;
+        let mut vk_buf = Zeroizing::new(vec![0u8; key_size.max(1)]);
+        let (_slot, size) = dev
+            .volume_key_handle()
+            .get(None, &mut vk_buf, Some(&pw))
+            .map_err(|e| Error(format!("Failed to get volume key ({e})")))?;
+        vk_buf.truncate(size);
+        VolumeKey::new(vk_buf.to_vec())
     };
-
-    let key_size = dev.status_handle().get_volume_key_size().max(0) as usize;
-    let mut vk_buf = Zeroizing::new(vec![0u8; key_size.max(1)]);
-    let (_slot, size) = dev
-        .volume_key_handle()
-        .get(None, &mut vk_buf, Some(&pw))
-        .map_err(|e| Error(format!("Failed to get volume key ({e})")))?;
-    vk_buf.truncate(size);
-    let vk = VolumeKey::new(vk_buf.to_vec());
     // Prime the cache for every unlock method so a sequence of enroll/wipe ops
     // runs from a single extraction -- one FIDO2 tap / TPM2 unseal, or one
     // argon2id pass for a passphrase. Entries expire after VOLUME_KEY_CACHE_TTL.
@@ -704,5 +770,42 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&realpath(dev)));
+    }
+
+    #[test]
+    fn token_type_keyslots_targets_matching_type() {
+        // tpm2 token bound to slot 1, fido2 token bound to slot 2: a query
+        // for one type returns only that type's slot (issue #16 targeting).
+        let meta = serde_json::json!({
+            "tokens": {
+                "0": { "type": "systemd-tpm2", "keyslots": ["1"] },
+                "1": { "type": "systemd-fido2", "keyslots": ["2"] },
+            }
+        });
+        assert_eq!(token_type_keyslots(&meta, "systemd-tpm2"), vec![1]);
+        assert_eq!(token_type_keyslots(&meta, "systemd-fido2"), vec![2]);
+    }
+
+    #[test]
+    fn token_type_keyslots_dedups_across_tokens() {
+        let meta = serde_json::json!({
+            "tokens": {
+                "0": { "type": "systemd-fido2", "keyslots": ["1", "2"] },
+                "1": { "type": "systemd-fido2", "keyslots": ["2", "3"] },
+            }
+        });
+        assert_eq!(token_type_keyslots(&meta, "systemd-fido2"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn token_type_keyslots_empty_when_type_absent() {
+        // No token of the queried type -> empty -> caller falls back to -1.
+        let meta = serde_json::json!({
+            "tokens": { "0": { "type": "systemd-tpm2", "keyslots": ["1"] } }
+        });
+        assert!(token_type_keyslots(&meta, "systemd-recovery").is_empty());
+        // A missing tokens section is empty too, not a panic.
+        let empty = serde_json::json!({ "keyslots": {} });
+        assert!(token_type_keyslots(&empty, "systemd-tpm2").is_empty());
     }
 }

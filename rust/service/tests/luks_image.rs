@@ -100,6 +100,45 @@ fn enroll_recovery_key_golden_token() {
 }
 
 #[test]
+fn token_volume_key_targets_keyslot_and_falls_back() {
+    // Regression for issue #16: token unlock must query the token's own
+    // keyslot instead of every keyslot (which runs the slow argon2id
+    // password slot first). A systemd-recovery token stands in for a
+    // FIDO2/TPM2 token — its recovery key unlocks its keyslot as an
+    // ordinary passphrase, so the targeted path is exercised without
+    // real hardware.
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
+
+    let (ok, recovery_key, err) =
+        service::op_enroll_recovery_key(&img, PASSPHRASE, "passphrase", "");
+    assert!(ok, "recovery enrollment failed: {err}");
+
+    let tokens = luks::tokens_by_type(&img, "systemd-recovery");
+    assert_eq!(tokens.len(), 1);
+    let rk_slot = tokens[0].1[0];
+
+    // Targeted path: the recovery token records its keyslot, so extraction
+    // unlocks via that exact slot.
+    let (slot, vk_targeted) =
+        luks::extract_token_volume_key(&img, "systemd-recovery", recovery_key.as_bytes())
+            .expect("targeted extraction");
+    assert_eq!(slot, rk_slot, "should unlock via the token's own keyslot");
+
+    // Fallback path: no systemd-fido2 token exists, so there are no targeted
+    // slots and extraction falls back to -1 (try all). Still correct, and it
+    // yields the same volume key.
+    let (_slot, vk_fallback) =
+        luks::extract_token_volume_key(&img, "systemd-fido2", recovery_key.as_bytes())
+            .expect("fallback extraction");
+    assert_eq!(
+        vk_targeted.as_bytes(),
+        vk_fallback.as_bytes(),
+        "targeted and fallback paths must yield the same volume key"
+    );
+}
+
+#[test]
 fn enroll_passphrase_and_wipe_slot() {
     let dir = tmpdir();
     let img = new_luks_image(&dir);
