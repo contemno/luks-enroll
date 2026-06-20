@@ -26,7 +26,8 @@ jobs:
   #
   # Mapping:
   #   *.md / LICENSE        -> docs, ignored
-  #   rust/**               -> Rust (build/clippy/test + TPM roundtrips)
+  #   rust/**               -> Rust: rust-build (fmt/clippy/build/test) and the
+  #                            swtpm job (TPM2 roundtrips), gated by the `rust` check
   #   *.py / pyproject.toml / requirements-dev.txt / tests/**
   #                         -> Python (ruff lint + pytest)
   #   anything else         -> shared/build infra (debian/, scripts/, Makefile,
@@ -106,7 +107,18 @@ jobs:
       - name: Run tests
         run: python3 -m pytest tests/ -v
 
-  rust:
+  # The Rust checks fan out into two parallel jobs that share a build cache:
+  #   rust-build — fmt + clippy + build + `cargo test --workspace`
+  #   swtpm      — the #[ignore]d TPM2 seal/unseal roundtrips against swtpm
+  # The required status check stays named `rust`: it's a tiny aggregator (below)
+  # that passes only if BOTH finish green, so TPM failures keep gating merges
+  # with no branch-protection change. Splitting swtpm off moves its install +
+  # startup and the TPM compile-and-run off the build critical path (no coverage
+  # loss — the same two roundtrips still run). swtpm is intentionally NOT
+  # path-gated to tpm2.rs: it's the only real-TPM coverage and guards the
+  # parity-critical systemd token format, which shared code can break without
+  # touching tpm2.rs; running in parallel makes the extra coverage ~free.
+  rust-build:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
@@ -122,6 +134,15 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libcryptsetup-dev libfido2-dev libtss2-dev libblkid-dev
 
+      # Cache the cargo registry/git and rust/target, keyed on rust/Cargo.lock +
+      # rustc. `shared-key` (instead of the default per-job key) lets the swtpm
+      # job restore the same warm cache; the manifest lives under rust/.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: rust
+          shared-key: rust-ci
+
       - name: Format check
         run: cargo fmt --all --check
 
@@ -134,6 +155,30 @@ jobs:
       - name: Tests (includes LUKS2 image-file integration tests)
         run: cargo test --workspace
 
+  swtpm:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install C build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcryptsetup-dev libfido2-dev libtss2-dev libblkid-dev
+
+      # Same shared-key as rust-build: both restore one warm cache (rust-cache
+      # caches dependencies, which are identical across the two jobs).
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          workspaces: rust
+          shared-key: rust-ci
+
       - name: TPM2 seal/unseal roundtrips against swtpm
         run: |
           sudo apt-get install -y --no-install-recommends swtpm
@@ -142,3 +187,19 @@ jobs:
             --flags not-need-init,startup-clear --tpmstate dir=/tmp/swtpm-state --daemon
           TCTI="swtpm:host=127.0.0.1,port=2321" \
             cargo test -p luks-enroll-service tpm2 -- --ignored
+
+  # Aggregator: the single required `rust` status check. `if: always()` makes it
+  # run even when an upstream job fails, so it FAILS the check (a plain `needs`
+  # job would instead be reported "skipped", which branch protection treats as
+  # passing). On docs-only PRs (rust == false) it's skipped, which still
+  # satisfies branch protection — same as the lint/test/area jobs.
+  rust:
+    needs: [changes, rust-build, swtpm]
+    if: always() && needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require rust-build and swtpm to pass
+        run: |
+          echo "rust-build=${{ needs.rust-build.result }} swtpm=${{ needs.swtpm.result }}"
+          [ "${{ needs.rust-build.result }}" = "success" ] || exit 1
+          [ "${{ needs.swtpm.result }}" = "success" ] || exit 1
