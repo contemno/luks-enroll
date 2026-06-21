@@ -60,7 +60,7 @@ crypt-root  UUID=...  none  tpm2-device=auto,fido2-device=auto,luks,discard
 rust/                              Privileged service (Rust workspace)
   service/                         luks-enroll-service crate
     src/                           D-Bus service + cryptsetup/TPM2/FIDO2/format logic
-    tests/                         LUKS2 image-file, D-Bus e2e, and fd-passing integration tests
+    tests/                         LUKS2 image-file, D-Bus e2e, fd-passing, config-parity integration tests
       common/mod.rs                Shared test harness (temp-dir, LUKS-image factory, passphrase)
   fido2-sys/                       bindgen FFI to libfido2 (built against system headers)
 
