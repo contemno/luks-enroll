@@ -14,9 +14,10 @@ use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-const BUS_NAME: &str = "net.contemno.LuksEnroll";
-const OBJECT_PATH: &str = "/net/contemno/LuksEnroll";
-const INTERFACE: &str = "net.contemno.LuksEnroll1";
+use luks_enroll_service::constants::{BUS_NAME, INTERFACE, OBJECT_PATH};
+
+mod common;
+use common::{new_luks_image, tmpdir, PASSPHRASE};
 
 struct Procs {
     daemon: Child,
@@ -109,12 +110,8 @@ async fn e2e_over_private_bus() {
 
     // --- Privileged read on a caller-owned image file: the ownership
     //     check must bypass polkit and succeed end-to-end. ---
-    let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
-    let img = dir.path().join("e2e.img").to_string_lossy().into_owned();
-    let (ok, keyslot, err) =
-        luks_enroll_service::service::op_create_encrypted_image(&img, 32, "pw-e2e", None);
-    assert!(ok, "image creation failed: {err}");
-    assert_eq!(keyslot, 0);
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
 
     let keyslots_json: String = proxy
         .call("GetKeyslots", &(img.as_str(),))
@@ -132,7 +129,7 @@ async fn e2e_over_private_bus() {
 
     // --- Manage-action method on the owned file (VerifyPassphrase). ---
     let (ok, slot): (bool, i32) = proxy
-        .call("VerifyPassphrase", &(img.as_str(), "pw-e2e"))
+        .call("VerifyPassphrase", &(img.as_str(), PASSPHRASE))
         .await
         .expect("VerifyPassphrase");
     assert!(ok);
