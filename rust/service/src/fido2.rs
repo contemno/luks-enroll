@@ -288,6 +288,17 @@ fn classify_probe_ret(ret: c_int) -> Option<bool> {
     }
 }
 
+/// Assert setup shared by both `fido_dev_get_assert` paths: bind the RP and
+/// the all-zero 32-byte clientdata hash. Each caller then adds its own
+/// allow_cred / up / uv (and, for unlock, the hmac-secret extension + salt).
+fn setup_assert_common(assert: &Assert) {
+    let zeroes = [0u8; 32];
+    unsafe {
+        fido2_sys::fido_assert_set_rp(assert.0, FIDO2_RP_ID_C.as_ptr());
+        fido2_sys::fido_assert_set_clientdata_hash(assert.0, zeroes.as_ptr(), zeroes.len());
+    }
+}
+
 /// Check if `dev` holds `cred_id` without consuming a touch or a PIN
 /// retry (mirrors `_fido2_probe_credential`): assertion with UP=false,
 /// UV=omit, no PIN, no hmac-secret extension. Callers use `== Some(true)`
@@ -296,10 +307,8 @@ fn probe_credential(dev: &Dev, cred_id: &[u8]) -> Option<bool> {
     let Ok(assert) = Assert::new() else {
         return None;
     };
-    let zeroes = [0u8; 32];
+    setup_assert_common(&assert);
     unsafe {
-        fido2_sys::fido_assert_set_rp(assert.0, FIDO2_RP_ID_C.as_ptr());
-        fido2_sys::fido_assert_set_clientdata_hash(assert.0, zeroes.as_ptr(), zeroes.len());
         fido2_sys::fido_assert_allow_cred(assert.0, cred_id.as_ptr(), cred_id.len());
         fido2_sys::fido_assert_set_up(assert.0, FIDO_OPT_FALSE);
         fido2_sys::fido_assert_set_uv(assert.0, FIDO_OPT_OMIT);
@@ -314,10 +323,8 @@ fn probe_credential(dev: &Dev, cred_id: &[u8]) -> Option<bool> {
 /// user must touch the token; `None`/empty pin sends no PIN.
 fn get_hmac_secret(dev: &Dev, cred_id: &[u8], salt: &[u8], pin: Option<&str>) -> Result<Vec<u8>> {
     let assert = Assert::new()?;
-    let zeroes = [0u8; 32];
+    setup_assert_common(&assert);
     unsafe {
-        fido2_sys::fido_assert_set_rp(assert.0, FIDO2_RP_ID_C.as_ptr());
-        fido2_sys::fido_assert_set_clientdata_hash(assert.0, zeroes.as_ptr(), zeroes.len());
         fido2_sys::fido_assert_set_extensions(assert.0, FIDO_EXT_HMAC_SECRET);
         fido2_sys::fido_assert_set_hmac_salt(assert.0, salt.as_ptr(), salt.len());
         fido2_sys::fido_assert_allow_cred(assert.0, cred_id.as_ptr(), cred_id.len());
@@ -423,76 +430,55 @@ fn canonical_cstring(path: &str) -> Option<CString> {
 // RAII wrappers for libfido2 handles
 // ---------------------------------------------------------------------------
 
-/// Owned `fido_dev_t`. Drop closes then frees; `fido_dev_close` on a
-/// never-opened device just returns FIDO_ERR_INVALID_ARGUMENT, so the
-/// unconditional close is harmless (the Python's `finally` blocks rely on
-/// the same behavior).
-struct Dev(*mut fido2_sys::fido_dev_t);
+/// Define a newtype owning a `*mut fido2_sys::$ty`: `new()` allocates via
+/// `$new` (null-checked) and `Drop` frees via `$free(&mut self.0)`. The
+/// optional `close = $close` runs `$close(self.0)` before the free.
+macro_rules! fido_raii {
+    ($name:ident, $ty:ident, $new:ident, $free:ident $(, close = $close:ident)?) => {
+        struct $name(*mut fido2_sys::$ty);
+
+        impl $name {
+            fn new() -> Result<Self> {
+                let ptr = unsafe { fido2_sys::$new() };
+                if ptr.is_null() {
+                    bail!(concat!(stringify!($new), " failed"));
+                }
+                Ok(Self(ptr))
+            }
+        }
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                unsafe {
+                    $( fido2_sys::$close(self.0); )?
+                    fido2_sys::$free(&mut self.0);
+                }
+            }
+        }
+    };
+}
+
+// Owned `fido_cred_t` / `fido_assert_t`, freed on drop.
+fido_raii!(Cred, fido_cred_t, fido_cred_new, fido_cred_free);
+fido_raii!(Assert, fido_assert_t, fido_assert_new, fido_assert_free);
+
+// Owned `fido_dev_t`. Drop closes then frees; `fido_dev_close` on a
+// never-opened device just returns FIDO_ERR_INVALID_ARGUMENT, so the
+// unconditional close is harmless (the Python's `finally` blocks rely on
+// the same behavior).
+fido_raii!(
+    Dev,
+    fido_dev_t,
+    fido_dev_new,
+    fido_dev_free,
+    close = fido_dev_close
+);
 
 impl Dev {
-    fn new() -> Result<Self> {
-        let ptr = unsafe { fido2_sys::fido_dev_new() };
-        if ptr.is_null() {
-            bail!("fido_dev_new failed");
-        }
-        Ok(Self(ptr))
-    }
-
     /// `fido_dev_open`; returns the raw libfido2 code (`FIDO_OK` on
     /// success).
     fn open(&mut self, path: &CStr) -> c_int {
         unsafe { fido2_sys::fido_dev_open(self.0, path.as_ptr()) }
-    }
-}
-
-impl Drop for Dev {
-    fn drop(&mut self) {
-        unsafe {
-            fido2_sys::fido_dev_close(self.0);
-            fido2_sys::fido_dev_free(&mut self.0);
-        }
-    }
-}
-
-/// Owned `fido_cred_t`, freed on drop.
-struct Cred(*mut fido2_sys::fido_cred_t);
-
-impl Cred {
-    fn new() -> Result<Self> {
-        let ptr = unsafe { fido2_sys::fido_cred_new() };
-        if ptr.is_null() {
-            bail!("fido_cred_new failed");
-        }
-        Ok(Self(ptr))
-    }
-}
-
-impl Drop for Cred {
-    fn drop(&mut self) {
-        unsafe {
-            fido2_sys::fido_cred_free(&mut self.0);
-        }
-    }
-}
-
-/// Owned `fido_assert_t`, freed on drop.
-struct Assert(*mut fido2_sys::fido_assert_t);
-
-impl Assert {
-    fn new() -> Result<Self> {
-        let ptr = unsafe { fido2_sys::fido_assert_new() };
-        if ptr.is_null() {
-            bail!("fido_assert_new failed");
-        }
-        Ok(Self(ptr))
-    }
-}
-
-impl Drop for Assert {
-    fn drop(&mut self) {
-        unsafe {
-            fido2_sys::fido_assert_free(&mut self.0);
-        }
     }
 }
 
@@ -523,6 +509,19 @@ impl Drop for DevInfoList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raii_wrappers_construct_and_drop() {
+        // The `*_new` allocators need no hardware, and Drop's close/free on an
+        // unopened/empty handle is safe (`fido_dev_close` on a never-opened
+        // device is a harmless no-op; `fido_dev_info_free` frees an empty list).
+        // This is the only direct coverage of the `fido_raii!`-generated
+        // new()/Drop; each value is dropped at the end of its statement.
+        Cred::new().expect("fido_cred_new");
+        Assert::new().expect("fido_assert_new");
+        Dev::new().expect("fido_dev_new");
+        DevInfoList::new(64).expect("fido_dev_info_new");
+    }
 
     #[test]
     fn rp_id_cstring_matches_rp_id() {
