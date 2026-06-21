@@ -303,6 +303,14 @@ fn op_failed(op: &str, e: impl std::fmt::Display) -> Triple {
     (false, String::new(), "Operation failed".to_string())
 }
 
+/// Shared wrapper for the `op_*` entry points: run the operation body and, on
+/// any error, log the real cause and return the generic failure triple. Keeps
+/// the enroll/wipe handlers from each repeating the closure +
+/// `unwrap_or_else(op_failed)` dance.
+fn run_op(op: &str, body: impl FnOnce() -> crate::error::Result<Triple>) -> Triple {
+    body().unwrap_or_else(|e| op_failed(op, e))
+}
+
 pub fn op_enroll_fido2(
     device: &str,
     passphrase: &str,
@@ -311,7 +319,7 @@ pub fn op_enroll_fido2(
     unlock_method: &str,
     unlock_pin: &str,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
+    run_op("EnrollFido2", || {
         // Reject if this physical token is already enrolled on this volume.
         let existing_creds: Vec<Vec<u8>> = luks::fido2_token_refs(device)
             .map(|refs| refs.into_iter().map(|r| r.cred_id).collect())
@@ -345,8 +353,7 @@ pub fn op_enroll_fido2(
         });
         luks::set_token(device, -1, Some(&token_json.to_string()))?;
         Ok((true, String::new(), String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("EnrollFido2", e))
+    })
 }
 
 pub fn op_enroll_tpm2(
@@ -357,7 +364,7 @@ pub fn op_enroll_tpm2(
     unlock_method: &str,
     unlock_pin: &str,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
+    run_op("EnrollTpm2", || {
         // Random 32-byte secret to seal.
         let mut secret = zeroize::Zeroizing::new(vec![0u8; 32]);
         getrandom::fill(&mut secret).map_err(|e| crate::error::Error(e.to_string()))?;
@@ -398,8 +405,7 @@ pub fn op_enroll_tpm2(
         });
         luks::set_token(device, -1, Some(&token_json.to_string()))?;
         Ok((true, String::new(), String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("EnrollTpm2", e))
+    })
 }
 
 pub fn op_enroll_recovery_key(
@@ -408,7 +414,7 @@ pub fn op_enroll_recovery_key(
     unlock_method: &str,
     unlock_pin: &str,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
+    run_op("EnrollRecoveryKey", || {
         let recovery_key = recovery::make_recovery_key();
         let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
         let keyslot = luks::add_keyslot_by_volume_key(device, &vk, recovery_key.as_bytes(), false)?;
@@ -419,8 +425,7 @@ pub fn op_enroll_recovery_key(
         luks::set_token(device, -1, Some(&token_json.to_string()))?;
         // The GUI parses the recovery key from the stdout field.
         Ok((true, recovery_key, String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("EnrollRecoveryKey", e))
+    })
 }
 
 pub fn op_enroll_passphrase(
@@ -430,12 +435,11 @@ pub fn op_enroll_passphrase(
     unlock_method: &str,
     unlock_pin: &str,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
+    run_op("EnrollPassphrase", || {
         let vk = luks::get_volume_key(device, unlock_method, existing_passphrase, unlock_pin)?;
         luks::add_keyslot_by_volume_key(device, &vk, new_passphrase.as_bytes(), false)?;
         Ok((true, String::new(), String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("EnrollPassphrase", e))
+    })
 }
 
 pub fn op_wipe_slot(
@@ -445,7 +449,7 @@ pub fn op_wipe_slot(
     pin: &str,
     slot: i32,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
+    run_op("WipeSlot", || {
         // Verify the caller can unlock the device at all.
         luks::get_volume_key(device, unlock_method, passphrase, pin)?;
 
@@ -466,8 +470,7 @@ pub fn op_wipe_slot(
         }
         luks::destroy_keyslot(device, slot)?;
         Ok((true, String::new(), String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("WipeSlot", e))
+    })
 }
 
 pub fn op_create_encrypted_image(
