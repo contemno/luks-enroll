@@ -311,6 +311,47 @@ fn run_op(op: &str, body: impl FnOnce() -> crate::error::Result<Triple>) -> Trip
     body().unwrap_or_else(|e| op_failed(op, e))
 }
 
+/// What an enrollment modality produces before the shared keyslot + token spine
+/// runs. `token` holds every token-JSON field *except* `keyslots`; the spine
+/// fills that in once the new slot index is known, so the three modalities share
+/// one identical `"keyslots": [slot]` step.
+struct Prepared {
+    /// Bytes added as the new keyslot's passphrase.
+    keyslot_secret: Vec<u8>,
+    /// Minimal-PBKDF (high-entropy secret) vs. the default KDF (typed key).
+    minimal_pbkdf: bool,
+    /// stdout field of the success triple (the recovery key, else empty).
+    stdout: String,
+    /// Token JSON without its `keyslots` field.
+    token: serde_json::Value,
+}
+
+/// Shared enrollment spine for FIDO2 / TPM2 / recovery: run `prepare` to produce
+/// the modality secret and token, then unlock the volume, add a keyslot from the
+/// volume key, stamp the new slot into the token, and persist it. `prepare` runs
+/// first so secret/hardware failures surface before any volume mutation, matching
+/// the original per-modality ordering.
+fn enroll_token(
+    device: &str,
+    unlock_method: &str,
+    unlock_pin: &str,
+    passphrase: &str,
+    prepare: impl FnOnce() -> crate::error::Result<Prepared>,
+) -> crate::error::Result<Triple> {
+    let prepared = prepare()?;
+    let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
+    let keyslot = luks::add_keyslot_by_volume_key(
+        device,
+        &vk,
+        &prepared.keyslot_secret,
+        prepared.minimal_pbkdf,
+    )?;
+    let mut token = prepared.token;
+    token["keyslots"] = serde_json::json!([keyslot.to_string()]);
+    luks::set_token(device, -1, Some(&token.to_string()))?;
+    Ok((true, prepared.stdout, String::new()))
+}
+
 pub fn op_enroll_fido2(
     device: &str,
     passphrase: &str,
@@ -334,25 +375,18 @@ pub fn op_enroll_fido2(
             ));
         }
 
-        let enrollment = fido2::enroll(fido2_device, (!pin.is_empty()).then_some(pin))?;
-        let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
-
-        // systemd convention: the token plugin base64-encodes the secret.
-        let secret_b64 = B64.encode(&enrollment.hmac_secret);
-        let keyslot = luks::add_keyslot_by_volume_key(device, &vk, secret_b64.as_bytes(), true)?;
-
-        let token_json = serde_json::json!({
-            "type": TOKEN_TYPE_FIDO2,
-            "keyslots": [keyslot.to_string()],
-            "fido2-credential": B64.encode(&enrollment.cred_id),
-            "fido2-salt": B64.encode(&enrollment.salt),
-            "fido2-rp": fido2::FIDO2_RP_ID,
-            "fido2-clientPin-required": !pin.is_empty(),
-            "fido2-up-required": true,
-            "fido2-uv-required": false,
-        });
-        luks::set_token(device, -1, Some(&token_json.to_string()))?;
-        Ok((true, String::new(), String::new()))
+        enroll_token(device, unlock_method, unlock_pin, passphrase, move || {
+            let enrollment = fido2::enroll(fido2_device, (!pin.is_empty()).then_some(pin))?;
+            // systemd convention: the token plugin base64-encodes the secret.
+            let keyslot_secret = B64.encode(&enrollment.hmac_secret).into_bytes();
+            let token = fido2_token_json(&enrollment.cred_id, &enrollment.salt, !pin.is_empty());
+            Ok(Prepared {
+                keyslot_secret,
+                minimal_pbkdf: true,
+                stdout: String::new(),
+                token,
+            })
+        })
     })
 }
 
@@ -365,46 +399,34 @@ pub fn op_enroll_tpm2(
     unlock_pin: &str,
 ) -> Triple {
     run_op("EnrollTpm2", || {
-        // Random 32-byte secret to seal.
-        let mut secret = zeroize::Zeroizing::new(vec![0u8; 32]);
-        getrandom::fill(&mut secret).map_err(|e| crate::error::Error(e.to_string()))?;
+        enroll_token(device, unlock_method, unlock_pin, passphrase, move || {
+            // Random 32-byte secret to seal.
+            let mut secret = zeroize::Zeroizing::new(vec![0u8; 32]);
+            getrandom::fill(&mut secret).map_err(|e| crate::error::Error(e.to_string()))?;
 
-        let sealed = crate::tpm2::seal(&secret, pcrs, pin)?;
-        let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
+            let sealed = crate::tpm2::seal(&secret, pcrs, pin)?;
 
-        // systemd convention: token plugin base64-encodes the unsealed bytes.
-        let secret_b64 = B64.encode(&*secret);
-        let keyslot = luks::add_keyslot_by_volume_key(device, &vk, secret_b64.as_bytes(), true)?;
+            // systemd convention: token plugin base64-encodes the unsealed bytes.
+            let keyslot_secret = B64.encode(&*secret).into_bytes();
 
-        let pcr_list: Vec<i64> = pcrs
-            .split('+')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(|p| {
-                p.parse()
-                    .map_err(|_| crate::error::Error(format!("bad PCR: {p}")))
+            let pcr_list: Vec<i64> = pcrs
+                .split('+')
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .map(|p| {
+                    p.parse()
+                        .map_err(|_| crate::error::Error(format!("bad PCR: {p}")))
+                })
+                .collect::<crate::error::Result<_>>()?;
+
+            let token = tpm2_token_json(&sealed, &pcr_list, !pin.is_empty());
+            Ok(Prepared {
+                keyslot_secret,
+                minimal_pbkdf: true,
+                stdout: String::new(),
+                token,
             })
-            .collect::<crate::error::Result<_>>()?;
-
-        let blob_b64 = B64.encode(&sealed.blob);
-        let token_json = serde_json::json!({
-            "type": TOKEN_TYPE_TPM2,
-            "keyslots": [keyslot.to_string()],
-            // Both spellings, exactly like the Python service.
-            "tpm2-blob": blob_b64,
-            "tpm2_blob": blob_b64,
-            "tpm2-pcrs": pcr_list,
-            "tpm2-pcr-bank": "sha256",
-            "tpm2-primary-alg": sealed.primary_alg,
-            "tpm2-policy-hash": hex_encode(&sealed.policy_hash),
-            "tpm2-pin": !pin.is_empty(),
-            "tpm2_pubkey_pcrs": [],
-            "tpm2_pcr_hash": "sha256",
-            "tpm2_pcrlock": false,
-            "tpm2_srk": B64.encode(&sealed.srk_blob),
-        });
-        luks::set_token(device, -1, Some(&token_json.to_string()))?;
-        Ok((true, String::new(), String::new()))
+        })
     })
 }
 
@@ -415,16 +437,16 @@ pub fn op_enroll_recovery_key(
     unlock_pin: &str,
 ) -> Triple {
     run_op("EnrollRecoveryKey", || {
-        let recovery_key = recovery::make_recovery_key();
-        let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
-        let keyslot = luks::add_keyslot_by_volume_key(device, &vk, recovery_key.as_bytes(), false)?;
-        let token_json = serde_json::json!({
-            "type": TOKEN_TYPE_RECOVERY,
-            "keyslots": [keyslot.to_string()],
-        });
-        luks::set_token(device, -1, Some(&token_json.to_string()))?;
-        // The GUI parses the recovery key from the stdout field.
-        Ok((true, recovery_key, String::new()))
+        enroll_token(device, unlock_method, unlock_pin, passphrase, || {
+            let recovery_key = recovery::make_recovery_key();
+            Ok(Prepared {
+                keyslot_secret: recovery_key.as_bytes().to_vec(),
+                minimal_pbkdf: false,
+                // The GUI parses the recovery key from the stdout field.
+                stdout: recovery_key,
+                token: recovery_token_json(),
+            })
+        })
     })
 }
 
@@ -548,6 +570,52 @@ pub fn op_check_fido2_enrolled(device: &str, fido2_dev_paths: &[String]) -> Vec<
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// FIDO2 token JSON (systemd-fido2), minus the `keyslots` field that
+/// `enroll_token` injects. Split out so the on-disk shape is unit-testable
+/// without a real authenticator.
+fn fido2_token_json(cred_id: &[u8], salt: &[u8], client_pin_required: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": TOKEN_TYPE_FIDO2,
+        "fido2-credential": B64.encode(cred_id),
+        "fido2-salt": B64.encode(salt),
+        "fido2-rp": fido2::FIDO2_RP_ID,
+        "fido2-clientPin-required": client_pin_required,
+        "fido2-up-required": true,
+        "fido2-uv-required": false,
+    })
+}
+
+/// TPM2 token JSON (systemd-tpm2), minus the `keyslots` field. Emits the sealed
+/// blob under both `tpm2-blob` and `tpm2_blob`, exactly like the Python service,
+/// so either spelling round-trips.
+fn tpm2_token_json(
+    sealed: &crate::tpm2::SealResult,
+    pcr_list: &[i64],
+    pin: bool,
+) -> serde_json::Value {
+    let blob_b64 = B64.encode(&sealed.blob);
+    serde_json::json!({
+        "type": TOKEN_TYPE_TPM2,
+        // Both spellings, exactly like the Python service.
+        "tpm2-blob": blob_b64,
+        "tpm2_blob": blob_b64,
+        "tpm2-pcrs": pcr_list,
+        "tpm2-pcr-bank": "sha256",
+        "tpm2-primary-alg": sealed.primary_alg,
+        "tpm2-policy-hash": hex_encode(&sealed.policy_hash),
+        "tpm2-pin": pin,
+        "tpm2_pubkey_pcrs": [],
+        "tpm2_pcr_hash": "sha256",
+        "tpm2_pcrlock": false,
+        "tpm2_srk": B64.encode(&sealed.srk_blob),
+    })
+}
+
+/// Recovery token JSON (systemd-recovery), minus the `keyslots` field.
+fn recovery_token_json() -> serde_json::Value {
+    serde_json::json!({ "type": TOKEN_TYPE_RECOVERY })
 }
 
 /// JSON for GetKeyslots: {"0": "luks2", ...} (string keys like Python's
@@ -1197,5 +1265,79 @@ impl LuksEnrollService {
             op_create_image_fd(&fd_path(&fd), &passphrase)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fido2_token_json_has_expected_shape() {
+        let cred_id = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let salt = [0x01u8, 0x02, 0x03];
+
+        let tok = fido2_token_json(&cred_id, &salt, true);
+        assert_eq!(
+            tok,
+            serde_json::json!({
+                "type": TOKEN_TYPE_FIDO2,
+                "fido2-credential": B64.encode(cred_id),
+                "fido2-salt": B64.encode(salt),
+                "fido2-rp": fido2::FIDO2_RP_ID,
+                "fido2-clientPin-required": true,
+                "fido2-up-required": true,
+                "fido2-uv-required": false,
+            })
+        );
+        // The shared spine injects keyslots; the builder must not.
+        assert!(tok.get("keyslots").is_none());
+
+        // The clientPin flag tracks the argument.
+        let tok = fido2_token_json(&cred_id, &salt, false);
+        assert_eq!(tok["fido2-clientPin-required"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn tpm2_token_json_emits_both_blob_spellings() {
+        let sealed = crate::tpm2::SealResult {
+            blob: vec![0xAA, 0xBB, 0xCC],
+            policy_hash: vec![0x12, 0x34],
+            primary_alg: "ecc",
+            srk_blob: vec![0xFE, 0xED],
+        };
+
+        let tok = tpm2_token_json(&sealed, &[7, 11], true);
+        let blob_b64 = B64.encode(&sealed.blob);
+        assert_eq!(
+            tok,
+            serde_json::json!({
+                "type": TOKEN_TYPE_TPM2,
+                "tpm2-blob": blob_b64,
+                "tpm2_blob": blob_b64,
+                "tpm2-pcrs": [7, 11],
+                "tpm2-pcr-bank": "sha256",
+                "tpm2-primary-alg": "ecc",
+                "tpm2-policy-hash": hex_encode(&sealed.policy_hash),
+                "tpm2-pin": true,
+                "tpm2_pubkey_pcrs": [],
+                "tpm2_pcr_hash": "sha256",
+                "tpm2_pcrlock": false,
+                "tpm2_srk": B64.encode(&sealed.srk_blob),
+            })
+        );
+        // Parity-critical: both spellings present and equal.
+        assert_eq!(tok["tpm2-blob"], tok["tpm2_blob"]);
+        assert!(tok["tpm2-blob"].is_string());
+        assert!(tok.get("keyslots").is_none());
+    }
+
+    #[test]
+    fn recovery_token_json_is_type_only() {
+        let tok = recovery_token_json();
+        assert_eq!(tok, serde_json::json!({ "type": TOKEN_TYPE_RECOVERY }));
+        // Only `type`; the spine injects keyslots.
+        assert!(tok.get("keyslots").is_none());
+        assert_eq!(tok.as_object().unwrap().len(), 1);
     }
 }
