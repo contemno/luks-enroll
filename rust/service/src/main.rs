@@ -10,12 +10,10 @@
 //! contract and accepted divergences.
 
 use futures_util::StreamExt;
+use luks_enroll_service::constants::{BUS_NAME, OBJECT_PATH};
 use luks_enroll_service::service;
 use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
 use zbus::names::WellKnownName;
-
-const BUS_NAME: &str = "net.contemno.LuksEnroll";
-const OBJECT_PATH: &str = "/net/contemno/LuksEnroll";
 
 /// Idle timeout: exit when no privileged method has been called for this
 /// long. The service is bus-activated, so exiting is cheap.
