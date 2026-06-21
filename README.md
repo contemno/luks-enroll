@@ -85,7 +85,8 @@ tests/
   test_luks_enroll.py              GUI client unit tests (Python)
   conftest.py                      Shared GTK-shim test importer
 
-scripts/                           Developer tooling (git hooks, changelog generation)
+VERSION                            Release-version floor (X.Y.Z); bump for a minor/major release
+scripts/                           Developer tooling (git hooks, changelog + next-version)
 .github/workflows/                 CI (Python lint+tests, Rust fmt/clippy/build/test) and releases
 ```
 
@@ -180,6 +181,8 @@ Tags trigger GitHub Actions builds. Version scheme:
 |-----------------|-----------------|--------------------------------------------------|
 | `v1.0.0`        | `1.0.0-1`       | Production                                       |
 | `v1.0.0-dev.1`  | `1.0.0~dev1-1`  | Development (sorts lower, won't overwrite prod)  |
+
+Tagging is automatic ([`autotag.yml`](.github/workflows/autotag.yml)): a push to `dev` cuts a prerelease and a push to `main` cuts the release. The version is `max(patch-bump of the latest release tag, the ./VERSION floor)` (see [`scripts/next-version.sh`](scripts/next-version.sh)) — so patch releases need no edit, and to cut a minor/major release you bump [`VERSION`](VERSION) (e.g. `0.2.0`) in the `dev` PR; merging `dev → main` then releases it.
 
 ## Design notes, reference & roadmap
 
