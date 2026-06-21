@@ -19,6 +19,7 @@ use libcryptsetup_rs::consts::vals::{CryptKdf, EncryptionFormat};
 use libcryptsetup_rs::{CryptDevice, CryptInit, CryptPbkdfType, Either, LibcryptErr, TokenInput};
 use zeroize::Zeroizing;
 
+use crate::constants::{TOKEN_TYPE_FIDO2, TOKEN_TYPE_TPM2};
 use crate::error::{Error, Result};
 use crate::{bail, fido2, tpm2};
 
@@ -278,7 +279,7 @@ fn fido2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Fido2TokenRef>> 
     let mut out = Vec::new();
     if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
         for tinfo in tokens.values() {
-            if tinfo.get("type").and_then(|t| t.as_str()) != Some("systemd-fido2") {
+            if tinfo.get("type").and_then(|t| t.as_str()) != Some(TOKEN_TYPE_FIDO2) {
                 continue;
             }
             let cred = tinfo
@@ -320,7 +321,7 @@ fn tpm2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Tpm2TokenRef>> {
     let mut out = Vec::new();
     if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
         for (tid, tinfo) in tokens {
-            if tinfo.get("type").and_then(|t| t.as_str()) != Some("systemd-tpm2") {
+            if tinfo.get("type").and_then(|t| t.as_str()) != Some(TOKEN_TYPE_TPM2) {
                 continue;
             }
             let blob_val = tinfo
@@ -413,8 +414,8 @@ fn derive_passphrase_from_token(
     pin: &str,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let raw = match token_type {
-        "systemd-fido2" => fido2::unlock_from_tokens(&fido2_token_refs(device)?, pin)?,
-        "systemd-tpm2" => tpm2::unseal_from_tokens(&tpm2_token_refs(device)?, pin)?,
+        TOKEN_TYPE_FIDO2 => fido2::unlock_from_tokens(&fido2_token_refs(device)?, pin)?,
+        TOKEN_TYPE_TPM2 => tpm2::unseal_from_tokens(&tpm2_token_refs(device)?, pin)?,
         other => bail!("Unknown token type: {other}"),
     };
     let encoded = Zeroizing::new(B64.encode(&raw).into_bytes());
@@ -472,7 +473,7 @@ pub fn extract_token_volume_key(
 /// Returns the keyslot, or an error message.
 pub fn verify_token(device: &str, token_type: &str, pin: &str) -> std::result::Result<i32, String> {
     let _t = Timer::new("verify_token");
-    const VALID: [&str; 2] = ["systemd-fido2", "systemd-tpm2"];
+    const VALID: [&str; 2] = [TOKEN_TYPE_FIDO2, TOKEN_TYPE_TPM2];
     if !VALID.contains(&token_type) {
         // Parity: Python raises here (caller turns it into a D-Bus failure).
         return Err("Unsupported token type".to_string());
@@ -502,7 +503,7 @@ pub fn get_volume_key(
     unlock_pin: &str,
 ) -> Result<VolumeKey> {
     let _t = Timer::new("get_volume_key");
-    const VALID: [&str; 3] = ["passphrase", "systemd-fido2", "systemd-tpm2"];
+    const VALID: [&str; 3] = ["passphrase", TOKEN_TYPE_FIDO2, TOKEN_TYPE_TPM2];
     if !VALID.contains(&unlock_method) {
         bail!("Invalid unlock method: {unlock_method:?}");
     }

@@ -28,10 +28,11 @@ use zbus::zvariant::OwnedFd;
 use zbus::Connection;
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
+use crate::constants::{
+    POLKIT_ACTION_MANAGE, POLKIT_ACTION_READ, TOKEN_TYPE_FIDO2, TOKEN_TYPE_RECOVERY,
+    TOKEN_TYPE_TPM2,
+};
 use crate::{devices, fido2, format, luks, recovery, settings};
-
-pub const POLKIT_ACTION_READ: &str = "net.contemno.luks-enroll.read";
-pub const POLKIT_ACTION_MANAGE: &str = "net.contemno.luks-enroll.manage";
 
 const AUTH_CACHE_TTL: Duration = Duration::from_secs(30);
 const MANAGE_AUTH_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -333,7 +334,7 @@ pub fn op_enroll_fido2(
         let keyslot = luks::add_keyslot_by_volume_key(device, &vk, secret_b64.as_bytes(), true)?;
 
         let token_json = serde_json::json!({
-            "type": "systemd-fido2",
+            "type": TOKEN_TYPE_FIDO2,
             "keyslots": [keyslot.to_string()],
             "fido2-credential": B64.encode(&enrollment.cred_id),
             "fido2-salt": B64.encode(&enrollment.salt),
@@ -380,7 +381,7 @@ pub fn op_enroll_tpm2(
 
         let blob_b64 = B64.encode(&sealed.blob);
         let token_json = serde_json::json!({
-            "type": "systemd-tpm2",
+            "type": TOKEN_TYPE_TPM2,
             "keyslots": [keyslot.to_string()],
             // Both spellings, exactly like the Python service.
             "tpm2-blob": blob_b64,
@@ -412,7 +413,7 @@ pub fn op_enroll_recovery_key(
         let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
         let keyslot = luks::add_keyslot_by_volume_key(device, &vk, recovery_key.as_bytes(), false)?;
         let token_json = serde_json::json!({
-            "type": "systemd-recovery",
+            "type": TOKEN_TYPE_RECOVERY,
             "keyslots": [keyslot.to_string()],
         });
         luks::set_token(device, -1, Some(&token_json.to_string()))?;
@@ -565,6 +566,9 @@ pub fn tokens_json(device: &str, token_type: &str) -> String {
 // D-Bus interface
 // ---------------------------------------------------------------------------
 
+// The name must match `constants::INTERFACE`; an attribute macro needs a string
+// literal, so it can't reference the const directly (the `dbus_e2e` test, which
+// connects via that const, exercises the match end-to-end).
 #[zbus::interface(name = "net.contemno.LuksEnroll1")]
 impl LuksEnrollService {
     #[zbus(name = "DetectDevices")]
@@ -656,7 +660,7 @@ impl LuksEnrollService {
         Self::check_lens(&[&device, &token_type, &pin])?;
         // Parity: an unsupported token type raised out of the Python
         // handler and surfaced as a generic D-Bus failure.
-        if token_type != "systemd-fido2" && token_type != "systemd-tpm2" {
+        if token_type != TOKEN_TYPE_FIDO2 && token_type != TOKEN_TYPE_TPM2 {
             eprintln!("Method UnlockWithToken failed: Unsupported token type");
             return Err(SvcError::Failed("Operation failed".into()));
         }
@@ -1032,7 +1036,7 @@ impl LuksEnrollService {
     ) -> Result<(bool, i32), SvcError> {
         Self::check_fd(&fd, false, false)?;
         Self::check_lens(&[&token_type, &pin])?;
-        if token_type != "systemd-fido2" && token_type != "systemd-tpm2" {
+        if token_type != TOKEN_TYPE_FIDO2 && token_type != TOKEN_TYPE_TPM2 {
             eprintln!("Method UnlockWithTokenFd failed: Unsupported token type");
             return Err(SvcError::Failed("Operation failed".into()));
         }
