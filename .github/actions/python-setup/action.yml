@@ -1,0 +1,14 @@
+name: Python setup
+description: >-
+  Set up Python and install the hash-pinned dev tooling (ruff, pytest).
+  The caller is responsible for checking out the repo first.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+      with:
+        python-version: "3.x"
+
+    - name: Install dev tooling (hash-pinned)
+      shell: bash
+      run: pip install --require-hashes -r requirements-dev.txt
