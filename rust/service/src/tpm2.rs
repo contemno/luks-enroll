@@ -84,12 +84,8 @@ pub struct SealResult {
 pub fn seal(secret: &[u8], pcrs: &str, pin: &str) -> Result<SealResult> {
     let pcr_list = build_pcr_selection_list(HashingAlgorithm::Sha256, pcrs)?;
     let ctx = EsysContext::new()?;
-    let mut to_flush: Vec<sys::ESYS_TR> = Vec::new();
-    let result = seal_inner(&ctx, &mut to_flush, secret, &pcr_list, pin);
-    for handle in to_flush {
-        ctx.flush_quiet(handle);
-    }
-    result
+    let mut flusher = HandleFlusher::new(&ctx);
+    seal_inner(&ctx, &mut flusher, secret, &pcr_list, pin)
 }
 
 /// Unseal the secret from one of the device's systemd-tpm2 tokens.
@@ -338,6 +334,42 @@ impl Drop for EsysContext {
     }
 }
 
+/// Tracks ESYS transient handles and flushes any still held when dropped, so
+/// seal/unseal free their handles on success and on every error path.
+struct HandleFlusher<'a> {
+    ctx: &'a EsysContext,
+    handles: Vec<sys::ESYS_TR>,
+}
+
+impl<'a> HandleFlusher<'a> {
+    fn new(ctx: &'a EsysContext) -> Self {
+        Self {
+            ctx,
+            handles: Vec::new(),
+        }
+    }
+
+    /// Track a handle to be flushed on drop.
+    fn track(&mut self, handle: sys::ESYS_TR) {
+        self.handles.push(handle);
+    }
+
+    /// Flush now and stop tracking — for a handle that must be freed before a
+    /// later TPM op (the trial session and the transient SRK in `seal_inner`).
+    fn flush_now(&mut self, handle: sys::ESYS_TR) {
+        self.ctx.flush_quiet(handle);
+        self.handles.retain(|&h| h != handle);
+    }
+}
+
+impl Drop for HandleFlusher<'_> {
+    fn drop(&mut self) {
+        for &handle in &self.handles {
+            self.ctx.flush_quiet(handle);
+        }
+    }
+}
+
 /// Free an ESYS-allocated output pointer (no-op for NULL).
 fn esys_free<T>(ptr: *mut T) {
     if !ptr.is_null() {
@@ -565,7 +597,7 @@ fn marshal_tpm2b_public(public: &sys::TPM2B_PUBLIC) -> Result<Vec<u8>> {
 
 fn seal_inner(
     ctx: &EsysContext,
-    to_flush: &mut Vec<sys::ESYS_TR>,
+    flusher: &mut HandleFlusher,
     secret: &[u8],
     pcr_list: &PcrSelectionList,
     pin: &str,
@@ -573,12 +605,12 @@ fn seal_inner(
     // --- Get SRK (persistent at 0x81000001, or create transient) ---
     let (srk, srk_need_flush, srk_blob) = get_srk(ctx)?;
     if srk_need_flush {
-        to_flush.push(srk);
+        flusher.track(srk);
     }
 
     // --- Compute policy digest via trial session ---
     let trial_session = start_session(ctx, TPM2_SE_TRIAL, "trial")?;
-    to_flush.push(trial_session);
+    flusher.track(trial_session);
 
     policy_pcr(ctx, trial_session, pcr_list)?;
     if !pin.is_empty() {
@@ -587,8 +619,7 @@ fn seal_inner(
     let policy_hash = policy_get_digest(ctx, trial_session)?;
 
     // Flush the trial session.
-    ctx.flush_quiet(trial_session);
-    to_flush.retain(|&h| h != trial_session);
+    flusher.flush_now(trial_session);
 
     // --- Seal the secret ---
     let in_public = sys::TPM2B_PUBLIC::try_from(seal_template(&policy_hash, !pin.is_empty())?)
@@ -643,8 +674,7 @@ fn seal_inner(
 
     // Flush the SRK (only if we created a transient one).
     if srk_need_flush {
-        ctx.flush_quiet(srk);
-        to_flush.retain(|&h| h != srk);
+        flusher.flush_now(srk);
     }
 
     Ok(SealResult {
@@ -665,17 +695,13 @@ fn seal_inner(
 fn try_unseal_token(token: &Tpm2TokenRef, pin: &str) -> Result<Vec<u8>> {
     let pcr_list = build_pcr_selection_list(pcr_bank_to_alg(&token.pcr_bank), &token.pcrs)?;
     let ctx = EsysContext::new()?;
-    let mut to_flush: Vec<sys::ESYS_TR> = Vec::new();
-    let result = unseal_inner(&ctx, &mut to_flush, token, &pcr_list, pin);
-    for handle in to_flush {
-        ctx.flush_quiet(handle);
-    }
-    result
+    let mut flusher = HandleFlusher::new(&ctx);
+    unseal_inner(&ctx, &mut flusher, token, &pcr_list, pin)
 }
 
 fn unseal_inner(
     ctx: &EsysContext,
-    to_flush: &mut Vec<sys::ESYS_TR>,
+    flusher: &mut HandleFlusher,
     token: &Tpm2TokenRef,
     pcr_list: &PcrSelectionList,
     pin: &str,
@@ -683,7 +709,7 @@ fn unseal_inner(
     // --- Get SRK (persistent at 0x81000001, or create transient) ---
     let (srk, srk_need_flush, _srk_blob) = get_srk(ctx)?;
     if srk_need_flush {
-        to_flush.push(srk);
+        flusher.track(srk);
     }
 
     // Unmarshal the sealed private + public from the blob at a running offset.
@@ -731,7 +757,7 @@ fn unseal_inner(
     if rc != 0 {
         bail!("Esys_Load failed: 0x{rc:08x}");
     }
-    to_flush.push(loaded);
+    flusher.track(loaded);
 
     // If a PIN is used, set auth = SHA-256(pin) on the loaded object.
     if token.pin_required && !pin.is_empty() {
@@ -748,7 +774,7 @@ fn unseal_inner(
 
     // Start the policy session and replay the policy.
     let policy_session = start_session(ctx, TPM2_SE_POLICY, "policy")?;
-    to_flush.push(policy_session);
+    flusher.track(policy_session);
 
     policy_pcr(ctx, policy_session, pcr_list)?;
     if token.pin_required {
