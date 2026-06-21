@@ -274,6 +274,12 @@ pub fn fido2_token_refs(device: &str) -> Result<Vec<Fido2TokenRef>> {
     fido2_refs_from_meta(&meta)
 }
 
+/// Decode standard base64 into bytes, mapping a decode failure to the service
+/// error string the token parsers have always produced.
+fn decode_b64(s: &str) -> Result<Vec<u8>> {
+    B64.decode(s).map_err(|e| Error(format!("bad base64: {e}")))
+}
+
 /// Pure parser for systemd-fido2 tokens in LUKS2 metadata JSON.
 fn fido2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Fido2TokenRef>> {
     let mut out = Vec::new();
@@ -291,12 +297,8 @@ fn fido2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Fido2TokenRef>> 
                 .and_then(|v| v.as_str())
                 .ok_or(Error::from("fido2 token missing fido2-salt"))?;
             out.push(Fido2TokenRef {
-                cred_id: B64
-                    .decode(cred)
-                    .map_err(|e| Error(format!("bad base64: {e}")))?,
-                salt: B64
-                    .decode(salt)
-                    .map_err(|e| Error(format!("bad base64: {e}")))?,
+                cred_id: decode_b64(cred)?,
+                salt: decode_b64(salt)?,
             });
         }
     }
@@ -334,16 +336,11 @@ fn tpm2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Tpm2TokenRef>> {
                     let mut buf = Vec::new();
                     for p in parts {
                         let s = p.as_str().ok_or(Error::from("bad tpm2-blob entry"))?;
-                        buf.extend(
-                            B64.decode(s)
-                                .map_err(|e| Error(format!("bad base64: {e}")))?,
-                        );
+                        buf.extend(decode_b64(s)?);
                     }
                     buf
                 }
-                serde_json::Value::String(s) => B64
-                    .decode(s)
-                    .map_err(|e| Error(format!("bad base64: {e}")))?,
+                serde_json::Value::String(s) => decode_b64(s)?,
                 _ => bail!("bad tpm2-blob field"),
             };
             let pcrs = match tinfo.get("tpm2-pcrs") {
@@ -642,6 +639,13 @@ pub fn format_luks2(path: &str, passphrase: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_b64_decodes_and_reports_bad_input() {
+        assert_eq!(decode_b64("aGk=").unwrap(), b"hi");
+        let err = decode_b64("@@not base64@@").unwrap_err();
+        assert!(err.0.starts_with("bad base64"), "unexpected: {}", err.0);
+    }
 
     #[test]
     fn tpm2_refs_parse_quirks() {
