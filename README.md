@@ -89,6 +89,7 @@ tests/
 VERSION                            Release-version floor (X.Y.Z); bump for a minor/major release
 scripts/                           Developer tooling (git hooks, changelog + next-version)
 .github/workflows/                 CI (Python lint+tests, Rust fmt/clippy/build/test) and releases
+.github/actions/                   Reusable composite actions (install-c-deps, python-setup)
 ```
 
 [`debian/rules`](debian/rules) compiles the Rust service (`cargo build --release --locked`) and `dh_install` copies `dist/*` plus the built binary into place per [`debian/luks-enroll.install`](debian/luks-enroll.install). The service tests live in the Rust workspace ([`rust/service/tests/`](rust/service/tests/)); the Python suite under [`tests/`](tests/) covers the GUI client.
