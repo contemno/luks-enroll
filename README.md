@@ -61,6 +61,7 @@ rust/                              Privileged service (Rust workspace)
   service/                         luks-enroll-service crate
     src/                           D-Bus service + cryptsetup/TPM2/FIDO2/format logic
     tests/                         LUKS2 image-file, D-Bus e2e, and fd-passing integration tests
+      common/mod.rs                Shared test harness (temp-dir, LUKS-image factory, passphrase)
   fido2-sys/                       bindgen FFI to libfido2 (built against system headers)
 
 dist/                              Mirrors the install hierarchy for the non-Rust files:

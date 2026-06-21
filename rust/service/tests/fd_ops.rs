@@ -14,7 +14,8 @@ use std::os::fd::AsRawFd;
 
 use luks_enroll_service::{luks, service};
 
-const PASSPHRASE: &str = "fd-test-pw";
+mod common;
+use common::{tmpdir, PASSPHRASE};
 
 fn fd_path<F: AsRawFd>(f: &F) -> String {
     format!("/proc/self/fd/{}", f.as_raw_fd())
@@ -24,7 +25,7 @@ fn fd_path<F: AsRawFd>(f: &F) -> String {
 /// libcryptsetup operates correctly on the magic-symlink path.
 #[test]
 fn fd_create_enroll_verify_roundtrip() {
-    let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+    let dir = tmpdir();
     let path = dir.path().join("c.img");
     // Client side: create + size the file it owns, then hand over the fd.
     let file = std::fs::OpenOptions::new()
@@ -84,7 +85,7 @@ fn fd_writes_through_readonly_mount_namespace() {
         return;
     }
 
-    let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+    let dir = tmpdir();
     let path = dir.path().join("sandboxed.img");
     let dir_path = dir.path().to_path_buf();
     let file = std::fs::OpenOptions::new()
