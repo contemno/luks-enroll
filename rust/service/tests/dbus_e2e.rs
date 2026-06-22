@@ -141,6 +141,21 @@ async fn e2e_over_private_bus() {
     assert!(!ok);
     assert_eq!(slot, -1);
 
+    // --- check_lens is still enforced after the gate+validate step: an
+    //     over-length non-device argument on the owned device fails with
+    //     InvalidArgs, pinning that gate_device length-checks every arg, not
+    //     just the device. (MAX_STRING_LEN is private to service.rs; the 10 MiB
+    //     here mirrors it.) ---
+    let too_long = "x".repeat(10 * 1024 * 1024 + 1);
+    let err = proxy
+        .call::<_, _, (bool, i32)>("VerifyPassphrase", &(img.as_str(), too_long.as_str()))
+        .await
+        .expect_err("over-length passphrase must fail");
+    assert_eq!(
+        error_name(&err),
+        Some("org.freedesktop.DBus.Error.InvalidArgs")
+    );
+
     // --- Bad device argument: exact InvalidArgs error. ---
     let err = proxy
         .call::<_, _, String>("GetKeyslots", &("/nonexistent/nope",))
