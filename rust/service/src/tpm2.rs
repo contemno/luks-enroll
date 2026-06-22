@@ -67,6 +67,16 @@ const TPM2_PERSISTENT_SRK: u32 = 0x8100_0001;
 /// Scratch buffer size for Tss2_MU_* marshaling (Python: _MARSHAL_BUF_MAX).
 const MARSHAL_BUF_MAX: usize = 4096;
 
+/// Map a raw TSS return code to our `Result`: `Ok(())` on success, else a
+/// step-tagged, hex-formatted error (`"{step} failed: 0x{rc:08x}"`) matching
+/// the per-call messages the Python service logged for parity.
+fn tss_ok(rc: sys::TSS2_RC, step: &str) -> Result<()> {
+    if rc != 0 {
+        return Err(Error(format!("{step} failed: 0x{rc:08x}")));
+    }
+    Ok(())
+}
+
 pub struct SealResult {
     /// Marshaled TPM2B_PRIVATE + TPM2B_PUBLIC of the sealed object.
     pub blob: Vec<u8>,
@@ -307,9 +317,7 @@ impl EsysContext {
             .map_err(|_| Error::from("TCTI configuration contains a NUL byte"))?;
         let mut tcti: *mut sys::TSS2_TCTI_CONTEXT = null_mut();
         let rc = unsafe { sys::Tss2_TctiLdr_Initialize(conf.as_ptr(), &mut tcti) };
-        if rc != 0 {
-            bail!("Tss2_TctiLdr_Initialize failed: 0x{rc:08x}");
-        }
+        tss_ok(rc, "Tss2_TctiLdr_Initialize")?;
         let mut esys: *mut sys::ESYS_CONTEXT = null_mut();
         let rc = unsafe { sys::Esys_Initialize(&mut esys, tcti, null_mut()) };
         if rc != 0 {
@@ -382,9 +390,7 @@ fn tr_serialize(ctx: &EsysContext, handle: sys::ESYS_TR) -> Result<Vec<u8>> {
     let mut buffer: *mut u8 = null_mut();
     let mut buffer_size: sys::size_t = 0;
     let rc = unsafe { sys::Esys_TR_Serialize(ctx.esys, handle, &mut buffer, &mut buffer_size) };
-    if rc != 0 {
-        bail!("Esys_TR_Serialize failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_TR_Serialize")?;
     let out = if buffer.is_null() {
         Vec::new()
     } else {
@@ -453,9 +459,7 @@ fn get_srk(ctx: &EsysContext) -> Result<(sys::ESYS_TR, bool, Vec<u8>)> {
             &mut creation_ticket,
         )
     };
-    if rc != 0 {
-        bail!("Esys_CreatePrimary failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_CreatePrimary")?;
     esys_free(out_public);
     esys_free(creation_data);
     esys_free(creation_hash);
@@ -488,9 +492,7 @@ fn start_session(ctx: &EsysContext, session_type: u8, kind: &str) -> Result<sys:
             &mut session,
         )
     };
-    if rc != 0 {
-        bail!("Esys_StartAuthSession ({kind}) failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, &format!("Esys_StartAuthSession ({kind})"))?;
     Ok(session)
 }
 
@@ -509,9 +511,7 @@ fn policy_pcr(ctx: &EsysContext, session: sys::ESYS_TR, pcr_list: &PcrSelectionL
             &pcr_selection,
         )
     };
-    if rc != 0 {
-        bail!("Esys_PolicyPCR failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_PolicyPCR")?;
     Ok(())
 }
 
@@ -525,9 +525,7 @@ fn policy_auth_value(ctx: &EsysContext, session: sys::ESYS_TR) -> Result<()> {
             sys::ESYS_TR_NONE,
         )
     };
-    if rc != 0 {
-        bail!("Esys_PolicyAuthValue failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_PolicyAuthValue")?;
     Ok(())
 }
 
@@ -543,9 +541,7 @@ fn policy_get_digest(ctx: &EsysContext, session: sys::ESYS_TR) -> Result<Vec<u8>
             &mut digest_ptr,
         )
     };
-    if rc != 0 {
-        bail!("Esys_PolicyGetDigest failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_PolicyGetDigest")?;
     let digest = unsafe { &*digest_ptr };
     let len = (digest.size as usize).min(digest.buffer.len());
     let out = digest.buffer[..len].to_vec();
@@ -565,9 +561,7 @@ fn marshal_tpm2b_private(private: &sys::TPM2B_PRIVATE) -> Result<Vec<u8>> {
             &mut offset,
         )
     };
-    if rc != 0 {
-        bail!("Marshal failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Marshal")?;
     buf.truncate(offset as usize);
     Ok(buf)
 }
@@ -584,9 +578,7 @@ fn marshal_tpm2b_public(public: &sys::TPM2B_PUBLIC) -> Result<Vec<u8>> {
             &mut offset,
         )
     };
-    if rc != 0 {
-        bail!("Marshal failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Marshal")?;
     buf.truncate(offset as usize);
     Ok(buf)
 }
@@ -655,9 +647,7 @@ fn seal_inner(
     // Scrub the in-memory copy of the secret (and PIN hash) regardless of rc.
     in_sensitive.sensitive.userAuth.buffer.zeroize();
     in_sensitive.sensitive.data.buffer.zeroize();
-    if rc != 0 {
-        bail!("Esys_Create (seal) failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_Create (seal)")?;
 
     // Marshal sealed private + public into the token blob.
     let blob = (|| -> Result<Vec<u8>> {
@@ -724,9 +714,7 @@ fn unseal_inner(
             &mut seal_private,
         )
     };
-    if rc != 0 {
-        bail!("Unmarshal TPM2B_PRIVATE failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Unmarshal TPM2B_PRIVATE")?;
     let mut seal_public = sys::TPM2B_PUBLIC::default();
     let rc = unsafe {
         sys::Tss2_MU_TPM2B_PUBLIC_Unmarshal(
@@ -736,9 +724,7 @@ fn unseal_inner(
             &mut seal_public,
         )
     };
-    if rc != 0 {
-        bail!("Unmarshal TPM2B_PUBLIC failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Unmarshal TPM2B_PUBLIC")?;
 
     // Load the sealed object under the SRK (password session, empty auth).
     let mut loaded: sys::ESYS_TR = sys::ESYS_TR_NONE;
@@ -754,9 +740,7 @@ fn unseal_inner(
             &mut loaded,
         )
     };
-    if rc != 0 {
-        bail!("Esys_Load failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_Load")?;
     flusher.track(loaded);
 
     // If a PIN is used, set auth = SHA-256(pin) on the loaded object.
@@ -793,9 +777,7 @@ fn unseal_inner(
             &mut out_data,
         )
     };
-    if rc != 0 {
-        bail!("Esys_Unseal failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_Unseal")?;
     let sensitive = unsafe { &*out_data };
     let len = (sensitive.size as usize).min(sensitive.buffer.len());
     let secret = sensitive.buffer[..len].to_vec();
@@ -823,6 +805,17 @@ mod tests {
 
     fn ids(tokens: Vec<&Tpm2TokenRef>) -> Vec<String> {
         tokens.iter().map(|t| t.token_id.clone()).collect()
+    }
+
+    // --- TSS return-code helper ---------------------------------------------
+
+    #[test]
+    fn tss_ok_passes_zero_and_formats_failure() {
+        assert!(tss_ok(0, "Esys_Load").is_ok());
+        // Parity-critical: "<step> failed: 0x{rc:08x}" — lowercase, zero-padded
+        // to 8 hex digits, the exact per-call message the sites emitted before.
+        let err = tss_ok(0x1234, "Esys_Load").unwrap_err();
+        assert_eq!(err.0, "Esys_Load failed: 0x00001234");
     }
 
     // --- PCR string parsing -------------------------------------------------
