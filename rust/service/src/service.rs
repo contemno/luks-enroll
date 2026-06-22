@@ -198,6 +198,27 @@ impl LuksEnrollService {
         Ok(())
     }
 
+    /// Auth + validate + length-check for a device-path method. Runs the polkit
+    /// `gate` (ownership-skip / polkit / auth-cache), canonicalizes and validates
+    /// the device, then length-checks the validated device plus `extra` args.
+    /// Returns the validated (realpath'd) device, collapsing the
+    /// gate + validate_device + check_lens triple the device methods share.
+    async fn gate_device(
+        &self,
+        conn: &Connection,
+        hdr: &Header<'_>,
+        kind: AuthKind,
+        device: &str,
+        extra: &[&str],
+    ) -> MethodResult<String> {
+        self.gate(conn, hdr, kind, Some(device), false).await?;
+        let device = Self::validate_device(device)?;
+        let mut lens: Vec<&str> = vec![&device];
+        lens.extend_from_slice(extra);
+        Self::check_lens(&lens)?;
+        Ok(device)
+    }
+
     /// Validate a file descriptor received over D-Bus for an *Fd method.
     ///
     /// The descriptor must refer to a regular file (or a block device,
@@ -659,10 +680,9 @@ impl LuksEnrollService {
         #[zbus(header)] hdr: Header<'_>,
         device: String,
     ) -> Result<String, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device])?;
         Ok(keyslots_json(&device))
     }
 
@@ -674,10 +694,9 @@ impl LuksEnrollService {
         device: String,
         token_type: String,
     ) -> Result<String, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[&token_type])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &token_type])?;
         Ok(tokens_json(&device, &token_type))
     }
 
@@ -688,10 +707,9 @@ impl LuksEnrollService {
         #[zbus(header)] hdr: Header<'_>,
         device: String,
     ) -> Result<Vec<i32>, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device])?;
         Ok(luks::password_keyslots(&device))
     }
 
@@ -703,10 +721,9 @@ impl LuksEnrollService {
         device: String,
         passphrase: String,
     ) -> Result<(bool, i32), SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &passphrase])?;
         blocking(
             move || match luks::verify_passphrase(&device, &passphrase) {
                 Ok(slot) => (true, slot),
@@ -725,10 +742,9 @@ impl LuksEnrollService {
         token_type: String,
         pin: String,
     ) -> Result<(bool, i32), SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&token_type, &pin])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &token_type, &pin])?;
         // Parity: an unsupported token type raised out of the Python
         // handler and surfaced as a generic D-Bus failure.
         if token_type != TOKEN_TYPE_FIDO2 && token_type != TOKEN_TYPE_TPM2 {
@@ -760,17 +776,21 @@ impl LuksEnrollService {
         unlock_method: String,
         unlock_pin: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[
+                    &passphrase,
+                    &pin,
+                    &fido2_device,
+                    &unlock_method,
+                    &unlock_pin,
+                ],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[
-            &device,
-            &passphrase,
-            &pin,
-            &fido2_device,
-            &unlock_method,
-            &unlock_pin,
-        ])?;
         blocking(move || {
             op_enroll_fido2(
                 &device,
@@ -797,17 +817,15 @@ impl LuksEnrollService {
         unlock_method: String,
         unlock_pin: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[&passphrase, &pin, &pcrs, &unlock_method, &unlock_pin],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[
-            &device,
-            &passphrase,
-            &pin,
-            &pcrs,
-            &unlock_method,
-            &unlock_pin,
-        ])?;
         blocking(move || {
             op_enroll_tpm2(
                 &device,
@@ -831,10 +849,15 @@ impl LuksEnrollService {
         unlock_method: String,
         unlock_pin: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[&passphrase, &unlock_method, &unlock_pin],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &passphrase, &unlock_method, &unlock_pin])?;
         blocking(move || op_enroll_recovery_key(&device, &passphrase, &unlock_method, &unlock_pin))
             .await
     }
@@ -851,10 +874,15 @@ impl LuksEnrollService {
         pin: String,
         slot: i32,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[&passphrase, &unlock_method, &pin],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &passphrase, &unlock_method, &pin])?;
         blocking(move || op_wipe_slot(&device, &passphrase, &unlock_method, &pin, slot)).await
     }
 
@@ -907,10 +935,9 @@ impl LuksEnrollService {
         #[zbus(header)] hdr: Header<'_>,
         device: String,
     ) -> Result<String, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device])?;
         Ok(devices::get_device_info(&device).to_string())
     }
 
@@ -922,10 +949,9 @@ impl LuksEnrollService {
         device: String,
         passphrase: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &passphrase])?;
         blocking(move || op_format_partition(&device, &passphrase)).await
     }
 
@@ -941,16 +967,20 @@ impl LuksEnrollService {
         unlock_method: String,
         unlock_pin: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[
+                    &existing_passphrase,
+                    &new_passphrase,
+                    &unlock_method,
+                    &unlock_pin,
+                ],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[
-            &device,
-            &existing_passphrase,
-            &new_passphrase,
-            &unlock_method,
-            &unlock_pin,
-        ])?;
         blocking(move || {
             op_enroll_passphrase(
                 &device,
@@ -996,10 +1026,9 @@ impl LuksEnrollService {
         device: String,
         fido2_dev_paths: Vec<String>,
     ) -> Result<Vec<String>, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device])?;
         blocking(move || op_check_fido2_enrolled(&device, &fido2_dev_paths)).await
     }
 
@@ -1339,5 +1368,45 @@ mod tests {
         // Only `type`; the spine injects keyslots.
         assert!(tok.get("keyslots").is_none());
         assert_eq!(tok.as_object().unwrap().len(), 1);
+    }
+
+    // gate_device itself needs a live D-Bus connection (the polkit gate), so its
+    // two bus-free steps -- validate_device and check_lens -- are pinned here
+    // directly; the e2e composition (gate -> validate -> check_lens) is covered
+    // in tests/dbus_e2e.rs.
+    #[test]
+    fn validate_device_accepts_file_rejects_missing_and_dir() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let path = f.path().to_string_lossy().into_owned();
+        // A regular file validates; the returned path is canonicalized.
+        let real = LuksEnrollService::validate_device(&path).expect("file should validate");
+        assert_eq!(
+            real,
+            std::fs::canonicalize(&path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+
+        // A directory is neither a block device nor a regular file.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let derr = LuksEnrollService::validate_device(&dir.path().to_string_lossy())
+            .expect_err("a directory must be rejected");
+        assert!(matches!(derr, SvcError::InvalidArgs(_)));
+
+        // A path that does not exist is rejected.
+        let merr = LuksEnrollService::validate_device("/nonexistent/nope")
+            .expect_err("a missing path must be rejected");
+        assert!(matches!(merr, SvcError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn check_lens_enforces_max_len() {
+        let at_limit = "x".repeat(MAX_STRING_LEN);
+        LuksEnrollService::check_lens(&[&at_limit]).expect("exactly MAX_STRING_LEN is allowed");
+
+        let over = "x".repeat(MAX_STRING_LEN + 1);
+        let err = LuksEnrollService::check_lens(&[&over]).expect_err("over the limit must fail");
+        assert!(matches!(err, SvcError::InvalidArgs(_)));
     }
 }
