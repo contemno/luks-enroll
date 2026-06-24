@@ -26,7 +26,6 @@
 //! the Python service and systemd-cryptenroll.
 
 use std::convert::TryFrom;
-use std::ffi::CString;
 use std::ptr::{null, null_mut};
 
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -42,7 +41,7 @@ use tss_esapi::tss2_esys as sys;
 use zeroize::Zeroize;
 
 use crate::bail;
-use crate::error::{Error, Result};
+use crate::error::{cstring, Error, Result};
 use crate::luks::Tpm2TokenRef;
 
 // ---------------------------------------------------------------------------
@@ -313,8 +312,7 @@ fn tcti_conf() -> String {
 
 impl EsysContext {
     fn new() -> Result<Self> {
-        let conf = CString::new(tcti_conf())
-            .map_err(|_| Error::from("TCTI configuration contains a NUL byte"))?;
+        let conf = cstring(tcti_conf(), "TCTI configuration")?;
         let mut tcti: *mut sys::TSS2_TCTI_CONTEXT = null_mut();
         let rc = unsafe { sys::Tss2_TctiLdr_Initialize(conf.as_ptr(), &mut tcti) };
         tss_ok(rc, "Tss2_TctiLdr_Initialize")?;
