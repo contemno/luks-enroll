@@ -125,6 +125,13 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
   (`scripts/next-version.sh`); bump **`VERSION`** for a minor/major release, patch is automatic.
 - `ci.yml` gates PRs into **both** `dev` and `main` (feature→dev PRs and the dev→main release
   PR); it stays PR-only, since the release pipeline already validates the post-merge push.
+- **Supply-chain**: Dependabot (`.github/dependabot.yml`) covers GitHub Actions, the **`cargo`**
+  workspace (`rust/`), and pip dev tooling, each with a 14-day **cooldown** (minimum package
+  age) so a freshly published, possibly compromised release ages before adoption — cooldown
+  gates *version* updates only; Dependabot security fixes bypass it. `audit.yml` adds a weekly
+  (and manifest-touching-PR) advisory scan — `cargo audit` (RustSec) + `pip-audit` (PyPI/OSV) —
+  that is **intentionally non-gating**: a finding turns the job red but it's not a required
+  check, since daily advisory-DB churn shouldn't block PRs unrelated to the flagged dep.
 
 ## Don't
 
