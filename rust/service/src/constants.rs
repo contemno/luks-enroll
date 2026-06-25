@@ -26,6 +26,12 @@ pub const POLKIT_ACTION_READ: &str = "net.contemno.luks-enroll.read";
 /// polkit action gating mutating methods.
 pub const POLKIT_ACTION_MANAGE: &str = "net.contemno.luks-enroll.manage";
 
+/// Absolute path the service binary installs to; the systemd unit's
+/// `ExecStart=` and the D-Bus activation `Exec=` must match it (pinned by the
+/// `config_parity` integration test). Not referenced by the service at runtime
+/// — it's the install-location single source of truth for the packaging files.
+pub const SERVICE_BINARY_PATH: &str = "/usr/sbin/luks-enroll-service";
+
 /// LUKS2 token `type` for a FIDO2 enrollment (systemd-cryptenroll compatible).
 pub const TOKEN_TYPE_FIDO2: &str = "systemd-fido2";
 /// LUKS2 token `type` for a TPM2 enrollment.
@@ -51,5 +57,6 @@ mod tests {
         assert_eq!(TOKEN_TYPE_FIDO2, "systemd-fido2");
         assert_eq!(TOKEN_TYPE_TPM2, "systemd-tpm2");
         assert_eq!(TOKEN_TYPE_RECOVERY, "systemd-recovery");
+        assert_eq!(SERVICE_BINARY_PATH, "/usr/sbin/luks-enroll-service");
     }
 }

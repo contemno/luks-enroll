@@ -142,5 +142,65 @@ class TestDetectTpm2Device(unittest.TestCase):
         self.assertIsNone(result)
 
 
+# ===========================================================================
+# Token-type constants + run_async helper
+# ===========================================================================
+
+
+class TestTokenTypeConstants(unittest.TestCase):
+    """Client token-type constants must match systemd-cryptenroll's on-disk
+    values (and the Rust service's constants::TOKEN_TYPE_*)."""
+
+    def test_token_type_constants(self):
+        self.assertEqual(gui.TOKEN_FIDO2, "systemd-fido2")
+        self.assertEqual(gui.TOKEN_TPM2, "systemd-tpm2")
+        self.assertEqual(gui.TOKEN_RECOVERY, "systemd-recovery")
+
+
+class TestRunAsync(unittest.TestCase):
+    """run_async runs the call off-thread and routes the result (or a
+    synthesized D-Bus error triple) to the callback via GLib.idle_add."""
+
+    @staticmethod
+    def _sync_thread(target=None, daemon=None):
+        # Invoke the worker synchronously when .start() is called.
+        runner = mock.MagicMock()
+        runner.start = target
+        return runner
+
+    def test_success_routes_result_to_callback(self):
+        captured = []
+        with (
+            mock.patch.object(gui.threading, "Thread", side_effect=self._sync_thread),
+            mock.patch.object(
+                gui.GLib, "idle_add", side_effect=lambda *a: captured.append(a)
+            ),
+        ):
+            cb = object()
+            gui.run_async(lambda: (True, "out", ""), cb)
+        self.assertEqual(captured, [(cb, True, "out", "")])
+
+    def test_glib_error_becomes_failure_triple(self):
+        class FakeGError(Exception):
+            def __init__(self, message):
+                super().__init__(message)
+                self.message = message
+
+        def boom():
+            raise FakeGError("nope")
+
+        captured = []
+        with (
+            mock.patch.object(gui.threading, "Thread", side_effect=self._sync_thread),
+            mock.patch.object(gui.GLib, "Error", FakeGError),
+            mock.patch.object(
+                gui.GLib, "idle_add", side_effect=lambda *a: captured.append(a)
+            ),
+        ):
+            cb = object()
+            gui.run_async(boom, cb)
+        self.assertEqual(captured, [(cb, False, "", "D-Bus error: nope")])
+
+
 if __name__ == "__main__":
     unittest.main()
