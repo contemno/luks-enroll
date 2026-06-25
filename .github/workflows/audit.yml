@@ -1,0 +1,70 @@
+name: Dependency advisory scan
+
+# Advisory scanning that complements Dependabot. Dependabot's version/security
+# updates are tied to a new release landing and to the GitHub Advisory Database;
+# this job instead checks the *currently committed* dependencies against the
+# RustSec (cargo-audit) and PyPI/OSV (pip-audit) databases on a schedule, so a
+# newly disclosed advisory for a dep we already ship is surfaced without waiting
+# for an upstream release.
+#
+# Intentionally NOT a required status check: it runs weekly + on PRs that touch
+# the manifests, and a finding turns the job red (visible in the Actions tab /
+# as a non-required PR check), but it must NOT be added to branch protection --
+# the advisory DBs change daily, so a new advisory for an existing dep could
+# otherwise block PRs unrelated to that dep.
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC, independent of release cadence
+  workflow_dispatch:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - rust/Cargo.lock
+      - rust/Cargo.toml
+      - requirements-dev.txt
+      - .github/workflows/audit.yml
+
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same PR when new commits are pushed.
+concurrency:
+  group: audit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # RustSec advisory scan of the committed workspace lockfile. cargo audit reads
+  # only Cargo.lock, so no C build deps (libcryptsetup/fido2/tss2/blkid) are
+  # needed -- this is a metadata check, not a build. cargo-audit is version- and
+  # --locked-pinned for a reproducible tool; the RustSec DB is fetched fresh at
+  # run time, so new advisories are still detected. (Bump the version manually;
+  # it lives in a run-string, not a manifest Dependabot tracks.)
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Audit Rust dependencies (RustSec)
+        run: cargo audit --file rust/Cargo.lock
+
+  # PyPI/OSV advisory scan of the hash-pinned dev tooling. pip-audit reads the
+  # requirements file directly (verified to accept the --require-hashes format),
+  # so nothing is installed into the environment. Version-pinned for the same
+  # reproducibility reason as cargo-audit above.
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.x"
+
+      - name: Install pip-audit
+        run: pip install "pip-audit==2.10.1"
+
+      - name: Audit Python dev tooling (PyPI/OSV)
+        run: pip-audit -r requirements-dev.txt
