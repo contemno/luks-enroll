@@ -9,17 +9,50 @@ updates:
     target-branch: dev
     schedule:
       interval: weekly
+    # Enforce a minimum package age before opening a version-update PR, so a
+    # freshly published (possibly compromised) release has time to be caught
+    # and yanked before we adopt it. cooldown gates VERSION updates only --
+    # Dependabot security fixes bypass it. semver-* days apply to semver
+    # registries; actions are tag-based, so default-days is the knob here.
+    cooldown:
+      default-days: 14
     groups:
       actions:
         patterns: ["*"]
 
+  # Rust service crates: workspace at rust/ (members: service + fido2-sys).
+  # Version updates bump direct deps in Cargo.toml and regenerate Cargo.lock;
+  # transitive-only bumps still arrive via security updates (which ignore
+  # cooldown). Conservative cooldown matches this being a security-sensitive
+  # LUKS tool -- staleness is a fair price for vetting time.
+  - package-ecosystem: cargo
+    directory: /rust
+    target-branch: dev
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
+    groups:
+      cargo:
+        patterns: ["*"]
+
   # Dev tooling (ruff, pytest + transitive deps) hash-pinned in
   # requirements-dev.txt. Dependabot regenerates the file with new hashes.
+  # These run in CI, so a compromised release is a real supply-chain vector --
+  # cooldown buys vetting time.
   - package-ecosystem: pip
     directory: /
     target-branch: dev
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 14
+      semver-major-days: 30
+      semver-minor-days: 14
+      semver-patch-days: 7
     groups:
       dev-tools:
         patterns: ["*"]
