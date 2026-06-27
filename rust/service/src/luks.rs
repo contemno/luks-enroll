@@ -20,6 +20,7 @@ use libcryptsetup_rs::{CryptDevice, CryptInit, CryptPbkdfType, Either, LibcryptE
 use zeroize::Zeroizing;
 
 use crate::constants::{TOKEN_TYPE_FIDO2, TOKEN_TYPE_TPM2};
+use crate::devices::canonicalize_lossy;
 use crate::error::{Error, Result};
 use crate::{bail, fido2, tpm2};
 
@@ -98,25 +99,22 @@ const VOLUME_KEY_CACHE_TTL: Duration = Duration::from_secs(120);
 static VOLUME_KEY_CACHE: LazyLock<Mutex<HashMap<String, (VolumeKey, Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn realpath(device: &str) -> String {
-    std::fs::canonicalize(device)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| device.to_string())
-}
-
 pub fn clear_volume_key_cache(device: &str) {
-    VOLUME_KEY_CACHE.lock().unwrap().remove(&realpath(device));
+    VOLUME_KEY_CACHE
+        .lock()
+        .unwrap()
+        .remove(&canonicalize_lossy(device));
 }
 
 fn cache_volume_key(device: &str, vk: VolumeKey) {
     VOLUME_KEY_CACHE
         .lock()
         .unwrap()
-        .insert(realpath(device), (vk, Instant::now()));
+        .insert(canonicalize_lossy(device), (vk, Instant::now()));
 }
 
 fn cached_volume_key(device: &str) -> Option<VolumeKey> {
-    let key = realpath(device);
+    let key = canonicalize_lossy(device);
     let mut cache = VOLUME_KEY_CACHE.lock().unwrap();
     match cache.get(&key) {
         Some((vk, ts)) if ts.elapsed() < VOLUME_KEY_CACHE_TTL => Some(vk.clone()),
@@ -792,7 +790,7 @@ mod tests {
         VOLUME_KEY_CACHE
             .lock()
             .unwrap()
-            .insert(realpath(dev), (VolumeKey::new(vec![9, 9]), stale));
+            .insert(canonicalize_lossy(dev), (VolumeKey::new(vec![9, 9]), stale));
 
         assert!(
             cached_volume_key(dev).is_none(),
@@ -802,7 +800,7 @@ mod tests {
         assert!(!VOLUME_KEY_CACHE
             .lock()
             .unwrap()
-            .contains_key(&realpath(dev)));
+            .contains_key(&canonicalize_lossy(dev)));
     }
 
     #[test]
