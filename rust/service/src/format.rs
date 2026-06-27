@@ -271,26 +271,10 @@ fn probe_lookup_len(probe: &RawProbe, name: &str) -> Option<usize> {
     Some(len)
 }
 
-/// Hand-rolled `^nvme[0-9]+n[0-9]+$` (whole-disk nvme name).
+/// Hand-rolled `^nvme[0-9]+n[0-9]+$` (whole-disk nvme name): a well-formed
+/// nvme namespace with nothing after it.
 fn is_nvme_whole_disk(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("nvme") else {
-        return false;
-    };
-    let b = rest.as_bytes();
-    let mut i = 0;
-    let ctrl_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == ctrl_start || i >= b.len() || b[i] != b'n' {
-        return false;
-    }
-    i += 1;
-    let ns_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    i > ns_start && i == b.len()
+    devices::parse_nvme(name).is_some_and(|(_, suffix)| suffix.is_empty())
 }
 
 // ---------------------------------------------------------------------------
