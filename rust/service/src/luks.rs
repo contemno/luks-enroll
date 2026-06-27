@@ -179,15 +179,13 @@ pub fn tokens_by_type(device: &str, token_type: &str) -> Vec<(i32, Vec<i32>)> {
     let Some(meta) = metadata_json(device) else {
         return out;
     };
-    if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
-        for (tid, tinfo) in tokens {
-            if tinfo.get("type").and_then(|t| t.as_str()) == Some(token_type) {
-                let Ok(tid) = tid.parse::<i32>() else {
-                    continue;
-                };
-                let slots = token_keyslots(tinfo);
-                out.push((tid, slots));
-            }
+    for (tid, tinfo) in tokens_iter(&meta) {
+        if token_type_is(tinfo, token_type) {
+            let Ok(tid) = tid.parse::<i32>() else {
+                continue;
+            };
+            let slots = token_keyslots(tinfo);
+            out.push((tid, slots));
         }
     }
     out.sort();
@@ -206,16 +204,33 @@ fn token_keyslots(tinfo: &serde_json::Value) -> Vec<i32> {
         .unwrap_or_default()
 }
 
+/// Iterate the LUKS2 `tokens` object as (token-id, token-info) pairs. Empty
+/// when the section is absent or not an object — the *absent = empty, not
+/// error* contract the token walkers and parsers rely on.
+fn tokens_iter(meta: &serde_json::Value) -> impl Iterator<Item = (&String, &serde_json::Value)> {
+    meta.get("tokens")
+        .and_then(|v| v.as_object())
+        .into_iter()
+        .flatten()
+}
+
+/// Whether a token-info object's `type` field equals `token_type`.
+fn token_type_is(tinfo: &serde_json::Value, token_type: &str) -> bool {
+    tinfo.get("type").and_then(|t| t.as_str()) == Some(token_type)
+}
+
+/// A string field of a token-info object, or None if absent / not a string.
+fn token_str<'a>(tinfo: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    tinfo.get(field).and_then(|v| v.as_str())
+}
+
 /// Ordered, de-duplicated keyslots bound to tokens of `token_type` in the
 /// given LUKS2 metadata. Empty when the type has no tokens / no recorded
 /// keyslots — the signal for `extract_token_volume_key` to try every slot.
 fn token_type_keyslots(meta: &serde_json::Value, token_type: &str) -> Vec<i32> {
     let mut slots = Vec::new();
-    let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) else {
-        return slots;
-    };
-    for tinfo in tokens.values() {
-        if tinfo.get("type").and_then(|t| t.as_str()) == Some(token_type) {
+    for (_, tinfo) in tokens_iter(meta) {
+        if token_type_is(tinfo, token_type) {
             for s in token_keyslots(tinfo) {
                 if !slots.contains(&s) {
                     slots.push(s);
@@ -232,10 +247,8 @@ pub fn password_keyslots(device: &str) -> Vec<i32> {
         return Vec::new();
     };
     let mut managed = std::collections::HashSet::new();
-    if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
-        for tinfo in tokens.values() {
-            managed.extend(token_keyslots(tinfo));
-        }
+    for (_, tinfo) in tokens_iter(&meta) {
+        managed.extend(token_keyslots(tinfo));
     }
     let mut out: Vec<i32> = meta
         .get("keyslots")
@@ -256,12 +269,10 @@ pub fn find_token_for_keyslot(device: &str, slot: i32) -> i32 {
     let Some(meta) = metadata_json(device) else {
         return -1;
     };
-    if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
-        for (tid, tinfo) in tokens {
-            if token_keyslots(tinfo).contains(&slot) {
-                if let Ok(tid) = tid.parse() {
-                    return tid;
-                }
+    for (tid, tinfo) in tokens_iter(&meta) {
+        if token_keyslots(tinfo).contains(&slot) {
+            if let Ok(tid) = tid.parse() {
+                return tid;
             }
         }
     }
@@ -283,24 +294,18 @@ fn decode_b64(s: &str) -> Result<Vec<u8>> {
 /// Pure parser for systemd-fido2 tokens in LUKS2 metadata JSON.
 fn fido2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Fido2TokenRef>> {
     let mut out = Vec::new();
-    if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
-        for tinfo in tokens.values() {
-            if tinfo.get("type").and_then(|t| t.as_str()) != Some(TOKEN_TYPE_FIDO2) {
-                continue;
-            }
-            let cred = tinfo
-                .get("fido2-credential")
-                .and_then(|v| v.as_str())
-                .ok_or(Error::from("fido2 token missing fido2-credential"))?;
-            let salt = tinfo
-                .get("fido2-salt")
-                .and_then(|v| v.as_str())
-                .ok_or(Error::from("fido2 token missing fido2-salt"))?;
-            out.push(Fido2TokenRef {
-                cred_id: decode_b64(cred)?,
-                salt: decode_b64(salt)?,
-            });
+    for (_, tinfo) in tokens_iter(meta) {
+        if !token_type_is(tinfo, TOKEN_TYPE_FIDO2) {
+            continue;
         }
+        let cred = token_str(tinfo, "fido2-credential")
+            .ok_or(Error::from("fido2 token missing fido2-credential"))?;
+        let salt =
+            token_str(tinfo, "fido2-salt").ok_or(Error::from("fido2 token missing fido2-salt"))?;
+        out.push(Fido2TokenRef {
+            cred_id: decode_b64(cred)?,
+            salt: decode_b64(salt)?,
+        });
     }
     Ok(out)
 }
@@ -321,58 +326,54 @@ pub fn tpm2_token_refs(device: &str) -> Result<Vec<Tpm2TokenRef>> {
 /// write through crypt_token_json_set, so these forms are read-side only.
 fn tpm2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Tpm2TokenRef>> {
     let mut out = Vec::new();
-    if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
-        for (tid, tinfo) in tokens {
-            if tinfo.get("type").and_then(|t| t.as_str()) != Some(TOKEN_TYPE_TPM2) {
-                continue;
-            }
-            let blob_val = tinfo
-                .get("tpm2_blob")
-                .filter(|v| !v.is_null())
-                .or_else(|| tinfo.get("tpm2-blob"))
-                .ok_or(Error::from("tpm2 token missing tpm2-blob"))?;
-            let blob = match blob_val {
-                serde_json::Value::Array(parts) => {
-                    let mut buf = Vec::new();
-                    for p in parts {
-                        let s = p.as_str().ok_or(Error::from("bad tpm2-blob entry"))?;
-                        buf.extend(decode_b64(s)?);
-                    }
-                    buf
-                }
-                serde_json::Value::String(s) => decode_b64(s)?,
-                _ => bail!("bad tpm2-blob field"),
-            };
-            let pcrs = match tinfo.get("tpm2-pcrs") {
-                Some(serde_json::Value::Array(a)) => a
-                    .iter()
-                    .map(|p| match p {
-                        serde_json::Value::Number(n) => n.to_string(),
-                        other => other.as_str().unwrap_or_default().to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("+"),
-                Some(other) => other
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| other.to_string()),
-                None => String::new(),
-            };
-            out.push(Tpm2TokenRef {
-                token_id: tid.clone(),
-                blob,
-                pcrs,
-                pcr_bank: tinfo
-                    .get("tpm2-pcr-bank")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("sha256")
-                    .to_string(),
-                pin_required: tinfo
-                    .get("tpm2-pin")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-            });
+    for (tid, tinfo) in tokens_iter(meta) {
+        if !token_type_is(tinfo, TOKEN_TYPE_TPM2) {
+            continue;
         }
+        let blob_val = tinfo
+            .get("tpm2_blob")
+            .filter(|v| !v.is_null())
+            .or_else(|| tinfo.get("tpm2-blob"))
+            .ok_or(Error::from("tpm2 token missing tpm2-blob"))?;
+        let blob = match blob_val {
+            serde_json::Value::Array(parts) => {
+                let mut buf = Vec::new();
+                for p in parts {
+                    let s = p.as_str().ok_or(Error::from("bad tpm2-blob entry"))?;
+                    buf.extend(decode_b64(s)?);
+                }
+                buf
+            }
+            serde_json::Value::String(s) => decode_b64(s)?,
+            _ => bail!("bad tpm2-blob field"),
+        };
+        let pcrs = match tinfo.get("tpm2-pcrs") {
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .map(|p| match p {
+                    serde_json::Value::Number(n) => n.to_string(),
+                    other => other.as_str().unwrap_or_default().to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("+"),
+            Some(other) => other
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| other.to_string()),
+            None => String::new(),
+        };
+        out.push(Tpm2TokenRef {
+            token_id: tid.clone(),
+            blob,
+            pcrs,
+            pcr_bank: token_str(tinfo, "tpm2-pcr-bank")
+                .unwrap_or("sha256")
+                .to_string(),
+            pin_required: tinfo
+                .get("tpm2-pin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        });
     }
     Ok(out)
 }
@@ -645,6 +646,33 @@ mod tests {
         assert_eq!(decode_b64("aGk=").unwrap(), b"hi");
         let err = decode_b64("@@not base64@@").unwrap_err();
         assert!(err.0.starts_with("bad base64"), "unexpected: {}", err.0);
+    }
+
+    #[test]
+    fn token_helpers_walk_and_getters() {
+        // tokens_iter yields each (id, info) pair...
+        let meta = serde_json::json!({
+            "tokens": {
+                "0": { "type": "systemd-fido2", "fido2-salt": "AAAA" },
+                "1": { "type": "systemd-tpm2" },
+            }
+        });
+        let ids: Vec<&String> = tokens_iter(&meta).map(|(tid, _)| tid).collect();
+        assert_eq!(ids, vec!["0", "1"]);
+
+        // ...and is empty (not a panic) when the section is absent or non-object.
+        assert_eq!(tokens_iter(&serde_json::json!({"keyslots": {}})).count(), 0);
+        assert_eq!(tokens_iter(&serde_json::json!({"tokens": 7})).count(), 0);
+
+        let (_, fido) = tokens_iter(&meta).next().unwrap();
+        // token_type_is matches the `type` field exactly.
+        assert!(token_type_is(fido, "systemd-fido2"));
+        assert!(!token_type_is(fido, "systemd-tpm2"));
+        // token_str returns Some for a present string, None for missing /
+        // non-string fields.
+        assert_eq!(token_str(fido, "fido2-salt"), Some("AAAA"));
+        assert_eq!(token_str(fido, "fido2-credential"), None);
+        assert_eq!(token_str(fido, "type"), Some("systemd-fido2"));
     }
 
     #[test]
