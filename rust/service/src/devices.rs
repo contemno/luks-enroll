@@ -260,8 +260,10 @@ fn crypttab_devices(crypttab: &Path, by_uuid_dir: &Path) -> Vec<String> {
 }
 
 /// Like Python's os.path.realpath: canonicalize, falling back to the
-/// input path when resolution fails.
-fn canonicalize_lossy(path: &Path) -> String {
+/// input path when resolution fails. Accepts `&Path` or `&str` so the
+/// device-path callers in `luks` share this one implementation.
+pub(crate) fn canonicalize_lossy(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
     fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
@@ -388,6 +390,26 @@ mod tests {
         // Full paths reduce to their basename first.
         assert_eq!(parent_device_name("/dev/sda1"), "sda");
         assert_eq!(parent_device_name("/dev/nvme0n1p2"), "nvme0n1");
+    }
+
+    #[test]
+    fn canonicalize_lossy_str_and_path() {
+        // A nonexistent path resolves to nothing, so the input is returned
+        // verbatim -- and the &str overload (the luks cache call site) yields
+        // the same string as the original input.
+        assert_eq!(
+            canonicalize_lossy("/nonexistent/luks-enroll-canon-test"),
+            "/nonexistent/luks-enroll-canon-test"
+        );
+
+        // A real path resolves the same whether passed as &str or &Path.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let want = fs::canonicalize(f.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(canonicalize_lossy(f.path()), want);
+        assert_eq!(canonicalize_lossy(f.path().to_str().unwrap()), want);
     }
 
     #[test]
