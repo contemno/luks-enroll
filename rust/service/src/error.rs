@@ -5,6 +5,7 @@
 //! "Operation failed" over D-Bus. This type mirrors that: it carries the
 //! detailed message for logging; the D-Bus layer decides what leaks out.
 
+use std::ffi::CString;
 use std::fmt;
 
 #[derive(Debug)]
@@ -56,10 +57,29 @@ impl From<tss_esapi::Error> for Error {
     }
 }
 
+/// Build a `CString` from `bytes`, mapping an embedded NUL to a
+/// `"{what} contains a NUL byte"` error — the message the FFI call sites
+/// (device paths, PINs, TCTI config) used verbatim.
+pub fn cstring(bytes: impl Into<Vec<u8>>, what: &str) -> Result<CString> {
+    CString::new(bytes).map_err(|_| Error(format!("{what} contains a NUL byte")))
+}
+
 /// Shorthand: `return err!("Esys_Load failed: {rc:#x}")`.
 #[macro_export]
 macro_rules! bail {
     ($($arg:tt)*) => {
         return Err($crate::error::Error(format!($($arg)*)))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cstring_builds_and_reports_nul() {
+        assert_eq!(cstring("ok", "x").unwrap(), CString::new("ok").unwrap());
+        let err = cstring("a\0b", "device path").unwrap_err();
+        assert_eq!(err.0, "device path contains a NUL byte");
+    }
 }

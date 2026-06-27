@@ -22,7 +22,7 @@ use fido2_sys::{
 };
 
 use crate::bail;
-use crate::error::{Error, Result};
+use crate::error::{cstring, Error, Result};
 use crate::luks::Fido2TokenRef;
 
 // libfido2 status codes and flags, taken from the generated bindings
@@ -411,9 +411,7 @@ fn touch_select(devs: &[Dev], candidates: &[(usize, Vec<usize>)]) -> usize {
 /// `pin.encode() if pin else None` truthiness.
 fn pin_cstring(pin: Option<&str>) -> Result<Option<CString>> {
     match pin {
-        Some(p) if !p.is_empty() => Ok(Some(
-            CString::new(p).map_err(|_| Error::from("PIN contains a NUL byte"))?,
-        )),
+        Some(p) if !p.is_empty() => Ok(Some(cstring(p, "PIN")?)),
         _ => Ok(None),
     }
 }
