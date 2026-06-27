@@ -19,6 +19,7 @@ use libcryptsetup_rs::consts::vals::{CryptKdf, EncryptionFormat};
 use libcryptsetup_rs::{CryptDevice, CryptInit, CryptPbkdfType, Either, LibcryptErr, TokenInput};
 use zeroize::Zeroizing;
 
+use crate::constants::{TOKEN_TYPE_FIDO2, TOKEN_TYPE_TPM2};
 use crate::error::{Error, Result};
 use crate::{bail, fido2, tpm2};
 
@@ -273,12 +274,18 @@ pub fn fido2_token_refs(device: &str) -> Result<Vec<Fido2TokenRef>> {
     fido2_refs_from_meta(&meta)
 }
 
+/// Decode standard base64 into bytes, mapping a decode failure to the service
+/// error string the token parsers have always produced.
+fn decode_b64(s: &str) -> Result<Vec<u8>> {
+    B64.decode(s).map_err(|e| Error(format!("bad base64: {e}")))
+}
+
 /// Pure parser for systemd-fido2 tokens in LUKS2 metadata JSON.
 fn fido2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Fido2TokenRef>> {
     let mut out = Vec::new();
     if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
         for tinfo in tokens.values() {
-            if tinfo.get("type").and_then(|t| t.as_str()) != Some("systemd-fido2") {
+            if tinfo.get("type").and_then(|t| t.as_str()) != Some(TOKEN_TYPE_FIDO2) {
                 continue;
             }
             let cred = tinfo
@@ -290,12 +297,8 @@ fn fido2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Fido2TokenRef>> 
                 .and_then(|v| v.as_str())
                 .ok_or(Error::from("fido2 token missing fido2-salt"))?;
             out.push(Fido2TokenRef {
-                cred_id: B64
-                    .decode(cred)
-                    .map_err(|e| Error(format!("bad base64: {e}")))?,
-                salt: B64
-                    .decode(salt)
-                    .map_err(|e| Error(format!("bad base64: {e}")))?,
+                cred_id: decode_b64(cred)?,
+                salt: decode_b64(salt)?,
             });
         }
     }
@@ -320,7 +323,7 @@ fn tpm2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Tpm2TokenRef>> {
     let mut out = Vec::new();
     if let Some(tokens) = meta.get("tokens").and_then(|v| v.as_object()) {
         for (tid, tinfo) in tokens {
-            if tinfo.get("type").and_then(|t| t.as_str()) != Some("systemd-tpm2") {
+            if tinfo.get("type").and_then(|t| t.as_str()) != Some(TOKEN_TYPE_TPM2) {
                 continue;
             }
             let blob_val = tinfo
@@ -333,16 +336,11 @@ fn tpm2_refs_from_meta(meta: &serde_json::Value) -> Result<Vec<Tpm2TokenRef>> {
                     let mut buf = Vec::new();
                     for p in parts {
                         let s = p.as_str().ok_or(Error::from("bad tpm2-blob entry"))?;
-                        buf.extend(
-                            B64.decode(s)
-                                .map_err(|e| Error(format!("bad base64: {e}")))?,
-                        );
+                        buf.extend(decode_b64(s)?);
                     }
                     buf
                 }
-                serde_json::Value::String(s) => B64
-                    .decode(s)
-                    .map_err(|e| Error(format!("bad base64: {e}")))?,
+                serde_json::Value::String(s) => decode_b64(s)?,
                 _ => bail!("bad tpm2-blob field"),
             };
             let pcrs = match tinfo.get("tpm2-pcrs") {
@@ -413,8 +411,8 @@ fn derive_passphrase_from_token(
     pin: &str,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let raw = match token_type {
-        "systemd-fido2" => fido2::unlock_from_tokens(&fido2_token_refs(device)?, pin)?,
-        "systemd-tpm2" => tpm2::unseal_from_tokens(&tpm2_token_refs(device)?, pin)?,
+        TOKEN_TYPE_FIDO2 => fido2::unlock_from_tokens(&fido2_token_refs(device)?, pin)?,
+        TOKEN_TYPE_TPM2 => tpm2::unseal_from_tokens(&tpm2_token_refs(device)?, pin)?,
         other => bail!("Unknown token type: {other}"),
     };
     let encoded = Zeroizing::new(B64.encode(&raw).into_bytes());
@@ -472,7 +470,7 @@ pub fn extract_token_volume_key(
 /// Returns the keyslot, or an error message.
 pub fn verify_token(device: &str, token_type: &str, pin: &str) -> std::result::Result<i32, String> {
     let _t = Timer::new("verify_token");
-    const VALID: [&str; 2] = ["systemd-fido2", "systemd-tpm2"];
+    const VALID: [&str; 2] = [TOKEN_TYPE_FIDO2, TOKEN_TYPE_TPM2];
     if !VALID.contains(&token_type) {
         // Parity: Python raises here (caller turns it into a D-Bus failure).
         return Err("Unsupported token type".to_string());
@@ -502,7 +500,7 @@ pub fn get_volume_key(
     unlock_pin: &str,
 ) -> Result<VolumeKey> {
     let _t = Timer::new("get_volume_key");
-    const VALID: [&str; 3] = ["passphrase", "systemd-fido2", "systemd-tpm2"];
+    const VALID: [&str; 3] = ["passphrase", TOKEN_TYPE_FIDO2, TOKEN_TYPE_TPM2];
     if !VALID.contains(&unlock_method) {
         bail!("Invalid unlock method: {unlock_method:?}");
     }
@@ -641,6 +639,13 @@ pub fn format_luks2(path: &str, passphrase: &str) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_b64_decodes_and_reports_bad_input() {
+        assert_eq!(decode_b64("aGk=").unwrap(), b"hi");
+        let err = decode_b64("@@not base64@@").unwrap_err();
+        assert!(err.0.starts_with("bad base64"), "unexpected: {}", err.0);
+    }
 
     #[test]
     fn tpm2_refs_parse_quirks() {

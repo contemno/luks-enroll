@@ -60,7 +60,8 @@ crypt-root  UUID=...  none  tpm2-device=auto,fido2-device=auto,luks,discard
 rust/                              Privileged service (Rust workspace)
   service/                         luks-enroll-service crate
     src/                           D-Bus service + cryptsetup/TPM2/FIDO2/format logic
-    tests/                         LUKS2 image-file, D-Bus e2e, and fd-passing integration tests
+    tests/                         LUKS2 image-file, D-Bus e2e, fd-passing, config-parity integration tests
+      common/mod.rs                Shared test harness (temp-dir, LUKS-image factory, passphrase)
   fido2-sys/                       bindgen FFI to libfido2 (built against system headers)
 
 dist/                              Mirrors the install hierarchy for the non-Rust files:
@@ -88,6 +89,7 @@ tests/
 VERSION                            Release-version floor (X.Y.Z); bump for a minor/major release
 scripts/                           Developer tooling (git hooks, changelog + next-version)
 .github/workflows/                 CI (Python lint+tests, Rust fmt/clippy/build/test) and releases
+.github/actions/                   Reusable composite actions (install-c-deps, python-setup)
 ```
 
 [`debian/rules`](debian/rules) compiles the Rust service (`cargo build --release --locked`) and `dh_install` copies `dist/*` plus the built binary into place per [`debian/luks-enroll.install`](debian/luks-enroll.install). The service tests live in the Rust workspace ([`rust/service/tests/`](rust/service/tests/)); the Python suite under [`tests/`](tests/) covers the GUI client.

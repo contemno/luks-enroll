@@ -29,16 +29,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ inputs.ref }}
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: "3.x"
-
-      - name: Install dev tooling (hash-pinned)
-        run: pip install --require-hashes -r requirements-dev.txt
+      - uses: ./.github/actions/python-setup
 
       - name: Ruff check
         run: ruff check .
@@ -49,16 +44,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ inputs.ref }}
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: "3.x"
-
-      - name: Install dev tooling (hash-pinned)
-        run: pip install --require-hashes -r requirements-dev.txt
+      - uses: ./.github/actions/python-setup
 
       - name: Run tests
         run: python3 -m pytest tests/ -v
@@ -89,7 +79,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0  # need full history + tags for changelog generation
@@ -103,7 +93,7 @@ jobs:
       # key from the PR job (release profile != debug). Paired with `-nc` below so
       # the package `clean` step doesn't delete the restored cache.
       - name: Cache cargo home and target (release)
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: |
             debian/.cargo/registry/index
@@ -158,7 +148,7 @@ jobs:
       # and flip it to published as a separate step.
       - name: Create draft release with assets
         id: draft_release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe  # v2.6.1
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3.0.1
         with:
           tag_name: ${{ inputs.ref }}
           files: artifacts/*.deb

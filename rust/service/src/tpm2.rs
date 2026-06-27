@@ -26,7 +26,6 @@
 //! the Python service and systemd-cryptenroll.
 
 use std::convert::TryFrom;
-use std::ffi::CString;
 use std::ptr::{null, null_mut};
 
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -42,7 +41,7 @@ use tss_esapi::tss2_esys as sys;
 use zeroize::Zeroize;
 
 use crate::bail;
-use crate::error::{Error, Result};
+use crate::error::{cstring, Error, Result};
 use crate::luks::Tpm2TokenRef;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +66,16 @@ const TPM2_PERSISTENT_SRK: u32 = 0x8100_0001;
 /// Scratch buffer size for Tss2_MU_* marshaling (Python: _MARSHAL_BUF_MAX).
 const MARSHAL_BUF_MAX: usize = 4096;
 
+/// Map a raw TSS return code to our `Result`: `Ok(())` on success, else a
+/// step-tagged, hex-formatted error (`"{step} failed: 0x{rc:08x}"`) matching
+/// the per-call messages the Python service logged for parity.
+fn tss_ok(rc: sys::TSS2_RC, step: &str) -> Result<()> {
+    if rc != 0 {
+        return Err(Error(format!("{step} failed: 0x{rc:08x}")));
+    }
+    Ok(())
+}
+
 pub struct SealResult {
     /// Marshaled TPM2B_PRIVATE + TPM2B_PUBLIC of the sealed object.
     pub blob: Vec<u8>,
@@ -84,12 +93,8 @@ pub struct SealResult {
 pub fn seal(secret: &[u8], pcrs: &str, pin: &str) -> Result<SealResult> {
     let pcr_list = build_pcr_selection_list(HashingAlgorithm::Sha256, pcrs)?;
     let ctx = EsysContext::new()?;
-    let mut to_flush: Vec<sys::ESYS_TR> = Vec::new();
-    let result = seal_inner(&ctx, &mut to_flush, secret, &pcr_list, pin);
-    for handle in to_flush {
-        ctx.flush_quiet(handle);
-    }
-    result
+    let mut flusher = HandleFlusher::new(&ctx);
+    seal_inner(&ctx, &mut flusher, secret, &pcr_list, pin)
 }
 
 /// Unseal the secret from one of the device's systemd-tpm2 tokens.
@@ -307,13 +312,10 @@ fn tcti_conf() -> String {
 
 impl EsysContext {
     fn new() -> Result<Self> {
-        let conf = CString::new(tcti_conf())
-            .map_err(|_| Error::from("TCTI configuration contains a NUL byte"))?;
+        let conf = cstring(tcti_conf(), "TCTI configuration")?;
         let mut tcti: *mut sys::TSS2_TCTI_CONTEXT = null_mut();
         let rc = unsafe { sys::Tss2_TctiLdr_Initialize(conf.as_ptr(), &mut tcti) };
-        if rc != 0 {
-            bail!("Tss2_TctiLdr_Initialize failed: 0x{rc:08x}");
-        }
+        tss_ok(rc, "Tss2_TctiLdr_Initialize")?;
         let mut esys: *mut sys::ESYS_CONTEXT = null_mut();
         let rc = unsafe { sys::Esys_Initialize(&mut esys, tcti, null_mut()) };
         if rc != 0 {
@@ -338,6 +340,42 @@ impl Drop for EsysContext {
     }
 }
 
+/// Tracks ESYS transient handles and flushes any still held when dropped, so
+/// seal/unseal free their handles on success and on every error path.
+struct HandleFlusher<'a> {
+    ctx: &'a EsysContext,
+    handles: Vec<sys::ESYS_TR>,
+}
+
+impl<'a> HandleFlusher<'a> {
+    fn new(ctx: &'a EsysContext) -> Self {
+        Self {
+            ctx,
+            handles: Vec::new(),
+        }
+    }
+
+    /// Track a handle to be flushed on drop.
+    fn track(&mut self, handle: sys::ESYS_TR) {
+        self.handles.push(handle);
+    }
+
+    /// Flush now and stop tracking — for a handle that must be freed before a
+    /// later TPM op (the trial session and the transient SRK in `seal_inner`).
+    fn flush_now(&mut self, handle: sys::ESYS_TR) {
+        self.ctx.flush_quiet(handle);
+        self.handles.retain(|&h| h != handle);
+    }
+}
+
+impl Drop for HandleFlusher<'_> {
+    fn drop(&mut self) {
+        for &handle in &self.handles {
+            self.ctx.flush_quiet(handle);
+        }
+    }
+}
+
 /// Free an ESYS-allocated output pointer (no-op for NULL).
 fn esys_free<T>(ptr: *mut T) {
     if !ptr.is_null() {
@@ -350,9 +388,7 @@ fn tr_serialize(ctx: &EsysContext, handle: sys::ESYS_TR) -> Result<Vec<u8>> {
     let mut buffer: *mut u8 = null_mut();
     let mut buffer_size: sys::size_t = 0;
     let rc = unsafe { sys::Esys_TR_Serialize(ctx.esys, handle, &mut buffer, &mut buffer_size) };
-    if rc != 0 {
-        bail!("Esys_TR_Serialize failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_TR_Serialize")?;
     let out = if buffer.is_null() {
         Vec::new()
     } else {
@@ -421,9 +457,7 @@ fn get_srk(ctx: &EsysContext) -> Result<(sys::ESYS_TR, bool, Vec<u8>)> {
             &mut creation_ticket,
         )
     };
-    if rc != 0 {
-        bail!("Esys_CreatePrimary failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_CreatePrimary")?;
     esys_free(out_public);
     esys_free(creation_data);
     esys_free(creation_hash);
@@ -456,9 +490,7 @@ fn start_session(ctx: &EsysContext, session_type: u8, kind: &str) -> Result<sys:
             &mut session,
         )
     };
-    if rc != 0 {
-        bail!("Esys_StartAuthSession ({kind}) failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, &format!("Esys_StartAuthSession ({kind})"))?;
     Ok(session)
 }
 
@@ -477,9 +509,7 @@ fn policy_pcr(ctx: &EsysContext, session: sys::ESYS_TR, pcr_list: &PcrSelectionL
             &pcr_selection,
         )
     };
-    if rc != 0 {
-        bail!("Esys_PolicyPCR failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_PolicyPCR")?;
     Ok(())
 }
 
@@ -493,9 +523,7 @@ fn policy_auth_value(ctx: &EsysContext, session: sys::ESYS_TR) -> Result<()> {
             sys::ESYS_TR_NONE,
         )
     };
-    if rc != 0 {
-        bail!("Esys_PolicyAuthValue failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_PolicyAuthValue")?;
     Ok(())
 }
 
@@ -511,9 +539,7 @@ fn policy_get_digest(ctx: &EsysContext, session: sys::ESYS_TR) -> Result<Vec<u8>
             &mut digest_ptr,
         )
     };
-    if rc != 0 {
-        bail!("Esys_PolicyGetDigest failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_PolicyGetDigest")?;
     let digest = unsafe { &*digest_ptr };
     let len = (digest.size as usize).min(digest.buffer.len());
     let out = digest.buffer[..len].to_vec();
@@ -533,9 +559,7 @@ fn marshal_tpm2b_private(private: &sys::TPM2B_PRIVATE) -> Result<Vec<u8>> {
             &mut offset,
         )
     };
-    if rc != 0 {
-        bail!("Marshal failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Marshal")?;
     buf.truncate(offset as usize);
     Ok(buf)
 }
@@ -552,9 +576,7 @@ fn marshal_tpm2b_public(public: &sys::TPM2B_PUBLIC) -> Result<Vec<u8>> {
             &mut offset,
         )
     };
-    if rc != 0 {
-        bail!("Marshal failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Marshal")?;
     buf.truncate(offset as usize);
     Ok(buf)
 }
@@ -565,7 +587,7 @@ fn marshal_tpm2b_public(public: &sys::TPM2B_PUBLIC) -> Result<Vec<u8>> {
 
 fn seal_inner(
     ctx: &EsysContext,
-    to_flush: &mut Vec<sys::ESYS_TR>,
+    flusher: &mut HandleFlusher,
     secret: &[u8],
     pcr_list: &PcrSelectionList,
     pin: &str,
@@ -573,12 +595,12 @@ fn seal_inner(
     // --- Get SRK (persistent at 0x81000001, or create transient) ---
     let (srk, srk_need_flush, srk_blob) = get_srk(ctx)?;
     if srk_need_flush {
-        to_flush.push(srk);
+        flusher.track(srk);
     }
 
     // --- Compute policy digest via trial session ---
     let trial_session = start_session(ctx, TPM2_SE_TRIAL, "trial")?;
-    to_flush.push(trial_session);
+    flusher.track(trial_session);
 
     policy_pcr(ctx, trial_session, pcr_list)?;
     if !pin.is_empty() {
@@ -587,8 +609,7 @@ fn seal_inner(
     let policy_hash = policy_get_digest(ctx, trial_session)?;
 
     // Flush the trial session.
-    ctx.flush_quiet(trial_session);
-    to_flush.retain(|&h| h != trial_session);
+    flusher.flush_now(trial_session);
 
     // --- Seal the secret ---
     let in_public = sys::TPM2B_PUBLIC::try_from(seal_template(&policy_hash, !pin.is_empty())?)
@@ -624,9 +645,7 @@ fn seal_inner(
     // Scrub the in-memory copy of the secret (and PIN hash) regardless of rc.
     in_sensitive.sensitive.userAuth.buffer.zeroize();
     in_sensitive.sensitive.data.buffer.zeroize();
-    if rc != 0 {
-        bail!("Esys_Create (seal) failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_Create (seal)")?;
 
     // Marshal sealed private + public into the token blob.
     let blob = (|| -> Result<Vec<u8>> {
@@ -643,8 +662,7 @@ fn seal_inner(
 
     // Flush the SRK (only if we created a transient one).
     if srk_need_flush {
-        ctx.flush_quiet(srk);
-        to_flush.retain(|&h| h != srk);
+        flusher.flush_now(srk);
     }
 
     Ok(SealResult {
@@ -665,17 +683,13 @@ fn seal_inner(
 fn try_unseal_token(token: &Tpm2TokenRef, pin: &str) -> Result<Vec<u8>> {
     let pcr_list = build_pcr_selection_list(pcr_bank_to_alg(&token.pcr_bank), &token.pcrs)?;
     let ctx = EsysContext::new()?;
-    let mut to_flush: Vec<sys::ESYS_TR> = Vec::new();
-    let result = unseal_inner(&ctx, &mut to_flush, token, &pcr_list, pin);
-    for handle in to_flush {
-        ctx.flush_quiet(handle);
-    }
-    result
+    let mut flusher = HandleFlusher::new(&ctx);
+    unseal_inner(&ctx, &mut flusher, token, &pcr_list, pin)
 }
 
 fn unseal_inner(
     ctx: &EsysContext,
-    to_flush: &mut Vec<sys::ESYS_TR>,
+    flusher: &mut HandleFlusher,
     token: &Tpm2TokenRef,
     pcr_list: &PcrSelectionList,
     pin: &str,
@@ -683,7 +697,7 @@ fn unseal_inner(
     // --- Get SRK (persistent at 0x81000001, or create transient) ---
     let (srk, srk_need_flush, _srk_blob) = get_srk(ctx)?;
     if srk_need_flush {
-        to_flush.push(srk);
+        flusher.track(srk);
     }
 
     // Unmarshal the sealed private + public from the blob at a running offset.
@@ -698,9 +712,7 @@ fn unseal_inner(
             &mut seal_private,
         )
     };
-    if rc != 0 {
-        bail!("Unmarshal TPM2B_PRIVATE failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Unmarshal TPM2B_PRIVATE")?;
     let mut seal_public = sys::TPM2B_PUBLIC::default();
     let rc = unsafe {
         sys::Tss2_MU_TPM2B_PUBLIC_Unmarshal(
@@ -710,9 +722,7 @@ fn unseal_inner(
             &mut seal_public,
         )
     };
-    if rc != 0 {
-        bail!("Unmarshal TPM2B_PUBLIC failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Unmarshal TPM2B_PUBLIC")?;
 
     // Load the sealed object under the SRK (password session, empty auth).
     let mut loaded: sys::ESYS_TR = sys::ESYS_TR_NONE;
@@ -728,10 +738,8 @@ fn unseal_inner(
             &mut loaded,
         )
     };
-    if rc != 0 {
-        bail!("Esys_Load failed: 0x{rc:08x}");
-    }
-    to_flush.push(loaded);
+    tss_ok(rc, "Esys_Load")?;
+    flusher.track(loaded);
 
     // If a PIN is used, set auth = SHA-256(pin) on the loaded object.
     if token.pin_required && !pin.is_empty() {
@@ -748,7 +756,7 @@ fn unseal_inner(
 
     // Start the policy session and replay the policy.
     let policy_session = start_session(ctx, TPM2_SE_POLICY, "policy")?;
-    to_flush.push(policy_session);
+    flusher.track(policy_session);
 
     policy_pcr(ctx, policy_session, pcr_list)?;
     if token.pin_required {
@@ -767,9 +775,7 @@ fn unseal_inner(
             &mut out_data,
         )
     };
-    if rc != 0 {
-        bail!("Esys_Unseal failed: 0x{rc:08x}");
-    }
+    tss_ok(rc, "Esys_Unseal")?;
     let sensitive = unsafe { &*out_data };
     let len = (sensitive.size as usize).min(sensitive.buffer.len());
     let secret = sensitive.buffer[..len].to_vec();
@@ -797,6 +803,17 @@ mod tests {
 
     fn ids(tokens: Vec<&Tpm2TokenRef>) -> Vec<String> {
         tokens.iter().map(|t| t.token_id.clone()).collect()
+    }
+
+    // --- TSS return-code helper ---------------------------------------------
+
+    #[test]
+    fn tss_ok_passes_zero_and_formats_failure() {
+        assert!(tss_ok(0, "Esys_Load").is_ok());
+        // Parity-critical: "<step> failed: 0x{rc:08x}" — lowercase, zero-padded
+        // to 8 hex digits, the exact per-call message the sites emitted before.
+        let err = tss_ok(0x1234, "Esys_Load").unwrap_err();
+        assert_eq!(err.0, "Esys_Load failed: 0x00001234");
     }
 
     // --- PCR string parsing -------------------------------------------------

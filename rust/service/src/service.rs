@@ -28,10 +28,11 @@ use zbus::zvariant::OwnedFd;
 use zbus::Connection;
 use zbus_polkit::policykit1::{AuthorityProxy, CheckAuthorizationFlags, Subject};
 
+use crate::constants::{
+    POLKIT_ACTION_MANAGE, POLKIT_ACTION_READ, TOKEN_TYPE_FIDO2, TOKEN_TYPE_RECOVERY,
+    TOKEN_TYPE_TPM2,
+};
 use crate::{devices, fido2, format, luks, recovery, settings};
-
-pub const POLKIT_ACTION_READ: &str = "net.contemno.luks-enroll.read";
-pub const POLKIT_ACTION_MANAGE: &str = "net.contemno.luks-enroll.manage";
 
 const AUTH_CACHE_TTL: Duration = Duration::from_secs(30);
 const MANAGE_AUTH_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -197,6 +198,27 @@ impl LuksEnrollService {
         Ok(())
     }
 
+    /// Auth + validate + length-check for a device-path method. Runs the polkit
+    /// `gate` (ownership-skip / polkit / auth-cache), canonicalizes and validates
+    /// the device, then length-checks the validated device plus `extra` args.
+    /// Returns the validated (realpath'd) device, collapsing the
+    /// gate + validate_device + check_lens triple the device methods share.
+    async fn gate_device(
+        &self,
+        conn: &Connection,
+        hdr: &Header<'_>,
+        kind: AuthKind,
+        device: &str,
+        extra: &[&str],
+    ) -> MethodResult<String> {
+        self.gate(conn, hdr, kind, Some(device), false).await?;
+        let device = Self::validate_device(device)?;
+        let mut lens: Vec<&str> = vec![&device];
+        lens.extend_from_slice(extra);
+        Self::check_lens(&lens)?;
+        Ok(device)
+    }
+
     /// Validate a file descriptor received over D-Bus for an *Fd method.
     ///
     /// The descriptor must refer to a regular file (or a block device,
@@ -302,6 +324,55 @@ fn op_failed(op: &str, e: impl std::fmt::Display) -> Triple {
     (false, String::new(), "Operation failed".to_string())
 }
 
+/// Shared wrapper for the `op_*` entry points: run the operation body and, on
+/// any error, log the real cause and return the generic failure triple. Keeps
+/// the enroll/wipe handlers from each repeating the closure +
+/// `unwrap_or_else(op_failed)` dance.
+fn run_op(op: &str, body: impl FnOnce() -> crate::error::Result<Triple>) -> Triple {
+    body().unwrap_or_else(|e| op_failed(op, e))
+}
+
+/// What an enrollment modality produces before the shared keyslot + token spine
+/// runs. `token` holds every token-JSON field *except* `keyslots`; the spine
+/// fills that in once the new slot index is known, so the three modalities share
+/// one identical `"keyslots": [slot]` step.
+struct Prepared {
+    /// Bytes added as the new keyslot's passphrase.
+    keyslot_secret: Vec<u8>,
+    /// Minimal-PBKDF (high-entropy secret) vs. the default KDF (typed key).
+    minimal_pbkdf: bool,
+    /// stdout field of the success triple (the recovery key, else empty).
+    stdout: String,
+    /// Token JSON without its `keyslots` field.
+    token: serde_json::Value,
+}
+
+/// Shared enrollment spine for FIDO2 / TPM2 / recovery: run `prepare` to produce
+/// the modality secret and token, then unlock the volume, add a keyslot from the
+/// volume key, stamp the new slot into the token, and persist it. `prepare` runs
+/// first so secret/hardware failures surface before any volume mutation, matching
+/// the original per-modality ordering.
+fn enroll_token(
+    device: &str,
+    unlock_method: &str,
+    unlock_pin: &str,
+    passphrase: &str,
+    prepare: impl FnOnce() -> crate::error::Result<Prepared>,
+) -> crate::error::Result<Triple> {
+    let prepared = prepare()?;
+    let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
+    let keyslot = luks::add_keyslot_by_volume_key(
+        device,
+        &vk,
+        &prepared.keyslot_secret,
+        prepared.minimal_pbkdf,
+    )?;
+    let mut token = prepared.token;
+    token["keyslots"] = serde_json::json!([keyslot.to_string()]);
+    luks::set_token(device, -1, Some(&token.to_string()))?;
+    Ok((true, prepared.stdout, String::new()))
+}
+
 pub fn op_enroll_fido2(
     device: &str,
     passphrase: &str,
@@ -310,7 +381,7 @@ pub fn op_enroll_fido2(
     unlock_method: &str,
     unlock_pin: &str,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
+    run_op("EnrollFido2", || {
         // Reject if this physical token is already enrolled on this volume.
         let existing_creds: Vec<Vec<u8>> = luks::fido2_token_refs(device)
             .map(|refs| refs.into_iter().map(|r| r.cred_id).collect())
@@ -325,27 +396,19 @@ pub fn op_enroll_fido2(
             ));
         }
 
-        let enrollment = fido2::enroll(fido2_device, (!pin.is_empty()).then_some(pin))?;
-        let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
-
-        // systemd convention: the token plugin base64-encodes the secret.
-        let secret_b64 = B64.encode(&enrollment.hmac_secret);
-        let keyslot = luks::add_keyslot_by_volume_key(device, &vk, secret_b64.as_bytes(), true)?;
-
-        let token_json = serde_json::json!({
-            "type": "systemd-fido2",
-            "keyslots": [keyslot.to_string()],
-            "fido2-credential": B64.encode(&enrollment.cred_id),
-            "fido2-salt": B64.encode(&enrollment.salt),
-            "fido2-rp": fido2::FIDO2_RP_ID,
-            "fido2-clientPin-required": !pin.is_empty(),
-            "fido2-up-required": true,
-            "fido2-uv-required": false,
-        });
-        luks::set_token(device, -1, Some(&token_json.to_string()))?;
-        Ok((true, String::new(), String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("EnrollFido2", e))
+        enroll_token(device, unlock_method, unlock_pin, passphrase, move || {
+            let enrollment = fido2::enroll(fido2_device, (!pin.is_empty()).then_some(pin))?;
+            // systemd convention: the token plugin base64-encodes the secret.
+            let keyslot_secret = B64.encode(&enrollment.hmac_secret).into_bytes();
+            let token = fido2_token_json(&enrollment.cred_id, &enrollment.salt, !pin.is_empty());
+            Ok(Prepared {
+                keyslot_secret,
+                minimal_pbkdf: true,
+                stdout: String::new(),
+                token,
+            })
+        })
+    })
 }
 
 pub fn op_enroll_tpm2(
@@ -356,49 +419,36 @@ pub fn op_enroll_tpm2(
     unlock_method: &str,
     unlock_pin: &str,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
-        // Random 32-byte secret to seal.
-        let mut secret = zeroize::Zeroizing::new(vec![0u8; 32]);
-        getrandom::fill(&mut secret).map_err(|e| crate::error::Error(e.to_string()))?;
+    run_op("EnrollTpm2", || {
+        enroll_token(device, unlock_method, unlock_pin, passphrase, move || {
+            // Random 32-byte secret to seal.
+            let mut secret = zeroize::Zeroizing::new(vec![0u8; 32]);
+            getrandom::fill(&mut secret).map_err(|e| crate::error::Error(e.to_string()))?;
 
-        let sealed = crate::tpm2::seal(&secret, pcrs, pin)?;
-        let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
+            let sealed = crate::tpm2::seal(&secret, pcrs, pin)?;
 
-        // systemd convention: token plugin base64-encodes the unsealed bytes.
-        let secret_b64 = B64.encode(&*secret);
-        let keyslot = luks::add_keyslot_by_volume_key(device, &vk, secret_b64.as_bytes(), true)?;
+            // systemd convention: token plugin base64-encodes the unsealed bytes.
+            let keyslot_secret = B64.encode(&*secret).into_bytes();
 
-        let pcr_list: Vec<i64> = pcrs
-            .split('+')
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(|p| {
-                p.parse()
-                    .map_err(|_| crate::error::Error(format!("bad PCR: {p}")))
+            let pcr_list: Vec<i64> = pcrs
+                .split('+')
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .map(|p| {
+                    p.parse()
+                        .map_err(|_| crate::error::Error(format!("bad PCR: {p}")))
+                })
+                .collect::<crate::error::Result<_>>()?;
+
+            let token = tpm2_token_json(&sealed, &pcr_list, !pin.is_empty());
+            Ok(Prepared {
+                keyslot_secret,
+                minimal_pbkdf: true,
+                stdout: String::new(),
+                token,
             })
-            .collect::<crate::error::Result<_>>()?;
-
-        let blob_b64 = B64.encode(&sealed.blob);
-        let token_json = serde_json::json!({
-            "type": "systemd-tpm2",
-            "keyslots": [keyslot.to_string()],
-            // Both spellings, exactly like the Python service.
-            "tpm2-blob": blob_b64,
-            "tpm2_blob": blob_b64,
-            "tpm2-pcrs": pcr_list,
-            "tpm2-pcr-bank": "sha256",
-            "tpm2-primary-alg": sealed.primary_alg,
-            "tpm2-policy-hash": hex_encode(&sealed.policy_hash),
-            "tpm2-pin": !pin.is_empty(),
-            "tpm2_pubkey_pcrs": [],
-            "tpm2_pcr_hash": "sha256",
-            "tpm2_pcrlock": false,
-            "tpm2_srk": B64.encode(&sealed.srk_blob),
-        });
-        luks::set_token(device, -1, Some(&token_json.to_string()))?;
-        Ok((true, String::new(), String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("EnrollTpm2", e))
+        })
+    })
 }
 
 pub fn op_enroll_recovery_key(
@@ -407,19 +457,18 @@ pub fn op_enroll_recovery_key(
     unlock_method: &str,
     unlock_pin: &str,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
-        let recovery_key = recovery::make_recovery_key();
-        let vk = luks::get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
-        let keyslot = luks::add_keyslot_by_volume_key(device, &vk, recovery_key.as_bytes(), false)?;
-        let token_json = serde_json::json!({
-            "type": "systemd-recovery",
-            "keyslots": [keyslot.to_string()],
-        });
-        luks::set_token(device, -1, Some(&token_json.to_string()))?;
-        // The GUI parses the recovery key from the stdout field.
-        Ok((true, recovery_key, String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("EnrollRecoveryKey", e))
+    run_op("EnrollRecoveryKey", || {
+        enroll_token(device, unlock_method, unlock_pin, passphrase, || {
+            let recovery_key = recovery::make_recovery_key();
+            Ok(Prepared {
+                keyslot_secret: recovery_key.as_bytes().to_vec(),
+                minimal_pbkdf: false,
+                // The GUI parses the recovery key from the stdout field.
+                stdout: recovery_key,
+                token: recovery_token_json(),
+            })
+        })
+    })
 }
 
 pub fn op_enroll_passphrase(
@@ -429,12 +478,11 @@ pub fn op_enroll_passphrase(
     unlock_method: &str,
     unlock_pin: &str,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
+    run_op("EnrollPassphrase", || {
         let vk = luks::get_volume_key(device, unlock_method, existing_passphrase, unlock_pin)?;
         luks::add_keyslot_by_volume_key(device, &vk, new_passphrase.as_bytes(), false)?;
         Ok((true, String::new(), String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("EnrollPassphrase", e))
+    })
 }
 
 pub fn op_wipe_slot(
@@ -444,7 +492,7 @@ pub fn op_wipe_slot(
     pin: &str,
     slot: i32,
 ) -> Triple {
-    let run = || -> crate::error::Result<Triple> {
+    run_op("WipeSlot", || {
         // Verify the caller can unlock the device at all.
         luks::get_volume_key(device, unlock_method, passphrase, pin)?;
 
@@ -465,8 +513,7 @@ pub fn op_wipe_slot(
         }
         luks::destroy_keyslot(device, slot)?;
         Ok((true, String::new(), String::new()))
-    };
-    run().unwrap_or_else(|e| op_failed("WipeSlot", e))
+    })
 }
 
 pub fn op_create_encrypted_image(
@@ -546,6 +593,52 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// FIDO2 token JSON (systemd-fido2), minus the `keyslots` field that
+/// `enroll_token` injects. Split out so the on-disk shape is unit-testable
+/// without a real authenticator.
+fn fido2_token_json(cred_id: &[u8], salt: &[u8], client_pin_required: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": TOKEN_TYPE_FIDO2,
+        "fido2-credential": B64.encode(cred_id),
+        "fido2-salt": B64.encode(salt),
+        "fido2-rp": fido2::FIDO2_RP_ID,
+        "fido2-clientPin-required": client_pin_required,
+        "fido2-up-required": true,
+        "fido2-uv-required": false,
+    })
+}
+
+/// TPM2 token JSON (systemd-tpm2), minus the `keyslots` field. Emits the sealed
+/// blob under both `tpm2-blob` and `tpm2_blob`, exactly like the Python service,
+/// so either spelling round-trips.
+fn tpm2_token_json(
+    sealed: &crate::tpm2::SealResult,
+    pcr_list: &[i64],
+    pin: bool,
+) -> serde_json::Value {
+    let blob_b64 = B64.encode(&sealed.blob);
+    serde_json::json!({
+        "type": TOKEN_TYPE_TPM2,
+        // Both spellings, exactly like the Python service.
+        "tpm2-blob": blob_b64,
+        "tpm2_blob": blob_b64,
+        "tpm2-pcrs": pcr_list,
+        "tpm2-pcr-bank": "sha256",
+        "tpm2-primary-alg": sealed.primary_alg,
+        "tpm2-policy-hash": hex_encode(&sealed.policy_hash),
+        "tpm2-pin": pin,
+        "tpm2_pubkey_pcrs": [],
+        "tpm2_pcr_hash": "sha256",
+        "tpm2_pcrlock": false,
+        "tpm2_srk": B64.encode(&sealed.srk_blob),
+    })
+}
+
+/// Recovery token JSON (systemd-recovery), minus the `keyslots` field.
+fn recovery_token_json() -> serde_json::Value {
+    serde_json::json!({ "type": TOKEN_TYPE_RECOVERY })
+}
+
 /// JSON for GetKeyslots: {"0": "luks2", ...} (string keys like Python's
 /// json.dumps of an int-keyed dict).
 pub fn keyslots_json(device: &str) -> String {
@@ -565,6 +658,9 @@ pub fn tokens_json(device: &str, token_type: &str) -> String {
 // D-Bus interface
 // ---------------------------------------------------------------------------
 
+// The name must match `constants::INTERFACE`; an attribute macro needs a string
+// literal, so it can't reference the const directly (the `dbus_e2e` test, which
+// connects via that const, exercises the match end-to-end).
 #[zbus::interface(name = "net.contemno.LuksEnroll1")]
 impl LuksEnrollService {
     #[zbus(name = "DetectDevices")]
@@ -584,10 +680,9 @@ impl LuksEnrollService {
         #[zbus(header)] hdr: Header<'_>,
         device: String,
     ) -> Result<String, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device])?;
         Ok(keyslots_json(&device))
     }
 
@@ -599,10 +694,9 @@ impl LuksEnrollService {
         device: String,
         token_type: String,
     ) -> Result<String, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[&token_type])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &token_type])?;
         Ok(tokens_json(&device, &token_type))
     }
 
@@ -613,10 +707,9 @@ impl LuksEnrollService {
         #[zbus(header)] hdr: Header<'_>,
         device: String,
     ) -> Result<Vec<i32>, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device])?;
         Ok(luks::password_keyslots(&device))
     }
 
@@ -628,10 +721,9 @@ impl LuksEnrollService {
         device: String,
         passphrase: String,
     ) -> Result<(bool, i32), SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &passphrase])?;
         blocking(
             move || match luks::verify_passphrase(&device, &passphrase) {
                 Ok(slot) => (true, slot),
@@ -650,13 +742,12 @@ impl LuksEnrollService {
         token_type: String,
         pin: String,
     ) -> Result<(bool, i32), SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&token_type, &pin])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &token_type, &pin])?;
         // Parity: an unsupported token type raised out of the Python
         // handler and surfaced as a generic D-Bus failure.
-        if token_type != "systemd-fido2" && token_type != "systemd-tpm2" {
+        if token_type != TOKEN_TYPE_FIDO2 && token_type != TOKEN_TYPE_TPM2 {
             eprintln!("Method UnlockWithToken failed: Unsupported token type");
             return Err(SvcError::Failed("Operation failed".into()));
         }
@@ -685,17 +776,21 @@ impl LuksEnrollService {
         unlock_method: String,
         unlock_pin: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[
+                    &passphrase,
+                    &pin,
+                    &fido2_device,
+                    &unlock_method,
+                    &unlock_pin,
+                ],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[
-            &device,
-            &passphrase,
-            &pin,
-            &fido2_device,
-            &unlock_method,
-            &unlock_pin,
-        ])?;
         blocking(move || {
             op_enroll_fido2(
                 &device,
@@ -722,17 +817,15 @@ impl LuksEnrollService {
         unlock_method: String,
         unlock_pin: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[&passphrase, &pin, &pcrs, &unlock_method, &unlock_pin],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[
-            &device,
-            &passphrase,
-            &pin,
-            &pcrs,
-            &unlock_method,
-            &unlock_pin,
-        ])?;
         blocking(move || {
             op_enroll_tpm2(
                 &device,
@@ -756,10 +849,15 @@ impl LuksEnrollService {
         unlock_method: String,
         unlock_pin: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[&passphrase, &unlock_method, &unlock_pin],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &passphrase, &unlock_method, &unlock_pin])?;
         blocking(move || op_enroll_recovery_key(&device, &passphrase, &unlock_method, &unlock_pin))
             .await
     }
@@ -776,10 +874,15 @@ impl LuksEnrollService {
         pin: String,
         slot: i32,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[&passphrase, &unlock_method, &pin],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &passphrase, &unlock_method, &pin])?;
         blocking(move || op_wipe_slot(&device, &passphrase, &unlock_method, &pin, slot)).await
     }
 
@@ -832,10 +935,9 @@ impl LuksEnrollService {
         #[zbus(header)] hdr: Header<'_>,
         device: String,
     ) -> Result<String, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device])?;
         Ok(devices::get_device_info(&device).to_string())
     }
 
@@ -847,10 +949,9 @@ impl LuksEnrollService {
         device: String,
         passphrase: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device, &passphrase])?;
         blocking(move || op_format_partition(&device, &passphrase)).await
     }
 
@@ -866,16 +967,20 @@ impl LuksEnrollService {
         unlock_method: String,
         unlock_pin: String,
     ) -> Result<Triple, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Manage, Some(&device), false)
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[
+                    &existing_passphrase,
+                    &new_passphrase,
+                    &unlock_method,
+                    &unlock_pin,
+                ],
+            )
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[
-            &device,
-            &existing_passphrase,
-            &new_passphrase,
-            &unlock_method,
-            &unlock_pin,
-        ])?;
         blocking(move || {
             op_enroll_passphrase(
                 &device,
@@ -921,10 +1026,9 @@ impl LuksEnrollService {
         device: String,
         fido2_dev_paths: Vec<String>,
     ) -> Result<Vec<String>, SvcError> {
-        self.gate(conn, &hdr, AuthKind::Read, Some(&device), false)
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
             .await?;
-        let device = Self::validate_device(&device)?;
-        Self::check_lens(&[&device])?;
         blocking(move || op_check_fido2_enrolled(&device, &fido2_dev_paths)).await
     }
 
@@ -1032,7 +1136,7 @@ impl LuksEnrollService {
     ) -> Result<(bool, i32), SvcError> {
         Self::check_fd(&fd, false, false)?;
         Self::check_lens(&[&token_type, &pin])?;
-        if token_type != "systemd-fido2" && token_type != "systemd-tpm2" {
+        if token_type != TOKEN_TYPE_FIDO2 && token_type != TOKEN_TYPE_TPM2 {
             eprintln!("Method UnlockWithTokenFd failed: Unsupported token type");
             return Err(SvcError::Failed("Operation failed".into()));
         }
@@ -1190,5 +1294,119 @@ impl LuksEnrollService {
             op_create_image_fd(&fd_path(&fd), &passphrase)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fido2_token_json_has_expected_shape() {
+        let cred_id = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let salt = [0x01u8, 0x02, 0x03];
+
+        let tok = fido2_token_json(&cred_id, &salt, true);
+        assert_eq!(
+            tok,
+            serde_json::json!({
+                "type": TOKEN_TYPE_FIDO2,
+                "fido2-credential": B64.encode(cred_id),
+                "fido2-salt": B64.encode(salt),
+                "fido2-rp": fido2::FIDO2_RP_ID,
+                "fido2-clientPin-required": true,
+                "fido2-up-required": true,
+                "fido2-uv-required": false,
+            })
+        );
+        // The shared spine injects keyslots; the builder must not.
+        assert!(tok.get("keyslots").is_none());
+
+        // The clientPin flag tracks the argument.
+        let tok = fido2_token_json(&cred_id, &salt, false);
+        assert_eq!(tok["fido2-clientPin-required"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn tpm2_token_json_emits_both_blob_spellings() {
+        let sealed = crate::tpm2::SealResult {
+            blob: vec![0xAA, 0xBB, 0xCC],
+            policy_hash: vec![0x12, 0x34],
+            primary_alg: "ecc",
+            srk_blob: vec![0xFE, 0xED],
+        };
+
+        let tok = tpm2_token_json(&sealed, &[7, 11], true);
+        let blob_b64 = B64.encode(&sealed.blob);
+        assert_eq!(
+            tok,
+            serde_json::json!({
+                "type": TOKEN_TYPE_TPM2,
+                "tpm2-blob": blob_b64,
+                "tpm2_blob": blob_b64,
+                "tpm2-pcrs": [7, 11],
+                "tpm2-pcr-bank": "sha256",
+                "tpm2-primary-alg": "ecc",
+                "tpm2-policy-hash": hex_encode(&sealed.policy_hash),
+                "tpm2-pin": true,
+                "tpm2_pubkey_pcrs": [],
+                "tpm2_pcr_hash": "sha256",
+                "tpm2_pcrlock": false,
+                "tpm2_srk": B64.encode(&sealed.srk_blob),
+            })
+        );
+        // Parity-critical: both spellings present and equal.
+        assert_eq!(tok["tpm2-blob"], tok["tpm2_blob"]);
+        assert!(tok["tpm2-blob"].is_string());
+        assert!(tok.get("keyslots").is_none());
+    }
+
+    #[test]
+    fn recovery_token_json_is_type_only() {
+        let tok = recovery_token_json();
+        assert_eq!(tok, serde_json::json!({ "type": TOKEN_TYPE_RECOVERY }));
+        // Only `type`; the spine injects keyslots.
+        assert!(tok.get("keyslots").is_none());
+        assert_eq!(tok.as_object().unwrap().len(), 1);
+    }
+
+    // gate_device itself needs a live D-Bus connection (the polkit gate), so its
+    // two bus-free steps -- validate_device and check_lens -- are pinned here
+    // directly; the e2e composition (gate -> validate -> check_lens) is covered
+    // in tests/dbus_e2e.rs.
+    #[test]
+    fn validate_device_accepts_file_rejects_missing_and_dir() {
+        let f = tempfile::NamedTempFile::new().expect("temp file");
+        let path = f.path().to_string_lossy().into_owned();
+        // A regular file validates; the returned path is canonicalized.
+        let real = LuksEnrollService::validate_device(&path).expect("file should validate");
+        assert_eq!(
+            real,
+            std::fs::canonicalize(&path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+
+        // A directory is neither a block device nor a regular file.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let derr = LuksEnrollService::validate_device(&dir.path().to_string_lossy())
+            .expect_err("a directory must be rejected");
+        assert!(matches!(derr, SvcError::InvalidArgs(_)));
+
+        // A path that does not exist is rejected.
+        let merr = LuksEnrollService::validate_device("/nonexistent/nope")
+            .expect_err("a missing path must be rejected");
+        assert!(matches!(merr, SvcError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn check_lens_enforces_max_len() {
+        let at_limit = "x".repeat(MAX_STRING_LEN);
+        LuksEnrollService::check_lens(&[&at_limit]).expect("exactly MAX_STRING_LEN is allowed");
+
+        let over = "x".repeat(MAX_STRING_LEN + 1);
+        let err = LuksEnrollService::check_lens(&[&over]).expect_err("over the limit must fail");
+        assert!(matches!(err, SvcError::InvalidArgs(_)));
     }
 }

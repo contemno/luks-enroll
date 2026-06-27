@@ -3,6 +3,7 @@
 //! Exposed as a library so integration tests can exercise the operation
 //! layer directly (against LUKS2 image files) without D-Bus.
 
+pub mod constants;
 pub mod devices;
 pub mod error;
 pub mod fido2;
