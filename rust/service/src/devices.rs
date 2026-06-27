@@ -117,10 +117,16 @@ pub fn get_device_info(device: &str) -> Value {
         _ => {
             let parent = parent_device_name(device);
             let base = basename(device);
-            let sectors = read_sysfs(&format!("/sys/block/{parent}/{base}/size"))
-                .or_else(|| read_sysfs(&format!("/sys/block/{base}/size")));
-            if let Some(n) = sectors.and_then(|s| s.parse::<u64>().ok()) {
-                size = format_size(n * 512);
+            // Prefer the parent-qualified sysfs `size` (a partition under its
+            // disk), falling back to the bare basename (a whole disk).
+            // sysfs_size_bytes does the read -> parse -> *512, returning 0 for
+            // a missing/unparseable file.
+            let bytes = match sysfs_size_bytes(&format!("/sys/block/{parent}/{base}/size")) {
+                0 => sysfs_size_bytes(&format!("/sys/block/{base}/size")),
+                n => n,
+            };
+            if bytes > 0 {
+                size = format_size(bytes);
             }
         }
     }
@@ -260,8 +266,10 @@ fn crypttab_devices(crypttab: &Path, by_uuid_dir: &Path) -> Vec<String> {
 }
 
 /// Like Python's os.path.realpath: canonicalize, falling back to the
-/// input path when resolution fails.
-fn canonicalize_lossy(path: &Path) -> String {
+/// input path when resolution fails. Accepts `&Path` or `&str` so the
+/// device-path callers in `luks` share this one implementation.
+pub(crate) fn canonicalize_lossy(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
     fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
@@ -303,8 +311,13 @@ fn is_virtual_block_name(name: &str) -> bool {
     name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram")
 }
 
-/// Hand-rolled `^(nvme[0-9]+n[0-9]+)p[0-9]+$` -> group 1.
-fn nvme_partition_parent(name: &str) -> Option<&str> {
+/// Parse an `nvme<ctrl>n<ns>` device name (the whole-disk shape). Returns the
+/// byte offset just past the namespace -- the end of the whole-disk name --
+/// and the remaining suffix after it, or None when the name isn't a
+/// well-formed nvme namespace. `nvme0n1` -> Some((7, "")); `nvme0n1p2` ->
+/// Some((7, "p2")). Shared by `nvme_partition_parent` here and
+/// `format::is_nvme_whole_disk`.
+pub(crate) fn parse_nvme(name: &str) -> Option<(usize, &str)> {
     let rest = name.strip_prefix("nvme")?;
     let b = rest.as_bytes();
     let mut i = 0;
@@ -320,19 +333,23 @@ fn nvme_partition_parent(name: &str) -> Option<&str> {
     while i < b.len() && b[i].is_ascii_digit() {
         i += 1;
     }
-    if i == ns_start || i >= b.len() || b[i] != b'p' {
+    if i == ns_start {
         return None;
     }
-    let parent_end = "nvme".len() + i;
-    i += 1;
-    let part_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
+    let end = "nvme".len() + i;
+    Some((end, &name[end..]))
+}
+
+/// Hand-rolled `^(nvme[0-9]+n[0-9]+)p[0-9]+$` -> group 1.
+fn nvme_partition_parent(name: &str) -> Option<&str> {
+    let (parent_end, suffix) = parse_nvme(name)?;
+    // The suffix must be exactly `p` followed by one or more digits.
+    let digits = suffix.strip_prefix('p')?;
+    if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
+        Some(&name[..parent_end])
+    } else {
+        None
     }
-    if i == part_start || i != b.len() {
-        return None;
-    }
-    Some(&name[..parent_end])
 }
 
 /// Hand-rolled `^([a-z]+)[0-9]+$` -> the letters. Lowercase ASCII only,
@@ -375,6 +392,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_nvme_shared() {
+        // Whole disk: namespace runs to the end, empty suffix.
+        assert_eq!(parse_nvme("nvme0n1"), Some((7, "")));
+        assert_eq!(parse_nvme("nvme12n34"), Some((9, "")));
+        // Partition: suffix is the trailing `p<part>`.
+        assert_eq!(parse_nvme("nvme0n1p2"), Some((7, "p2")));
+        // Not a well-formed namespace.
+        assert_eq!(parse_nvme("nvme0"), None); // no `n<ns>`
+        assert_eq!(parse_nvme("nvme0n"), None); // empty namespace
+        assert_eq!(parse_nvme("sda"), None); // not nvme
+    }
+
+    #[test]
+    fn sysfs_size_bytes_reads_sectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("size");
+        fs::write(&ok, "2048\n").unwrap();
+        // sectors * 512.
+        assert_eq!(sysfs_size_bytes(ok.to_str().unwrap()), 2048 * 512);
+        // Missing or non-numeric -> 0 (the fallback signal in get_device_info).
+        assert_eq!(
+            sysfs_size_bytes(dir.path().join("absent").to_str().unwrap()),
+            0
+        );
+        let bad = dir.path().join("bad");
+        fs::write(&bad, "not-a-number").unwrap();
+        assert_eq!(sysfs_size_bytes(bad.to_str().unwrap()), 0);
+    }
+
+    #[test]
     fn parent_device_name_cases() {
         assert_eq!(parent_device_name("sda1"), "sda");
         assert_eq!(parent_device_name("sdb"), "sdb");
@@ -388,6 +435,26 @@ mod tests {
         // Full paths reduce to their basename first.
         assert_eq!(parent_device_name("/dev/sda1"), "sda");
         assert_eq!(parent_device_name("/dev/nvme0n1p2"), "nvme0n1");
+    }
+
+    #[test]
+    fn canonicalize_lossy_str_and_path() {
+        // A nonexistent path resolves to nothing, so the input is returned
+        // verbatim -- and the &str overload (the luks cache call site) yields
+        // the same string as the original input.
+        assert_eq!(
+            canonicalize_lossy("/nonexistent/luks-enroll-canon-test"),
+            "/nonexistent/luks-enroll-canon-test"
+        );
+
+        // A real path resolves the same whether passed as &str or &Path.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let want = fs::canonicalize(f.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(canonicalize_lossy(f.path()), want);
+        assert_eq!(canonicalize_lossy(f.path().to_str().unwrap()), want);
     }
 
     #[test]
