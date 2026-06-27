@@ -19,7 +19,7 @@ use gpt::disk::LogicalBlockSize;
 use gpt::mbr::ProtectiveMBR;
 use gpt::{partition_types, GptConfig};
 
-use crate::error::{Error, Result};
+use crate::error::{cstring, Error, Result};
 use crate::{bail, devices, luks};
 
 /// Linux LUKS partition type GUID (sgdisk shortcode 8309).
@@ -35,7 +35,7 @@ pub const LUKS_PARTITION_TYPE_GUID: &str = "CA7D7CCB-63ED-4C53-861C-1742536059CC
 /// so partition-table magics reported by the partitions chain (PTMAGIC*)
 /// are probed but not wiped.
 pub fn wipefs(device: &str) -> Result<()> {
-    let dev_c = CString::new(device).map_err(|_| Error::from("device path contains a NUL byte"))?;
+    let dev_c = cstring(device, "device path")?;
     let raw = unsafe { libblkid_rs_sys::blkid_new_probe_from_filename(dev_c.as_ptr()) };
     if raw.is_null() {
         bail!("blkid_new_probe_from_filename failed for {device}");
