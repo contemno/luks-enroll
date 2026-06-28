@@ -586,6 +586,19 @@ fn format_container(path: &str, passphrase: &str) -> crate::error::Result<i32> {
     }
 }
 
+/// True when `fd` points at an empty (zero-length) file. The create-via-fd
+/// handler checks this before it sizes the file, where the length is still the
+/// one the client handed over: the client opens the new container
+/// `O_CREAT|O_EXCL` and never sizes it (the service does), so a legitimate fd
+/// is empty. A non-empty fd means content already exists, so the create is
+/// refused rather than clobbering it. Unlike `O_EXCL`, the length is directly
+/// observable, so this is a verified guarantee, not an assumption (issue #58).
+pub fn create_fd_is_empty<Fd: std::os::fd::AsFd>(fd: Fd) -> bool {
+    nix::sys::stat::fstat(&fd)
+        .map(|st| st.st_size == 0)
+        .unwrap_or(false)
+}
+
 pub fn op_format_partition(device: &str, passphrase: &str) -> Triple {
     match format::format_removable_partition(device, passphrase) {
         Ok(partition) => (true, partition, String::new()),
@@ -1309,18 +1322,15 @@ impl LuksEnrollService {
         if !(1..=8192).contains(&size_mb) {
             return Ok((false, -1, "size_mb must be between 1 and 8192".to_string()));
         }
-        // Never reformat an existing container in place: if the fd already
-        // holds a LUKS2 header, refuse rather than clobber it. The client
-        // opens new containers O_CREAT|O_EXCL, so a legitimate create targets a
-        // fresh, non-LUKS file; this enforces the rule service-side too, not
-        // only via the client's O_EXCL (issue #58). Checked before the
-        // ftruncate below, which would otherwise truncate the header first.
-        if luks::is_luks2_header(&fd_path(&fd)) {
-            return Ok((
-                false,
-                -1,
-                "A LUKS2 container already exists at this path".to_string(),
-            ));
+        // Never reformat in place: require the fd to point at an empty file.
+        // Checked before the ftruncate below, so the length is still the one
+        // the client handed over -- the client creates the container
+        // O_CREAT|O_EXCL and lets the service size it, so a legitimate fd is
+        // zero-length; a non-empty fd means content already exists and we'd be
+        // clobbering it. The length is observable (unlike O_EXCL), so this is
+        // enforced service-side, not assumed of the client (issue #58).
+        if !create_fd_is_empty(&fd) {
+            return Ok((false, -1, "A file already exists at this path".to_string()));
         }
         self.touch_idle();
         blocking(move || {

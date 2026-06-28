@@ -89,30 +89,6 @@ fn keyless_volume_has_no_recovery_path_once_cache_is_gone() {
 }
 
 #[test]
-fn is_luks2_header_distinguishes_container_from_plain_file() {
-    // Backs the fd-path create guard (issue #58): CreateEncryptedImageFd
-    // refuses to reformat an fd that already holds a LUKS2 header. A fresh,
-    // non-LUKS file (what the client passes after O_CREAT|O_EXCL) is allowed.
-    let dir = tmpdir();
-
-    let plain = dir.path().join("plain.img").to_string_lossy().into_owned();
-    std::fs::File::create(&plain)
-        .unwrap()
-        .set_len(4 * 1024 * 1024)
-        .unwrap();
-    assert!(
-        !luks::is_luks2_header(&plain),
-        "a zeroed file is not a LUKS2 container"
-    );
-
-    let img = new_luks_image(&dir);
-    assert!(
-        luks::is_luks2_header(&img),
-        "a formatted container must be detected so create can refuse it"
-    );
-}
-
-#[test]
 fn create_refuses_existing_file_instead_of_clobbering() {
     // Issue #58: never reformat in place. A second create at the same path is
     // refused rather than truncating whatever (possibly a LUKS container) is
