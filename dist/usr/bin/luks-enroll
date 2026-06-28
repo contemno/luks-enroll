@@ -20,6 +20,36 @@ from gi.repository import Adw, Gio, GLib, GUdev, Gtk  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
+# Application version
+# ---------------------------------------------------------------------------
+
+# Substituted with the package version by debian/rules at build time. A real
+# version never starts with "@", so the placeholder is detectable at runtime.
+__version__ = "@VERSION@"
+
+
+def _resolve_version():
+    """The version string to display.
+
+    Installed builds carry the substituted ``__version__``. Running from a
+    source checkout, fall back to the repo's ``VERSION`` floor, then ``dev``.
+    """
+    if not __version__.startswith("@"):
+        return __version__
+    try:
+        # dist/usr/bin/luks-enroll -> repo root is three levels up.
+        root = os.path.dirname(os.path.abspath(__file__))
+        version_file = os.path.join(root, "..", "..", "..", "VERSION")
+        with open(version_file) as f:
+            return f.read().strip() or "dev"
+    except OSError:
+        return "dev"
+
+
+APP_VERSION = _resolve_version()
+
+
+# ---------------------------------------------------------------------------
 # Token types + background-work helper
 # ---------------------------------------------------------------------------
 
@@ -578,6 +608,14 @@ class DeviceListPage(Adw.NavigationPage):
         # Content stack: either the preferences page or the empty status page
         self.content_stack = Gtk.Stack()
         toolbar_view.set_content(self.content_stack)
+
+        # Version footer, so the running build is identifiable at a glance.
+        self.version_label = Gtk.Label(label=f"luks-enroll {APP_VERSION}")
+        self.version_label.add_css_class("dim-label")
+        self.version_label.add_css_class("caption")
+        self.version_label.set_margin_top(4)
+        self.version_label.set_margin_bottom(4)
+        toolbar_view.add_bottom_bar(self.version_label)
 
         # Preferences page with device groups
         self.prefs_page = Adw.PreferencesPage()

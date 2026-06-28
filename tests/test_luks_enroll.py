@@ -11,6 +11,7 @@ Run: python3 -m pytest test_luks_enroll.py -v
 
 import ast
 import glob  # noqa: F401  pre-import so sys.modules patching doesn't evict it
+import os
 import unittest
 from unittest import mock
 
@@ -155,6 +156,33 @@ class TestTokenTypeConstants(unittest.TestCase):
         self.assertEqual(gui.TOKEN_FIDO2, "systemd-fido2")
         self.assertEqual(gui.TOKEN_TPM2, "systemd-tpm2")
         self.assertEqual(gui.TOKEN_RECOVERY, "systemd-recovery")
+
+
+class TestAppVersion(unittest.TestCase):
+    """The footer version resolves to the build-time-substituted __version__,
+    else the repo VERSION floor, else 'dev' — never the raw placeholder."""
+
+    def test_source_checkout_falls_back_to_version_file(self):
+        # Imported from the repo the @VERSION@ placeholder is unsubstituted, so
+        # APP_VERSION mirrors the VERSION floor and never leaks the placeholder.
+        version_file = os.path.join(
+            os.path.dirname(GUI_PATH), "..", "..", "..", "VERSION"
+        )
+        with open(version_file) as f:
+            expected = f.read().strip()
+        self.assertEqual(gui.APP_VERSION, expected)
+        self.assertFalse(gui.APP_VERSION.startswith("@"))
+
+    def test_substituted_version_is_used_verbatim(self):
+        with mock.patch.object(gui, "__version__", "0.3.0-dev.20260627.deadbee"):
+            self.assertEqual(gui._resolve_version(), "0.3.0-dev.20260627.deadbee")
+
+    def test_unreadable_version_file_falls_back_to_dev(self):
+        with (
+            mock.patch.object(gui, "__version__", "@VERSION@"),
+            mock.patch("builtins.open", side_effect=OSError),
+        ):
+            self.assertEqual(gui._resolve_version(), "dev")
 
 
 class TestRunAsync(unittest.TestCase):
