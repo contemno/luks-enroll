@@ -1,11 +1,23 @@
 #!/usr/bin/make -f
 
+# Provides DEB_VERSION_UPSTREAM (the package version without the Debian
+# revision), stamped into the client below.
+include /usr/share/dpkg/pkg-info.mk
+
 # Keep cargo's registry/cache inside the build tree so the build works under
 # restricted-$HOME builders and is removed by `clean`.
 export CARGO_HOME = $(CURDIR)/debian/.cargo
 
 %:
 	dh $@
+
+# Stamp the real version into the installed client. The source ships a
+# "@VERSION@" placeholder; replace the whole assignment line so nothing else
+# in the script is touched.
+override_dh_install:
+	dh_install
+	sed -i 's|^__version__ = .*|__version__ = "$(DEB_VERSION_UPSTREAM)"|' \
+		debian/luks-enroll/usr/bin/luks-enroll
 
 # Build the privileged service from the Rust workspace. The compiled binary
 # (rust/target/release/luks-enroll-service) is shipped to /usr/sbin via

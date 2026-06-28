@@ -92,7 +92,7 @@ scripts/                           Developer tooling (git hooks, changelog + nex
 .github/actions/                   Reusable composite actions (install-c-deps, python-setup)
 ```
 
-[`debian/rules`](debian/rules) compiles the Rust service (`cargo build --release --locked`) and `dh_install` copies `dist/*` plus the built binary into place per [`debian/luks-enroll.install`](debian/luks-enroll.install). The service tests live in the Rust workspace ([`rust/service/tests/`](rust/service/tests/)); the Python suite under [`tests/`](tests/) covers the GUI client.
+[`debian/rules`](debian/rules) compiles the Rust service (`cargo build --release --locked`) and `dh_install` copies `dist/*` plus the built binary into place per [`debian/luks-enroll.install`](debian/luks-enroll.install), then stamps the package version into the installed client (the client ships a `@VERSION@` placeholder it shows in its window footer; a source checkout falls back to the [`VERSION`](VERSION) floor). The service tests live in the Rust workspace ([`rust/service/tests/`](rust/service/tests/)); the Python suite under [`tests/`](tests/) covers the GUI client.
 
 ## Dependencies
 
