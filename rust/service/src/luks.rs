@@ -148,6 +148,12 @@ pub fn metadata_json(device: &str) -> Option<serde_json::Value> {
     dev.status_handle().dump_json().ok()
 }
 
+/// True when `device` already holds a loadable LUKS2 header. Used to refuse
+/// reformatting an existing container in place (issue #58).
+pub fn is_luks2_header(device: &str) -> bool {
+    open_luks2(device).is_ok()
+}
+
 // ---------------------------------------------------------------------------
 // Read-only metadata queries
 // ---------------------------------------------------------------------------

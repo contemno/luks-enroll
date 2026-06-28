@@ -1309,6 +1309,19 @@ impl LuksEnrollService {
         if !(1..=8192).contains(&size_mb) {
             return Ok((false, -1, "size_mb must be between 1 and 8192".to_string()));
         }
+        // Never reformat an existing container in place: if the fd already
+        // holds a LUKS2 header, refuse rather than clobber it. The client
+        // opens new containers O_CREAT|O_EXCL, so a legitimate create targets a
+        // fresh, non-LUKS file; this enforces the rule service-side too, not
+        // only via the client's O_EXCL (issue #58). Checked before the
+        // ftruncate below, which would otherwise truncate the header first.
+        if luks::is_luks2_header(&fd_path(&fd)) {
+            return Ok((
+                false,
+                -1,
+                "A LUKS2 container already exists at this path".to_string(),
+            ));
+        }
         self.touch_idle();
         blocking(move || {
             if let Err(e) = nix::unistd::ftruncate(&fd, size_mb as libc::off_t * 1024 * 1024) {
