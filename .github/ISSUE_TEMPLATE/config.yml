@@ -1,0 +1,21 @@
+# Structured forms are the recommended starting points, but blank issues stay
+# enabled so maintainers can open planning / roadmap / epic / spike issues that
+# don't fit a triage form.
+blank_issues_enabled: true
+contact_links:
+  # TODO: set these URLs for your project. The security link is NOT optional.
+  - name: 🔒 Security vulnerability (do NOT open a public issue)
+    url: https://github.com/OWNER/REPO/security/advisories/new
+    about: >-
+      Report anything that could be exploited privately via a GitHub security
+      advisory — never as a public issue.
+  - name: 💬 Question / usage help
+    url: https://github.com/OWNER/REPO/discussions
+    about: >-
+      Not sure if it's a bug? Ask in Discussions. Setup and usage questions are a
+      better fit there than the issue tracker.
+  - name: 🗺️ Roadmap & milestones
+    url: https://github.com/OWNER/REPO/milestones
+    about: >-
+      Planned and in-progress work is tracked in milestones. Check there before
+      proposing long-horizon work.
