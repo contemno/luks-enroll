@@ -70,6 +70,13 @@
       <arg direction="out" type="s" name="stdout"/>
       <arg direction="out" type="s" name="stderr"/>
     </method>
+    <!--
+      An empty passphrase means "no passphrase keyslot": the new container is
+      formatted with a freshly generated volume key that the service caches,
+      and the first enrollment wraps it (returning keyslot -1 here). A
+      non-empty passphrase keeps the classic behavior of seeding a password
+      keyslot. An existing path is refused rather than reformatted in place.
+    -->
     <method name="CreateEncryptedImage">
       <arg direction="in" type="s" name="path"/>
       <arg direction="in" type="i" name="size_mb"/>
@@ -219,6 +226,9 @@
       <arg direction="in" type="as" name="fido2_dev_paths"/>
       <arg direction="out" type="as" name="enrolled_hidraw_paths"/>
     </method>
+    <!-- Empty passphrase => keyslot-less format with a cached volume key, as
+         for CreateEncryptedImage above (keyslot -1). The client owns the fd
+         and opens it O_CREAT|O_EXCL, so an existing file is never clobbered. -->
     <method name="CreateEncryptedImageFd">
       <arg direction="in" type="h" name="fd"/>
       <arg direction="in" type="i" name="size_mb"/>
