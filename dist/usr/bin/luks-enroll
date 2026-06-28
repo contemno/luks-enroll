@@ -1353,6 +1353,25 @@ class DeviceDetailPage(Adw.NavigationPage):
         self._info_group.set_visible(False)
         self._prefs_page.add(self._info_group)
 
+        # Shortcut to the system Disks utility so the user can mount/browse
+        # the volume after unlocking. Only shown when gnome-disks is installed
+        # (this app authenticates to manage keyslots; it does not itself
+        # activate or mount the filesystem).
+        if GLib.find_program_in_path("gnome-disks"):
+            open_row = Adw.ActionRow(
+                title="Open in Disks",
+                subtitle="Mount or browse this volume in the Disks utility",
+            )
+            open_row.add_prefix(
+                Gtk.Image.new_from_icon_name("drive-harddisk-symbolic")
+            )
+            open_btn = Gtk.Button(label="Open Disks")
+            open_btn.set_valign(Gtk.Align.CENTER)
+            open_btn.connect("clicked", lambda _: self._open_in_disks())
+            open_row.add_suffix(open_btn)
+            open_row.set_activatable_widget(open_btn)
+            self._info_group.add(open_row)
+
         # --- Enrollments group (hidden until unlocked) ---
         self._enrollments_group = Adw.PreferencesGroup(title="Current Enrollments")
         self._enrollments_group.set_visible(False)
@@ -1575,6 +1594,22 @@ class DeviceDetailPage(Adw.NavigationPage):
             self._unlock_error.set_text(
                 f"{token_name} unlock failed. Check PIN or try another method."
             )
+
+    def _open_in_disks(self):
+        """Launch the GNOME Disks utility focused on this device.
+
+        Falls back to launching Disks without a target device if the
+        --block-device invocation fails (e.g. older gnome-disks).
+        """
+        for argv in (
+            ["gnome-disks", "--block-device", self.device],
+            ["gnome-disks"],
+        ):
+            try:
+                Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
+                return
+            except GLib.Error:
+                continue
 
     def _show_unlocked(self):
         """Hide unlock groups and fetch device details in background."""
@@ -2198,6 +2233,8 @@ def _tpm2_setup_inputs(page, group):
     page._pin_entry.set_show_peek_icon(True)
     page._pin_entry.set_valign(Gtk.Align.CENTER)
     page._pin_entry.set_hexpand(True)
+    # Enter in the PIN field advances to the confirm field.
+    page._pin_entry.connect("activate", lambda _: page._pin_confirm.grab_focus())
     page._pin_row.add_suffix(page._pin_entry)
     page._pin_group.add(page._pin_row)
 
@@ -2290,6 +2327,8 @@ def _passphrase_setup_inputs(page, group):
     page._pw_entry.set_show_peek_icon(True)
     page._pw_entry.set_valign(Gtk.Align.CENTER)
     page._pw_entry.set_hexpand(True)
+    # Enter in the passphrase field advances to the confirm field.
+    page._pw_entry.connect("activate", lambda _: page._pw_confirm.grab_focus())
     page._pw_row.add_suffix(page._pw_entry)
     group.add(page._pw_row)
 
