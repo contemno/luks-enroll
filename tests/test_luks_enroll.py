@@ -202,5 +202,39 @@ class TestRunAsync(unittest.TestCase):
         self.assertEqual(captured, [(cb, False, "", "D-Bus error: nope")])
 
 
+class TestCreateImageSizeBound(unittest.TestCase):
+    """The create-image size selector must not offer a size the service rejects.
+
+    Regression for #59: the spin button allowed up to 65536 MB while the
+    service caps image size at 1..=8192 MB (rust/service/src/{service.rs,
+    format.rs}), so any size above 8192 came back as
+    "Failed: size_mb must be between 1 and 8192".
+    """
+
+    def test_max_image_size_matches_service_bound(self):
+        # Must equal the service's upper bound (rust `1..=8192`); see the
+        # `size_mb must be between 1 and 8192` checks in the Rust service.
+        self.assertEqual(gui.MAX_IMAGE_SIZE_MB, 8192)
+
+    def test_size_spin_upper_bound_uses_capped_constant(self):
+        # GTK base classes are mocked, so the page can't be instantiated;
+        # assert against the source AST instead (matching TestSyntax).
+        with open(GUI_PATH) as f:
+            tree = ast.parse(f.read(), filename=GUI_PATH)
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "new_with_range"
+        ]
+        self.assertEqual(len(calls), 1, "expected exactly one size SpinButton")
+        max_arg = calls[0].args[1]
+        # The max must be the MAX_IMAGE_SIZE_MB constant, not a literal that
+        # could drift above the service's 8192 cap (the #59 regression).
+        self.assertIsInstance(max_arg, ast.Name)
+        self.assertEqual(max_arg.id, "MAX_IMAGE_SIZE_MB")
+
+
 if __name__ == "__main__":
     unittest.main()

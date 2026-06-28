@@ -29,6 +29,12 @@ TOKEN_FIDO2 = "systemd-fido2"
 TOKEN_TPM2 = "systemd-tpm2"
 TOKEN_RECOVERY = "systemd-recovery"
 
+# Largest image size (MiB) the service will accept. The service rejects
+# anything outside 1..=8192 (rust/service/src/{service.rs,format.rs}), so the
+# create-image size selector must not let the user pick a size that the service
+# will then refuse. Keep in lockstep with the service's bound.
+MAX_IMAGE_SIZE_MB = 8192
+
 
 def run_async(svc_call, on_done):
     """Run svc_call() on a daemon thread and hand its (ok, stdout, stderr)
@@ -1103,7 +1109,7 @@ class CreateImagePage(Adw.NavigationPage):
         prefs.add(size_group)
 
         size_row = Adw.ActionRow(title="Image size (MB)")
-        self._size_spin = Gtk.SpinButton.new_with_range(16, 65536, 64)
+        self._size_spin = Gtk.SpinButton.new_with_range(16, MAX_IMAGE_SIZE_MB, 64)
         self._size_spin.set_value(256)
         self._size_spin.set_valign(Gtk.Align.CENTER)
         size_row.add_suffix(self._size_spin)
