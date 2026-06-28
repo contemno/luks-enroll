@@ -1147,15 +1147,19 @@ class CreateImagePage(Adw.NavigationPage):
         size_row.add_suffix(self._size_spin)
         size_group.add(size_row)
 
-        # Passphrase group
-        pw_group = Adw.PreferencesGroup(title="Passphrase")
-        prefs.add(pw_group)
-
-        self._pw_row = Adw.PasswordEntryRow(title="Passphrase")
-        pw_group.add(self._pw_row)
-
-        self._pw_confirm_row = Adw.PasswordEntryRow(title="Confirm passphrase")
-        pw_group.add(self._pw_confirm_row)
+        # No passphrase here: the new container is formatted with a cached
+        # volume key and you enroll a real method (FIDO2/TPM2/recovery, or a
+        # passphrase if you want one) on the detail page that opens next. This
+        # avoids a throwaway passphrase whose only job was to wrap a volume key
+        # we already know (issue #58).
+        info_group = Adw.PreferencesGroup()
+        prefs.add(info_group)
+        info_group.add(
+            Adw.ActionRow(
+                title="No passphrase needed",
+                subtitle="Pick how to unlock it on the next screen.",
+            )
+        )
 
         # Status + action
         action_group = Adw.PreferencesGroup()
@@ -1208,19 +1212,9 @@ class CreateImagePage(Adw.NavigationPage):
     def _on_create(self, _btn):
         path = self._path_row.get_text().strip()
         size_mb = int(self._size_spin.get_value())
-        pw = self._pw_row.get_text()
-        confirm = self._pw_confirm_row.get_text()
 
         if not path:
             self._status_label.set_text("File path cannot be empty.")
-            self._status_label.add_css_class("error")
-            return
-        if not pw:
-            self._status_label.set_text("Passphrase cannot be empty.")
-            self._status_label.add_css_class("error")
-            return
-        if pw != confirm:
-            self._status_label.set_text("Passphrases do not match.")
             self._status_label.add_css_class("error")
             return
 
@@ -1230,9 +1224,10 @@ class CreateImagePage(Adw.NavigationPage):
         self._spinner.start()
         self._create_btn.set_sensitive(False)
         self._pending_path = path
-        self._pending_pw = pw
 
-        self.svc.create_encrypted_image_async(path, size_mb, pw, self._on_create_finish)
+        # Empty passphrase: the service formats a keyslot-less container and
+        # caches its volume key for the first enrollment (issue #58).
+        self.svc.create_encrypted_image_async(path, size_mb, "", self._on_create_finish)
 
     def _on_create_finish(self, proxy, result):
         """Async callback — runs on main thread after D-Bus call completes."""
@@ -1250,10 +1245,11 @@ class CreateImagePage(Adw.NavigationPage):
             self._status_label.remove_css_class("error")
             self._status_label.add_css_class("success")
             self.list_page.add_image_file(path)
-            # Replace this page with the device detail page, pre-unlocked
+            # Replace this page with the device detail page, pre-unlocked via
+            # the cached volume key (no passphrase was set on create).
             nav = self.get_ancestor(Adw.NavigationView)
             if nav:
-                detail = DeviceDetailPage(self.svc, path, passphrase=self._pending_pw)
+                detail = DeviceDetailPage(self.svc, path, volume_key_cached=True)
                 nav.push(detail)
         else:
             self._status_label.set_text(f"Failed: {error}")
@@ -1264,7 +1260,7 @@ class CreateImagePage(Adw.NavigationPage):
 class DeviceDetailPage(Adw.NavigationPage):
     """Detail view for a single LUKS device — unlock, view enrollments, manage."""
 
-    def __init__(self, svc, device, passphrase=None):
+    def __init__(self, svc, device, passphrase=None, volume_key_cached=False):
         super().__init__(title=device)
         self.svc = svc
         self.device = device
@@ -1274,6 +1270,11 @@ class DeviceDetailPage(Adw.NavigationPage):
         self.unlock_pin = ""
         self._unlocked = False
         self._initial_passphrase = passphrase
+        # Set when we just created this container without a passphrase: the
+        # service holds its volume key in the cache, so the first enrollment
+        # authenticates from there with an empty passphrase (issue #58). No
+        # keyslot exists yet, so there is nothing to verify against.
+        self._volume_key_cached = volume_key_cached
 
         toolbar_view = Adw.ToolbarView()
         self.set_child(toolbar_view)
@@ -1435,7 +1436,15 @@ class DeviceDetailPage(Adw.NavigationPage):
         # global libcryptsetup lock so the metadata reads above queue behind
         # it. A genuinely blank-password container still auto-unlocks via the
         # known-passphrase path (its passphrase, "", is passed in on create).
-        if self._initial_passphrase is not None:
+        if self._volume_key_cached:
+            # Freshly created keyslot-less container: the volume key is cached
+            # service-side, so go straight to the unlocked view. The first
+            # enrollment passes an empty passphrase and is served from the
+            # cache; until then there is no keyslot to authenticate against.
+            self.passphrase = ""
+            self.auth_keyslot = -1
+            self._show_unlocked()
+        elif self._initial_passphrase is not None:
             self._auto_unlock_with(self._initial_passphrase)
 
     def _auto_unlock_with(self, passphrase):
@@ -1491,6 +1500,11 @@ class DeviceDetailPage(Adw.NavigationPage):
 
     def _apply_enrolled_methods(self, data):
         """Show enrolled methods and configure unlock fields accordingly."""
+        # If we already unlocked (e.g. a freshly created container with a
+        # cached volume key), this late background callback must not re-show
+        # the unlock prompt over the unlocked view.
+        if self._unlocked:
+            return
         self._clear_dynamic_rows("method:")
 
         has_any = False
