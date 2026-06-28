@@ -86,6 +86,33 @@ fn enroll_recovery_key_golden_token() {
 }
 
 #[test]
+fn recovery_keyslot_uses_minimal_pbkdf() {
+    // Regression for issue #57: the recovery key is 256 bits of OS-RNG
+    // entropy, so its keyslot must use the fast pbkdf2 KDF (like the
+    // FIDO2/TPM2 secret slots and systemd-cryptenroll), not the slow
+    // argon2id pass reserved for low-entropy user passphrases. Running
+    // argon2id here cost ~8 s for no security benefit.
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
+
+    let (ok, _recovery_key, err) =
+        service::op_enroll_recovery_key(&img, PASSPHRASE, "passphrase", "");
+    assert!(ok, "recovery enrollment failed: {err}");
+
+    let rk_slot = luks::tokens_by_type(&img, "systemd-recovery")[0].1[0];
+    let meta = luks::metadata_json(&img).expect("metadata");
+    let kdf = &meta["keyslots"][rk_slot.to_string()]["kdf"]["type"];
+    assert_eq!(
+        kdf, "pbkdf2",
+        "recovery keyslot must use minimal pbkdf2, got {kdf}"
+    );
+
+    // Sanity: the original low-entropy password slot is still argon2-hardened,
+    // so this is a targeted choice, not a global KDF downgrade.
+    assert_eq!(meta["keyslots"]["0"]["kdf"]["type"], "argon2id");
+}
+
+#[test]
 fn token_volume_key_targets_keyslot_and_falls_back() {
     // Regression for issue #16: token unlock must query the token's own
     // keyslot instead of every keyslot (which runs the slow argon2id

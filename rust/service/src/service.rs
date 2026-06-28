@@ -462,7 +462,10 @@ pub fn op_enroll_recovery_key(
             let recovery_key = recovery::make_recovery_key();
             Ok(Prepared {
                 keyslot_secret: recovery_key.as_bytes().to_vec(),
-                minimal_pbkdf: false,
+                // The recovery key is 256 bits of OS-RNG entropy, so the slow
+                // argon2id pass buys nothing — use minimal pbkdf2 like the
+                // FIDO2/TPM2 secrets, matching systemd-cryptenroll (issue #57).
+                minimal_pbkdf: true,
                 // The GUI parses the recovery key from the stdout field.
                 stdout: recovery_key,
                 token: recovery_token_json(),
