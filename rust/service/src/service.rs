@@ -525,10 +525,16 @@ pub fn op_create_encrypted_image(
     passphrase: &str,
     owner: Option<(u32, u32)>,
 ) -> (bool, i32, String) {
-    // Reject block devices / non-regular existing paths.
+    // Never reformat in place: a brand-new container is always a new file, so
+    // an existing path is refused rather than clobbered (an existing LUKS2
+    // container would otherwise be silently truncated). Non-regular existing
+    // paths (block devices, dirs) keep their own message.
     let p = Path::new(real_path);
-    if p.exists() && !p.is_file() {
-        return (false, -1, "Path must be a regular file".to_string());
+    if p.exists() {
+        if !p.is_file() {
+            return (false, -1, "Path must be a regular file".to_string());
+        }
+        return (false, -1, "A file already exists at this path".to_string());
     }
     // Allowlist: only under /home/ or /tmp/.
     if !(real_path.starts_with("/home/") || real_path.starts_with("/tmp/")) {
@@ -536,7 +542,7 @@ pub fn op_create_encrypted_image(
     }
     let run = || -> crate::error::Result<i32> {
         format::create_image_file(real_path, size_mb)?;
-        let keyslot = luks::format_luks2(real_path, passphrase)?;
+        let keyslot = format_container(real_path, passphrase)?;
         if let Some((uid, gid)) = owner {
             std::os::unix::fs::chown(real_path, Some(uid), Some(gid))?;
         }
@@ -556,13 +562,41 @@ pub fn op_create_encrypted_image(
 /// check, and no chown — the descriptor is the capability. The handler
 /// sizes the file via ftruncate before calling this.
 pub fn op_create_image_fd(path: &str, passphrase: &str) -> (bool, i32, String) {
-    match luks::format_luks2(path, passphrase) {
+    match format_container(path, passphrase) {
         Ok(keyslot) => (true, keyslot, String::new()),
         Err(e) => {
             eprintln!("CreateEncryptedImage(fd) failed: {e}");
             (false, -1, "Operation failed".to_string())
         }
     }
+}
+
+/// Format a freshly created container. An empty passphrase means "no
+/// passphrase keyslot": the volume is formatted with a cached volume key and
+/// the first enrollment wraps it, so the user is never asked for a throwaway
+/// passphrase (issue #58). A non-empty passphrase keeps the classic behavior
+/// of seeding a password keyslot. Returns the first keyslot, or -1 when none
+/// was created.
+fn format_container(path: &str, passphrase: &str) -> crate::error::Result<i32> {
+    if passphrase.is_empty() {
+        luks::format_luks2_keyless(path)?;
+        Ok(-1)
+    } else {
+        luks::format_luks2(path, passphrase)
+    }
+}
+
+/// True when `fd` points at an empty (zero-length) file. The create-via-fd
+/// handler checks this before it sizes the file, where the length is still the
+/// one the client handed over: the client opens the new container
+/// `O_CREAT|O_EXCL` and never sizes it (the service does), so a legitimate fd
+/// is empty. A non-empty fd means content already exists, so the create is
+/// refused rather than clobbering it. Unlike `O_EXCL`, the length is directly
+/// observable, so this is a verified guarantee, not an assumption (issue #58).
+pub fn create_fd_is_empty<Fd: std::os::fd::AsFd>(fd: Fd) -> bool {
+    nix::sys::stat::fstat(&fd)
+        .map(|st| st.st_size == 0)
+        .unwrap_or(false)
 }
 
 pub fn op_format_partition(device: &str, passphrase: &str) -> Triple {
@@ -1287,6 +1321,16 @@ impl LuksEnrollService {
         Self::check_lens(&[&passphrase])?;
         if !(1..=8192).contains(&size_mb) {
             return Ok((false, -1, "size_mb must be between 1 and 8192".to_string()));
+        }
+        // Never reformat in place: require the fd to point at an empty file.
+        // Checked before the ftruncate below, so the length is still the one
+        // the client handed over -- the client creates the container
+        // O_CREAT|O_EXCL and lets the service size it, so a legitimate fd is
+        // zero-length; a non-empty fd means content already exists and we'd be
+        // clobbering it. The length is observable (unlike O_EXCL), so this is
+        // enforced service-side, not assumed of the client (issue #58).
+        if !create_fd_is_empty(&fd) {
+            return Ok((false, -1, "A file already exists at this path".to_string()));
         }
         self.touch_idle();
         blocking(move || {
