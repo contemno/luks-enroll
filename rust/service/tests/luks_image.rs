@@ -31,6 +31,85 @@ fn create_image_format_and_verify() {
 }
 
 #[test]
+fn keyless_create_caches_vk_and_first_enroll_needs_no_passphrase() {
+    // Issue #58: creating a container with an empty passphrase formats a
+    // keyslot-less LUKS2 header and caches the volume key, so the first
+    // enrollment authenticates from the cache -- the user never types a
+    // throwaway passphrase.
+    let dir = tmpdir();
+    let path = dir
+        .path()
+        .join("keyless.img")
+        .to_string_lossy()
+        .into_owned();
+    luks::clear_volume_key_cache(&path);
+
+    let (ok, keyslot, err) = service::op_create_encrypted_image(&path, 32, "", None);
+    assert!(ok, "keyless create failed: {err}");
+    assert_eq!(keyslot, -1, "no keyslot is created up front");
+
+    // Valid LUKS2 header, but zero keyslots / zero password slots on disk.
+    assert!(
+        luks::list_keyslots(&path).is_empty(),
+        "no keyslots persisted"
+    );
+    assert!(luks::password_keyslots(&path).is_empty());
+
+    // The first enrollment passes an empty passphrase; it can only succeed by
+    // serving the volume key from the cache (there is no keyslot to unwrap).
+    let (ok, recovery_key, err) = service::op_enroll_recovery_key(&path, "", "passphrase", "");
+    assert!(ok, "first enroll via cached VK failed: {err}");
+
+    // Now exactly one keyslot exists and the recovery key unlocks it.
+    assert_eq!(luks::list_keyslots(&path).len(), 1);
+    assert!(luks::verify_passphrase(&path, &recovery_key).is_ok());
+}
+
+#[test]
+fn keyless_volume_has_no_recovery_path_once_cache_is_gone() {
+    // Pins the safety reasoning behind the keyless create: with no keyslot,
+    // the cached VK is the *only* way in. Dropping the cache before the first
+    // enrollment leaves an empty, unrecoverable throwaway -- which is sound
+    // precisely because no data has been committed yet (the container was
+    // just created and was never mountable through the keyslot path).
+    let dir = tmpdir();
+    let path = dir.path().join("orphan.img").to_string_lossy().into_owned();
+    luks::clear_volume_key_cache(&path);
+
+    let (ok, _, err) = service::op_create_encrypted_image(&path, 32, "", None);
+    assert!(ok, "keyless create failed: {err}");
+
+    luks::clear_volume_key_cache(&path);
+
+    // No cached VK and no keyslot: enrollment can't get a volume key.
+    let (ok, _, _) = service::op_enroll_recovery_key(&path, "", "passphrase", "");
+    assert!(!ok, "without the cached VK there is no way to enroll");
+    // And no passphrase (not even empty) unlocks a keyslot-less header.
+    assert!(luks::verify_passphrase(&path, "").is_err());
+}
+
+#[test]
+fn create_refuses_existing_file_instead_of_clobbering() {
+    // Issue #58: never reformat in place. A second create at the same path is
+    // refused rather than truncating whatever (possibly a LUKS container) is
+    // already there.
+    let dir = tmpdir();
+    let path = dir.path().join("exists.img").to_string_lossy().into_owned();
+
+    let (ok, _, err) = service::op_create_encrypted_image(&path, 32, PASSPHRASE, None);
+    assert!(ok, "initial create failed: {err}");
+
+    let (ok, slot, err) = service::op_create_encrypted_image(&path, 32, PASSPHRASE, None);
+    assert!(!ok, "second create must refuse the existing file");
+    assert_eq!(slot, -1);
+    assert_eq!(err, "A file already exists at this path");
+
+    // The original is untouched: still a valid one-keyslot LUKS2 container.
+    assert_eq!(luks::list_keyslots(&path).len(), 1);
+    assert_eq!(luks::verify_passphrase(&path, PASSPHRASE), Ok(0));
+}
+
+#[test]
 fn create_image_rejects_bad_paths_and_sizes() {
     // Outside the allowlist.
     let (ok, slot, err) = service::op_create_encrypted_image("/var/evil.img", 32, PASSPHRASE, None);
