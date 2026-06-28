@@ -1,0 +1,48 @@
+version: 2
+updates:
+  # GitHub Actions: pinned to commit SHAs in workflow files. Dependabot rewrites
+  # the SHA and updates the trailing version comment in lockstep. Keep this block
+  # in every repo that has workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    # Open update PRs against dev: merges to main auto-publish a release, so
+    # dependency bumps flow through dev like everything else.
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]   # one grouped PR, not one per action
+
+  # TODO: add ONE block per package manager you actually use, and delete the rest.
+  # Group each ecosystem so you review a single PR instead of N. Examples:
+
+  # Python (hash-pinned in requirements*.txt — Dependabot regenerates hashes):
+  # - package-ecosystem: pip
+  #   directory: /
+  #   target-branch: dev
+  #   schedule:
+  #     interval: weekly
+  #   groups:
+  #     pip:
+  #       patterns: ["*"]
+
+  # Rust (Cargo.lock committed):
+  # - package-ecosystem: cargo
+  #   directory: /
+  #   target-branch: dev
+  #   schedule:
+  #     interval: weekly
+  #   groups:
+  #     cargo:
+  #       patterns: ["*"]
+
+  # Node:
+  # - package-ecosystem: npm
+  #   directory: /
+  #   target-branch: dev
+  #   schedule:
+  #     interval: weekly
+  #   groups:
+  #     npm:
+  #       patterns: ["*"]
