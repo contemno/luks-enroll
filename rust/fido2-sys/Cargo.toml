@@ -7,4 +7,4 @@ description = "Minimal bindgen FFI bindings to the system libfido2, covering the
 links = "fido2"
 
 [build-dependencies]
-bindgen = "0.71"
+bindgen = "0.72"
