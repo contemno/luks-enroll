@@ -526,6 +526,11 @@ fn open_close_volume_roundtrip() {
         std::path::Path::new(&mapper_path).exists(),
         "{mapper_path} should exist after open"
     );
+    // Freshly opened, nothing mounted on it -> close is allowed.
+    assert!(
+        !luks::mapping_is_mounted(&name),
+        "a freshly opened mapping has no mounted filesystem"
+    );
 
     // Re-open is idempotent: still ok, still one mapping.
     let (ok, _, err) = service::op_open_volume(&img, &name, PASSPHRASE, "passphrase", "");
