@@ -327,5 +327,28 @@ class TestVolumeMappingProxy(unittest.TestCase):
         self.assertEqual(proxy.proxy.calls, ["CloseVolume"])
 
 
+class TestMapperNameDerivation(unittest.TestCase):
+    """The Volume Mapping button must appear even when the service reports no
+    UUID (older service build), so the name derivation falls back to the
+    device path instead of disabling the control (PR #70 review)."""
+
+    @staticmethod
+    def _derive(device, uuid):
+        return gui.derive_mapper_name(device, uuid)
+
+    def test_prefers_uuid(self):
+        self.assertEqual(self._derive("/dev/sdb1", "1b6e-2c3d"), "luks-1b6e-2c3d")
+
+    def test_falls_back_to_device_basename_when_no_uuid(self):
+        # No UUID -> still a valid, non-None name so the button shows.
+        self.assertEqual(self._derive("/dev/sdb1", ""), "luks-sdb1")
+
+    def test_fallback_sanitizes_to_dm_name_charset(self):
+        name = self._derive("/home/user/My Secret.img", "")
+        self.assertTrue(name.startswith("luks-"))
+        # Only the dm-crypt charset the service's valid_mapper_name accepts.
+        self.assertTrue(all(c.isalnum() or c in "-_" for c in name))
+
+
 if __name__ == "__main__":
     unittest.main()
