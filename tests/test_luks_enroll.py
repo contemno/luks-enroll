@@ -274,5 +274,58 @@ class TestRunAsync(unittest.TestCase):
         self.assertEqual(captured, [(cb, False, "", "D-Bus error: nope")])
 
 
+class TestVolumeMappingProxy(unittest.TestCase):
+    """OpenVolume/CloseVolume proxy wrappers (issue #69): correct D-Bus method
+    names, signatures, and path-vs-fd dispatch."""
+
+    @staticmethod
+    def _proxy():
+        # Build a proxy instance without running __init__ (which would try to
+        # connect to the bus); the wrappers only touch .proxy / helpers.
+        return gui.LuksEnrollProxy.__new__(gui.LuksEnrollProxy)
+
+    def test_open_volume_uses_fd_variant_and_signature(self):
+        proxy = self._proxy()
+        captured = {}
+
+        def fake_dispatch(path_call, method_fd, fd_sig, device, extra_args, timeout):
+            captured.update(
+                method_fd=method_fd, fd_sig=fd_sig, device=device, extra_args=extra_args
+            )
+            return (True, "luks-uuid", "")
+
+        proxy._call_path_or_fd_sync = fake_dispatch
+        ok, mapper, err = proxy.open_volume(
+            "/dev/sdb1", "luks-uuid", "pw", "systemd-fido2", "1234"
+        )
+        self.assertEqual((ok, mapper, err), (True, "luks-uuid", ""))
+        self.assertEqual(captured["method_fd"], "OpenVolumeFd")
+        # fd path: index + name + passphrase + unlock_method + unlock_pin.
+        self.assertEqual(captured["fd_sig"], "(hssss)")
+        self.assertEqual(captured["device"], "/dev/sdb1")
+        self.assertEqual(
+            captured["extra_args"], ("luks-uuid", "pw", "systemd-fido2", "1234")
+        )
+
+    def test_close_volume_unpacks_proxy_result(self):
+        proxy = self._proxy()
+
+        class FakeResult:
+            def unpack(self):
+                return (True, "")
+
+        class FakeProxy:
+            def __init__(self):
+                self.calls = []
+
+            def call_sync(self, method, *args, **kwargs):
+                self.calls.append(method)
+                return FakeResult()
+
+        proxy.proxy = FakeProxy()
+        self.assertEqual(proxy.close_volume("luks-uuid"), (True, ""))
+        self.assertEqual(proxy.proxy.calls, ["CloseVolume"])
+
+
 if __name__ == "__main__":
     unittest.main()
