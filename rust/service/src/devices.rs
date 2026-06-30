@@ -212,6 +212,11 @@ pub fn blkid_tag(device: &str, tag: &str) -> Option<String> {
         .set_superblock_flags(BlkidSublksFlags::new(vec![
             BlkidSublks::Label,
             BlkidSublks::Type,
+            // UUID must be requested explicitly, or lookup_value("UUID")
+            // returns nothing — which is why GetDeviceInfo's `uuid` field came
+            // back empty and the client's mapper-name fell back to the device
+            // basename instead of the systemd `luks-<UUID>` convention.
+            BlkidSublks::Uuid,
         ]))
         .ok()?;
     if !matches!(probe.do_safeprobe(), Ok(BlkidSafeprobeRet::Success)) {
