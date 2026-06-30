@@ -1463,6 +1463,12 @@ class DeviceDetailPage(Adw.NavigationPage):
         # so the host can mount the filesystem inside — useful on distros that
         # only offer passphrase unlock at boot (issue #69).
         self._mapper_name = None
+        # An in-flight open/close suppresses the mount poll so it can't reset
+        # the spinner/button mid-operation; the poll keeps the mounted hint
+        # live when the filesystem is (un)mounted outside this app.
+        self._mapping_busy = False
+        self._mapping_poll_id = None
+        self.connect("destroy", lambda _: self._stop_mapping_poll())
         self._mapping_group = Adw.PreferencesGroup(
             title="Volume Mapping",
             description="Map the volume so the filesystem inside can be mounted.",
@@ -1843,12 +1849,34 @@ class DeviceDetailPage(Adw.NavigationPage):
             return False
         return mount_references(mounts, mapper, dm_node)
 
+    def _start_mapping_poll(self):
+        """Poll mapping/mount state every 2 s so the open/closed and mounted
+        indicators stay live when the volume is mapped or its filesystem is
+        (un)mounted from another app (e.g. Files/Disks)."""
+        if self._mapping_poll_id is None:
+            self._mapping_poll_id = GLib.timeout_add_seconds(
+                2, self._poll_mapping_state
+            )
+
+    def _stop_mapping_poll(self):
+        if self._mapping_poll_id is not None:
+            GLib.source_remove(self._mapping_poll_id)
+            self._mapping_poll_id = None
+
+    def _poll_mapping_state(self):
+        # Skip while an open/close is in flight (don't fight its spinner).
+        if not self._mapping_busy:
+            self._refresh_mapping_state()
+        return GLib.SOURCE_CONTINUE
+
     def _refresh_mapping_state(self):
         """Show the mapping group and set the button to Open or Close based on
-        whether /dev/mapper/<name> is currently present."""
+        whether /dev/mapper/<name> is currently present, and reflect whether
+        its filesystem is mounted."""
         name = self._mapper_name
         if not name:
             self._mapping_group.set_visible(False)
+            self._stop_mapping_poll()
             return
         self._mapping_spinner.stop()
         self._mapping_btn.set_sensitive(True)
@@ -1866,6 +1894,7 @@ class DeviceDetailPage(Adw.NavigationPage):
             self._mapping_btn.set_label("Open")
             self._mapping_btn.remove_css_class("destructive-action")
             self._mapping_btn.add_css_class("suggested-action")
+        self._start_mapping_poll()
         self._mapping_group.set_visible(True)
 
     def _on_mapping_clicked(self):
@@ -1874,6 +1903,7 @@ class DeviceDetailPage(Adw.NavigationPage):
         if not name:
             return
         is_open = os.path.exists(self._mapper_path())
+        self._mapping_busy = True
         self._mapping_btn.set_sensitive(False)
         self._mapping_spinner.start()
 
@@ -1895,6 +1925,7 @@ class DeviceDetailPage(Adw.NavigationPage):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_mapping_done(self, ok, err):
+        self._mapping_busy = False
         self._mapping_spinner.stop()
         if not ok:
             win = self.get_root()
