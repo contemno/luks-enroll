@@ -350,5 +350,39 @@ class TestMapperNameDerivation(unittest.TestCase):
         self.assertTrue(all(c.isalnum() or c in "-_" for c in name))
 
 
+class TestMountReferences(unittest.TestCase):
+    """The client's mounted-state hint mirrors the service's data-loss guard:
+    a mapping with a mounted filesystem must be recognized so it can be flagged
+    (and the service refuses to close it)."""
+
+    MOUNTS = (
+        "proc /proc proc rw 0 0\n"
+        "/dev/sda1 /boot ext4 rw 0 0\n"
+        "/dev/mapper/luks-abc /mnt/secret ext4 rw 0 0\n"
+    )
+
+    def test_matches_mapper_spelling(self):
+        self.assertTrue(
+            gui.mount_references(self.MOUNTS, "/dev/mapper/luks-abc", "/dev/dm-3")
+        )
+
+    def test_matches_resolved_dm_node(self):
+        mounts = "/dev/dm-3 /mnt/secret ext4 rw 0 0\n"
+        self.assertTrue(
+            gui.mount_references(mounts, "/dev/mapper/luks-abc", "/dev/dm-3")
+        )
+
+    def test_no_match_when_not_mounted(self):
+        self.assertFalse(
+            gui.mount_references(self.MOUNTS, "/dev/mapper/luks-other", "/dev/dm-9")
+        )
+
+    def test_substring_device_does_not_false_match(self):
+        mounts = "/dev/mapper/luks-abc-data /mnt/x ext4 rw 0 0\n"
+        self.assertFalse(
+            gui.mount_references(mounts, "/dev/mapper/luks-abc", "/dev/dm-3")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

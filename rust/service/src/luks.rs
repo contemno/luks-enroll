@@ -564,6 +564,29 @@ pub fn mapping_is_active(name: &str) -> bool {
     )
 }
 
+/// Pure mount matcher over /proc/mounts text: true if any mount's source
+/// device is the mapper symlink (`/dev/mapper/<name>`) or the dm node it
+/// resolves to (`/dev/dm-N`) — the two spellings a dm-crypt mount can take.
+fn mounts_reference(proc_mounts: &str, mapper: &str, dm_node: Option<&str>) -> bool {
+    proc_mounts
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .any(|src| src == mapper || dm_node.is_some_and(|d| src == d))
+}
+
+/// Whether the dm-crypt mapping `/dev/mapper/<name>` currently has a mounted
+/// filesystem. Used to refuse deactivation that would otherwise yank a mounted
+/// volume out from under the kernel (data loss).
+pub fn mapping_is_mounted(name: &str) -> bool {
+    let mapper = format!("/dev/mapper/{name}");
+    let dm_node = std::fs::canonicalize(&mapper)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    std::fs::read_to_string("/proc/mounts")
+        .map(|m| mounts_reference(&m, &mapper, dm_node.as_deref()))
+        .unwrap_or(false)
+}
+
 /// Activate `device` as `/dev/mapper/<name>` using the volume key obtained via
 /// `unlock_method` (cache-or-extract, exactly like enroll/wipe), so a single
 /// FIDO2 tap / TPM2 unseal / argon2 pass both unlocks *and* opens the volume.
@@ -605,6 +628,13 @@ pub fn deactivate_volume(name: &str) -> Result<()> {
     }
     if !mapping_is_active(name) {
         return Ok(());
+    }
+    // Refuse to close a mapping whose filesystem is still mounted: tearing the
+    // dm-crypt device down under a live mount loses data. The kernel also
+    // refuses (EBUSY) without a force flag, but checking first lets us return
+    // a clear, actionable message instead of a generic "device busy".
+    if mapping_is_mounted(name) {
+        bail!("The volume's filesystem is mounted; unmount it before closing");
     }
     let mut dev = CryptInit::init_by_name_and_header(name, None)
         .map_err(|e| Error(format!("crypt_init_by_name failed: {e}")))?;
@@ -924,6 +954,42 @@ mod tests {
         // A missing tokens section is empty too, not a panic.
         let empty = serde_json::json!({ "keyslots": {} });
         assert!(token_type_keyslots(&empty, "systemd-tpm2").is_empty());
+    }
+
+    #[test]
+    fn mounts_reference_matches_either_spelling() {
+        let mounts = "\
+proc /proc proc rw 0 0
+/dev/sda1 /boot ext4 rw 0 0
+/dev/mapper/luks-abc /mnt/secret ext4 rw 0 0
+tmpfs /run tmpfs rw 0 0
+";
+        // Mounted via the mapper symlink spelling.
+        assert!(mounts_reference(
+            mounts,
+            "/dev/mapper/luks-abc",
+            Some("/dev/dm-3")
+        ));
+        // Mounted via the resolved dm node spelling.
+        let mounts_dm = "/dev/dm-3 /mnt/secret ext4 rw 0 0\n";
+        assert!(mounts_reference(
+            mounts_dm,
+            "/dev/mapper/luks-abc",
+            Some("/dev/dm-3")
+        ));
+        // Not mounted: neither spelling present.
+        assert!(!mounts_reference(
+            mounts,
+            "/dev/mapper/luks-other",
+            Some("/dev/dm-9")
+        ));
+        // A substring of another device must not false-match.
+        let tricky = "/dev/mapper/luks-abc-data /mnt/x ext4 rw 0 0\n";
+        assert!(!mounts_reference(
+            tricky,
+            "/dev/mapper/luks-abc",
+            Some("/dev/dm-3")
+        ));
     }
 
     #[test]
