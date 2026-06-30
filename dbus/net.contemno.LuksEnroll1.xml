@@ -29,6 +29,29 @@
       <arg direction="out" type="b" name="success"/>
       <arg direction="out" type="i" name="keyslot"/>
     </method>
+    <!--
+      Activate a LUKS volume as /dev/mapper/<name> using the volume key
+      reached through any enrolled unlock method (the cached VK), so the host
+      can mount the filesystem inside. On success `mapper` is the active name.
+      Idempotent: re-opening an already-active mapping succeeds. Activation is
+      additive (no keyslot/token changes), preserving the lockout guarantee.
+    -->
+    <method name="OpenVolume">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="name"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="mapper"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <!-- Tear down the dm-crypt mapping /dev/mapper/<name>. Idempotent. -->
+    <method name="CloseVolume">
+      <arg direction="in" type="s" name="name"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
     <method name="EnrollFido2">
       <arg direction="in" type="s" name="device"/>
       <arg direction="in" type="s" name="passphrase"/>
@@ -165,6 +188,17 @@
       <arg direction="in" type="s" name="pin"/>
       <arg direction="out" type="b" name="success"/>
       <arg direction="out" type="i" name="keyslot"/>
+    </method>
+    <!-- OpenVolume for a client-owned container file (read-write fd). -->
+    <method name="OpenVolumeFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="in" type="s" name="name"/>
+      <arg direction="in" type="s" name="passphrase"/>
+      <arg direction="in" type="s" name="unlock_method"/>
+      <arg direction="in" type="s" name="unlock_pin"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="mapper"/>
+      <arg direction="out" type="s" name="stderr"/>
     </method>
     <method name="EnrollFido2Fd">
       <arg direction="in" type="h" name="fd"/>
