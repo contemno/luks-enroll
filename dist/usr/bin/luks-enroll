@@ -573,6 +573,17 @@ def detect_tpm2_device():
         return "TPM2 detected"
 
 
+def derive_mapper_name(device, uuid):
+    """dm-crypt mapper name for OpenVolume. Prefer the LUKS2 UUID
+    (systemd-cryptsetup's /dev/mapper/luks-<UUID> convention); fall back to the
+    device basename so the Open button still works when the service reports no
+    UUID (e.g. an older service build). Constrained to the charset the
+    service's valid_mapper_name accepts."""
+    base = uuid or os.path.basename(device) or "volume"
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in base)
+    return "luks-" + (safe or "volume")
+
+
 # TPM2 PCR descriptions, used by the TPM2 enrollment page.
 TPM2_PCRS = {
     0: "Core system firmware (BIOS/UEFI)",
@@ -1794,11 +1805,11 @@ class DeviceDetailPage(Adw.NavigationPage):
             row_fs = Adw.ActionRow(title="Filesystem", subtitle=info["filesystem"])
             self._add_row(self._info_group, row_fs, "info:fs")
 
-        # Derive the dm-crypt mapper name from the LUKS2 UUID, matching
-        # systemd-cryptsetup's /dev/mapper/luks-<UUID> convention, and reflect
-        # the current open/closed state in the mapping button.
-        uuid = info.get("uuid") or ""
-        self._mapper_name = ("luks-" + uuid) if uuid else None
+        # Choose the dm-crypt mapper name. Prefer the LUKS2 UUID, matching
+        # systemd-cryptsetup's /dev/mapper/luks-<UUID> convention; fall back to
+        # a name derived from the device path so the Open button still works
+        # when the service doesn't report a UUID (e.g. an older service build).
+        self._mapper_name = derive_mapper_name(self.device, info.get("uuid") or "")
         self._refresh_mapping_state()
 
     def _mapper_path(self):
@@ -1809,7 +1820,6 @@ class DeviceDetailPage(Adw.NavigationPage):
         whether /dev/mapper/<name> is currently present."""
         name = self._mapper_name
         if not name:
-            # No UUID available (e.g. a plain image): hide the mapping control.
             self._mapping_group.set_visible(False)
             return
         self._mapping_spinner.stop()
