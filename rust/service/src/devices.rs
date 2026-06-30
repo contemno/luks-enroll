@@ -147,6 +147,10 @@ pub fn get_device_info(device: &str) -> Value {
         "removable": is_removable(device),
         "mount_point": mount_point,
         "filesystem": blkid_tag(device, "TYPE").unwrap_or_default(),
+        // LUKS2 header UUID. The client derives the default dm-crypt mapper
+        // name (`luks-<UUID>`, matching systemd-cryptsetup) for OpenVolume,
+        // and reflects open/closed state by checking /dev/mapper/<name>.
+        "uuid": blkid_tag(device, "UUID").unwrap_or_default(),
     })
 }
 
