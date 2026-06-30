@@ -20,6 +20,36 @@ from gi.repository import Adw, Gio, GLib, GUdev, Gtk  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
+# Application version
+# ---------------------------------------------------------------------------
+
+# Substituted with the package version by debian/rules at build time. A real
+# version never starts with "@", so the placeholder is detectable at runtime.
+__version__ = "@VERSION@"
+
+
+def _resolve_version():
+    """The version string to display.
+
+    Installed builds carry the substituted ``__version__``. Running from a
+    source checkout, fall back to the repo's ``VERSION`` floor, then ``dev``.
+    """
+    if not __version__.startswith("@"):
+        return __version__
+    try:
+        # dist/usr/bin/luks-enroll -> repo root is three levels up.
+        root = os.path.dirname(os.path.abspath(__file__))
+        version_file = os.path.join(root, "..", "..", "..", "VERSION")
+        with open(version_file) as f:
+            return f.read().strip() or "dev"
+    except OSError:
+        return "dev"
+
+
+APP_VERSION = _resolve_version()
+
+
+# ---------------------------------------------------------------------------
 # Token types + background-work helper
 # ---------------------------------------------------------------------------
 
@@ -585,6 +615,14 @@ class DeviceListPage(Adw.NavigationPage):
         self.content_stack = Gtk.Stack()
         toolbar_view.set_content(self.content_stack)
 
+        # Version footer, so the running build is identifiable at a glance.
+        self.version_label = Gtk.Label(label=f"luks-enroll {APP_VERSION}")
+        self.version_label.add_css_class("dim-label")
+        self.version_label.add_css_class("caption")
+        self.version_label.set_margin_top(4)
+        self.version_label.set_margin_bottom(4)
+        toolbar_view.add_bottom_bar(self.version_label)
+
         # Preferences page with device groups
         self.prefs_page = Adw.PreferencesPage()
         self.internal_group = Adw.PreferencesGroup(title="Internal Volumes")
@@ -1115,15 +1153,19 @@ class CreateImagePage(Adw.NavigationPage):
         size_row.add_suffix(self._size_spin)
         size_group.add(size_row)
 
-        # Passphrase group
-        pw_group = Adw.PreferencesGroup(title="Passphrase")
-        prefs.add(pw_group)
-
-        self._pw_row = Adw.PasswordEntryRow(title="Passphrase")
-        pw_group.add(self._pw_row)
-
-        self._pw_confirm_row = Adw.PasswordEntryRow(title="Confirm passphrase")
-        pw_group.add(self._pw_confirm_row)
+        # No passphrase here: the new container is formatted with a cached
+        # volume key and you enroll a real method (FIDO2/TPM2/recovery, or a
+        # passphrase if you want one) on the detail page that opens next. This
+        # avoids a throwaway passphrase whose only job was to wrap a volume key
+        # we already know (issue #58).
+        info_group = Adw.PreferencesGroup()
+        prefs.add(info_group)
+        info_group.add(
+            Adw.ActionRow(
+                title="No passphrase needed",
+                subtitle="Pick how to unlock it on the next screen.",
+            )
+        )
 
         # Status + action
         action_group = Adw.PreferencesGroup()
@@ -1176,19 +1218,9 @@ class CreateImagePage(Adw.NavigationPage):
     def _on_create(self, _btn):
         path = self._path_row.get_text().strip()
         size_mb = int(self._size_spin.get_value())
-        pw = self._pw_row.get_text()
-        confirm = self._pw_confirm_row.get_text()
 
         if not path:
             self._status_label.set_text("File path cannot be empty.")
-            self._status_label.add_css_class("error")
-            return
-        if not pw:
-            self._status_label.set_text("Passphrase cannot be empty.")
-            self._status_label.add_css_class("error")
-            return
-        if pw != confirm:
-            self._status_label.set_text("Passphrases do not match.")
             self._status_label.add_css_class("error")
             return
 
@@ -1198,9 +1230,10 @@ class CreateImagePage(Adw.NavigationPage):
         self._spinner.start()
         self._create_btn.set_sensitive(False)
         self._pending_path = path
-        self._pending_pw = pw
 
-        self.svc.create_encrypted_image_async(path, size_mb, pw, self._on_create_finish)
+        # Empty passphrase: the service formats a keyslot-less container and
+        # caches its volume key for the first enrollment (issue #58).
+        self.svc.create_encrypted_image_async(path, size_mb, "", self._on_create_finish)
 
     def _on_create_finish(self, proxy, result):
         """Async callback — runs on main thread after D-Bus call completes."""
@@ -1218,10 +1251,11 @@ class CreateImagePage(Adw.NavigationPage):
             self._status_label.remove_css_class("error")
             self._status_label.add_css_class("success")
             self.list_page.add_image_file(path)
-            # Replace this page with the device detail page, pre-unlocked
+            # Replace this page with the device detail page, pre-unlocked via
+            # the cached volume key (no passphrase was set on create).
             nav = self.get_ancestor(Adw.NavigationView)
             if nav:
-                detail = DeviceDetailPage(self.svc, path, passphrase=self._pending_pw)
+                detail = DeviceDetailPage(self.svc, path, volume_key_cached=True)
                 nav.push(detail)
         else:
             self._status_label.set_text(f"Failed: {error}")
@@ -1232,7 +1266,7 @@ class CreateImagePage(Adw.NavigationPage):
 class DeviceDetailPage(Adw.NavigationPage):
     """Detail view for a single LUKS device — unlock, view enrollments, manage."""
 
-    def __init__(self, svc, device, passphrase=None):
+    def __init__(self, svc, device, passphrase=None, volume_key_cached=False):
         super().__init__(title=device)
         self.svc = svc
         self.device = device
@@ -1242,6 +1276,11 @@ class DeviceDetailPage(Adw.NavigationPage):
         self.unlock_pin = ""
         self._unlocked = False
         self._initial_passphrase = passphrase
+        # Set when we just created this container without a passphrase: the
+        # service holds its volume key in the cache, so the first enrollment
+        # authenticates from there with an empty passphrase (issue #58). No
+        # keyslot exists yet, so there is nothing to verify against.
+        self._volume_key_cached = volume_key_cached
 
         toolbar_view = Adw.ToolbarView()
         self.set_child(toolbar_view)
@@ -1359,6 +1398,25 @@ class DeviceDetailPage(Adw.NavigationPage):
         self._info_group.set_visible(False)
         self._prefs_page.add(self._info_group)
 
+        # Shortcut to the system Disks utility so the user can mount/browse
+        # the volume after unlocking. Only shown when gnome-disks is installed
+        # (this app authenticates to manage keyslots; it does not itself
+        # activate or mount the filesystem).
+        if GLib.find_program_in_path("gnome-disks"):
+            open_row = Adw.ActionRow(
+                title="Open in Disks",
+                subtitle="Mount or browse this volume in the Disks utility",
+            )
+            open_row.add_prefix(
+                Gtk.Image.new_from_icon_name("drive-harddisk-symbolic")
+            )
+            open_btn = Gtk.Button(label="Open Disks")
+            open_btn.set_valign(Gtk.Align.CENTER)
+            open_btn.connect("clicked", lambda _: self._open_in_disks())
+            open_row.add_suffix(open_btn)
+            open_row.set_activatable_widget(open_btn)
+            self._info_group.add(open_row)
+
         # --- Enrollments group (hidden until unlocked) ---
         self._enrollments_group = Adw.PreferencesGroup(title="Current Enrollments")
         self._enrollments_group.set_visible(False)
@@ -1384,7 +1442,15 @@ class DeviceDetailPage(Adw.NavigationPage):
         # global libcryptsetup lock so the metadata reads above queue behind
         # it. A genuinely blank-password container still auto-unlocks via the
         # known-passphrase path (its passphrase, "", is passed in on create).
-        if self._initial_passphrase is not None:
+        if self._volume_key_cached:
+            # Freshly created keyslot-less container: the volume key is cached
+            # service-side, so go straight to the unlocked view. The first
+            # enrollment passes an empty passphrase and is served from the
+            # cache; until then there is no keyslot to authenticate against.
+            self.passphrase = ""
+            self.auth_keyslot = -1
+            self._show_unlocked()
+        elif self._initial_passphrase is not None:
             self._auto_unlock_with(self._initial_passphrase)
 
     def _auto_unlock_with(self, passphrase):
@@ -1440,6 +1506,11 @@ class DeviceDetailPage(Adw.NavigationPage):
 
     def _apply_enrolled_methods(self, data):
         """Show enrolled methods and configure unlock fields accordingly."""
+        # If we already unlocked (e.g. a freshly created container with a
+        # cached volume key), this late background callback must not re-show
+        # the unlock prompt over the unlocked view.
+        if self._unlocked:
+            return
         self._clear_dynamic_rows("method:")
 
         has_any = False
@@ -1581,6 +1652,22 @@ class DeviceDetailPage(Adw.NavigationPage):
             self._unlock_error.set_text(
                 f"{token_name} unlock failed. Check PIN or try another method."
             )
+
+    def _open_in_disks(self):
+        """Launch the GNOME Disks utility focused on this device.
+
+        Falls back to launching Disks without a target device if the
+        --block-device invocation fails (e.g. older gnome-disks).
+        """
+        for argv in (
+            ["gnome-disks", "--block-device", self.device],
+            ["gnome-disks"],
+        ):
+            try:
+                Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
+                return
+            except GLib.Error:
+                continue
 
     def _show_unlocked(self):
         """Hide unlock groups and fetch device details in background."""
@@ -2204,6 +2291,8 @@ def _tpm2_setup_inputs(page, group):
     page._pin_entry.set_show_peek_icon(True)
     page._pin_entry.set_valign(Gtk.Align.CENTER)
     page._pin_entry.set_hexpand(True)
+    # Enter in the PIN field advances to the confirm field.
+    page._pin_entry.connect("activate", lambda _: page._pin_confirm.grab_focus())
     page._pin_row.add_suffix(page._pin_entry)
     page._pin_group.add(page._pin_row)
 
@@ -2296,6 +2385,8 @@ def _passphrase_setup_inputs(page, group):
     page._pw_entry.set_show_peek_icon(True)
     page._pw_entry.set_valign(Gtk.Align.CENTER)
     page._pw_entry.set_hexpand(True)
+    # Enter in the passphrase field advances to the confirm field.
+    page._pw_entry.connect("activate", lambda _: page._pw_confirm.grab_focus())
     page._pw_row.add_suffix(page._pw_entry)
     group.add(page._pw_row)
 

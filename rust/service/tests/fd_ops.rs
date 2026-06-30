@@ -21,6 +21,41 @@ fn fd_path<F: AsRawFd>(f: &F) -> String {
     format!("/proc/self/fd/{}", f.as_raw_fd())
 }
 
+/// The fd-path create guard (issue #58): a legitimate create hands over the
+/// fresh `O_CREAT|O_EXCL` file the client just made (empty), while an fd that
+/// already has content is refused before it gets reformatted. The length is
+/// what makes this a service-verified guarantee rather than trusting the
+/// client's `O_EXCL`.
+#[test]
+fn create_fd_guard_distinguishes_empty_from_existing() {
+    let dir = tmpdir();
+
+    let fresh = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("fresh.img"))
+        .expect("create");
+    assert!(
+        service::create_fd_is_empty(&fresh),
+        "a freshly created (empty) fd is an allowed create target"
+    );
+
+    let existing = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dir.path().join("existing.img"))
+        .expect("create");
+    existing.set_len(4096).expect("size");
+    assert!(
+        !service::create_fd_is_empty(&existing),
+        "a non-empty fd must be refused rather than reformatted"
+    );
+}
+
 /// op_create_image_fd + enroll + verify, all via /proc/self/fd — proves
 /// libcryptsetup operates correctly on the magic-symlink path.
 #[test]
