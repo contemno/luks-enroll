@@ -431,6 +431,38 @@ fn verify_passphrase_primes_volume_key_cache() {
     assert!(luks::get_volume_key(&img, "passphrase", "definitely-wrong", "").is_ok());
 }
 
+/// GetDeviceInfo must surface the LUKS2 UUID so the client can build the
+/// `luks-<UUID>` mapper name. Regression for the #70 review: the underlying
+/// blkid probe only requested LABEL/TYPE, so the UUID came back empty and the
+/// Open button fell back to the device-basename name.
+#[test]
+fn device_info_reports_luks_uuid() {
+    use luks_enroll_service::devices;
+
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
+
+    let info = devices::get_device_info(&img);
+    let uuid = info.get("uuid").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(!uuid.is_empty(), "GetDeviceInfo should report a LUKS UUID");
+    // Canonical UUID shape: 36 chars, 8-4-4-4-12 hex groups.
+    let groups: Vec<&str> = uuid.split('-').collect();
+    assert_eq!(
+        groups.len(),
+        5,
+        "UUID should have five dash-separated groups"
+    );
+    assert_eq!(
+        groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+        vec![8, 4, 4, 4, 12],
+        "UUID groups should be 8-4-4-4-12"
+    );
+    assert!(
+        uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+        "UUID should be hex digits and dashes only"
+    );
+}
+
 /// OpenVolume must reject a mapper name that could escape /dev/mapper before
 /// it ever touches dm-crypt — the validation happens up front, so this needs
 /// no root and asserts the security boundary at the op entry point.
