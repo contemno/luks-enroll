@@ -636,6 +636,41 @@ pub fn format_luks2(path: &str, passphrase: &str) -> Result<i32> {
     Ok(slot as i32)
 }
 
+/// LUKS2-format a freshly created container with a generated volume key but
+/// **no keyslot**, caching the VK so the first enrollment can wrap it with a
+/// real method (FIDO2/TPM2/recovery/passphrase) without the user ever typing
+/// a throwaway passphrase (issue #58).
+///
+/// We generate the 512-bit VK ourselves and pass it to `crypt_format`, then
+/// cache it directly -- no need to read it back out of the context. The
+/// on-disk header commits to this VK via its digest, but with zero keyslots
+/// the VK is recoverable *only* from the in-process cache until a keyslot is
+/// enrolled. That is safe precisely because the caller has just created the
+/// container: it holds no committed data and cannot be mounted through the
+/// normal (keyslot) path, so an abandoned, never-enrolled volume is an empty
+/// throwaway, not a lock-out. The caller MUST make the next step a
+/// keyslot-adding enrollment (which `get_volume_key` serves from this cache).
+pub fn format_luks2_keyless(path: &str) -> Result<()> {
+    let _t = Timer::new("format_luks2_keyless");
+    let mut vk = Zeroizing::new(vec![0u8; 64]);
+    getrandom::fill(vk.as_mut_slice()).expect("OS RNG unavailable");
+    let mut dev = CryptInit::init(Path::new(path)).map_err(|_| Error::from("crypt_init failed"))?;
+    dev.context_handle()
+        .format::<()>(
+            EncryptionFormat::Luks2,
+            ("aes", "xts-plain64"),
+            None,
+            Either::Left(&vk[..]),
+            None,
+        )
+        .map_err(|e| Error(format!("crypt_format failed: {e}")))?;
+    // No keyslot is added: the VK lives only in the cache until the first
+    // enrollment wraps it. Keyed by canonical path, so the subsequent enroll
+    // call (path- or fd-based) resolves to the same entry.
+    cache_volume_key(path, VolumeKey::new(vk.to_vec()));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

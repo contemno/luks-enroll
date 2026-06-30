@@ -11,6 +11,7 @@ Run: python3 -m pytest test_luks_enroll.py -v
 
 import ast
 import glob  # noqa: F401  pre-import so sys.modules patching doesn't evict it
+import os
 import unittest
 from unittest import mock
 
@@ -155,6 +156,77 @@ class TestTokenTypeConstants(unittest.TestCase):
         self.assertEqual(gui.TOKEN_FIDO2, "systemd-fido2")
         self.assertEqual(gui.TOKEN_TPM2, "systemd-tpm2")
         self.assertEqual(gui.TOKEN_RECOVERY, "systemd-recovery")
+
+
+class TestAppVersion(unittest.TestCase):
+    """The footer version resolves to the build-time-substituted __version__,
+    else the repo VERSION floor, else 'dev' — never the raw placeholder."""
+
+    def test_source_checkout_falls_back_to_version_file(self):
+        # Imported from the repo the @VERSION@ placeholder is unsubstituted, so
+        # APP_VERSION mirrors the VERSION floor and never leaks the placeholder.
+        version_file = os.path.join(
+            os.path.dirname(GUI_PATH), "..", "..", "..", "VERSION"
+        )
+        with open(version_file) as f:
+            expected = f.read().strip()
+        self.assertEqual(gui.APP_VERSION, expected)
+        self.assertFalse(gui.APP_VERSION.startswith("@"))
+
+    def test_substituted_version_is_used_verbatim(self):
+        with mock.patch.object(gui, "__version__", "0.3.0-dev.20260627.deadbee"):
+            self.assertEqual(gui._resolve_version(), "0.3.0-dev.20260627.deadbee")
+
+    def test_unreadable_version_file_falls_back_to_dev(self):
+        with (
+            mock.patch.object(gui, "__version__", "@VERSION@"),
+            mock.patch("builtins.open", side_effect=OSError),
+        ):
+            self.assertEqual(gui._resolve_version(), "dev")
+
+
+class TestKeylessImageCreation(unittest.TestCase):
+    """Issue #58: creating an encrypted container needs no passphrase. The
+    service formats it with a cached volume key and the detail page opens
+    already unlocked, so the first enrollment wraps that key directly.
+
+    The GUI page classes subclass mocked GTK bases (so they're MagicMocks at
+    import), hence these assert on the parsed source of each class body."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        cls.classes = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(ast.parse(source, filename=GUI_PATH))
+            if isinstance(node, ast.ClassDef)
+        }
+
+    def test_detail_page_accepts_volume_key_cached(self):
+        # DeviceDetailPage gained a volume_key_cached hand-off (default off).
+        self.assertIn("volume_key_cached=False", self.classes["DeviceDetailPage"])
+
+    def test_create_page_drops_passphrase_fields(self):
+        create = self.classes["CreateImagePage"]
+        # The passphrase entry rows and their validation are gone — the user
+        # is never asked for a throwaway passphrase on create.
+        self.assertNotIn("PasswordEntryRow", create)
+        self.assertNotIn("Passphrases do not match", create)
+        self.assertNotIn("Passphrase cannot be empty", create)
+
+    def test_create_uses_empty_passphrase_and_cached_handoff(self):
+        create = self.classes["CreateImagePage"]
+        # Create with an empty passphrase (keyless format) ...
+        self.assertIn('create_encrypted_image_async(path, size_mb, "", ', create)
+        # ... then hand off to the detail page as already-unlocked.
+        self.assertIn("volume_key_cached=True", create)
+
+    def test_block_device_flow_still_uses_a_passphrase(self):
+        # Scope guard: this change is image-files-only. The block-device
+        # encrypt flow keeps its passphrase hand-off (its keyless/deferred
+        # variant is tracked separately).
+        self.assertIn("passphrase=self._pending_pw", self.classes["EncryptDevicePage"])
 
 
 class TestRunAsync(unittest.TestCase):
