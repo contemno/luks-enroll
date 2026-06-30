@@ -524,6 +524,11 @@ pub fn op_wipe_slot(
 /// the mapper name is returned in the stdout slot so the GUI can address the
 /// new mapping. Activation is additive — it adds no keyslot and removes
 /// nothing — so it cannot lock the user out.
+/// Unlike the keyslot-mutating ops (which mask failures behind a generic
+/// "Operation failed" so header internals never leak), activation failures are
+/// environmental — device-mapper access, a busy device, a sandbox denial — and
+/// carry no secret, so the real libcryptsetup error is returned to the client.
+/// Without it an activation failure is opaque on both the client and in logs.
 pub fn op_open_volume(
     device: &str,
     name: &str,
@@ -531,20 +536,24 @@ pub fn op_open_volume(
     unlock_method: &str,
     unlock_pin: &str,
 ) -> Triple {
-    run_op("OpenVolume", || {
-        luks::activate_volume(device, name, unlock_method, passphrase, unlock_pin)?;
-        Ok((true, name.to_string(), String::new()))
-    })
+    match luks::activate_volume(device, name, unlock_method, passphrase, unlock_pin) {
+        Ok(()) => (true, name.to_string(), String::new()),
+        Err(e) => {
+            eprintln!("OpenVolume failed: {e}");
+            (false, String::new(), e.0)
+        }
+    }
 }
 
 /// Tear down the dm-crypt mapping `/dev/mapper/<name>`. Returns (ok, stderr);
-/// closing an already-closed mapping is a success (idempotent).
+/// closing an already-closed mapping is a success (idempotent). Surfaces the
+/// real error for the same reason as `op_open_volume`.
 pub fn op_close_volume(name: &str) -> (bool, String) {
     match luks::deactivate_volume(name) {
         Ok(()) => (true, String::new()),
         Err(e) => {
             eprintln!("CloseVolume failed: {e}");
-            (false, "Operation failed".to_string())
+            (false, e.0)
         }
     }
 }
