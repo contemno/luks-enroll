@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use libcryptsetup_rs::consts::flags::{CryptPbkdf, CryptVolumeKey};
-use libcryptsetup_rs::consts::vals::{CryptKdf, EncryptionFormat};
+use libcryptsetup_rs::consts::flags::{CryptActivate, CryptDeactivate, CryptPbkdf, CryptVolumeKey};
+use libcryptsetup_rs::consts::vals::{CryptKdf, CryptStatusInfo, EncryptionFormat};
 use libcryptsetup_rs::{CryptDevice, CryptInit, CryptPbkdfType, Either, LibcryptErr, TokenInput};
 use zeroize::Zeroizing;
 
@@ -538,6 +538,113 @@ pub fn get_volume_key(
 }
 
 // ---------------------------------------------------------------------------
+// Activation (dm-crypt mapping)
+// ---------------------------------------------------------------------------
+
+/// Whether `name` is a valid dm-crypt mapper name. Constrained to the
+/// characters systemd-cryptsetup uses for `luks-<UUID>` plus a length cap, so
+/// the service can never be steered into a `/dev/mapper/` path escape: no `/`,
+/// no `.`, no empty name. The name becomes a device node under `/dev/mapper`,
+/// so this is a security boundary, not just a sanity check.
+pub fn valid_mapper_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Whether a dm-crypt mapping named `name` is currently set up. `Busy` counts
+/// as active (the mapping exists and is in use); only `Inactive`/`Invalid`
+/// mean there is no mapping to act on.
+pub fn mapping_is_active(name: &str) -> bool {
+    matches!(
+        libcryptsetup_rs::status(None, name),
+        Ok(CryptStatusInfo::Active | CryptStatusInfo::Busy)
+    )
+}
+
+/// Pure mount matcher over /proc/mounts text: true if any mount's source
+/// device is the mapper symlink (`/dev/mapper/<name>`) or the dm node it
+/// resolves to (`/dev/dm-N`) — the two spellings a dm-crypt mount can take.
+fn mounts_reference(proc_mounts: &str, mapper: &str, dm_node: Option<&str>) -> bool {
+    proc_mounts
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .any(|src| src == mapper || dm_node.is_some_and(|d| src == d))
+}
+
+/// Whether the dm-crypt mapping `/dev/mapper/<name>` currently has a mounted
+/// filesystem. Used to refuse deactivation that would otherwise yank a mounted
+/// volume out from under the kernel (data loss).
+pub fn mapping_is_mounted(name: &str) -> bool {
+    let mapper = format!("/dev/mapper/{name}");
+    let dm_node = std::fs::canonicalize(&mapper)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    std::fs::read_to_string("/proc/mounts")
+        .map(|m| mounts_reference(&m, &mapper, dm_node.as_deref()))
+        .unwrap_or(false)
+}
+
+/// Activate `device` as `/dev/mapper/<name>` using the volume key obtained via
+/// `unlock_method` (cache-or-extract, exactly like enroll/wipe), so a single
+/// FIDO2 tap / TPM2 unseal / argon2 pass both unlocks *and* opens the volume.
+///
+/// Idempotent: if `name` is already an active mapping this returns `Ok`
+/// without touching dm-crypt — the GUI can call it freely to ensure-open.
+/// Activation is additive (no keyslot or token changes), so it preserves the
+/// "you can never lock yourself out" guarantee.
+pub fn activate_volume(
+    device: &str,
+    name: &str,
+    unlock_method: &str,
+    passphrase: &str,
+    unlock_pin: &str,
+) -> Result<()> {
+    let _t = Timer::new("activate_volume");
+    if !valid_mapper_name(name) {
+        bail!("Invalid mapper name");
+    }
+    if mapping_is_active(name) {
+        return Ok(());
+    }
+    let vk = get_volume_key(device, unlock_method, passphrase, unlock_pin)?;
+    let mut dev = open_luks2(device)?;
+    dev.activate_handle()
+        .activate_by_volume_key(Some(name), Some(vk.as_bytes()), CryptActivate::empty())
+        .map_err(|e| Error(format!("crypt_activate_by_volume_key failed: {e}")))?;
+    Ok(())
+}
+
+/// Tear down the dm-crypt mapping `/dev/mapper/<name>`. Reconstructs a device
+/// handle from the active mapping by name (no header path needed), so the
+/// caller does not have to re-identify the backing volume. Idempotent: a
+/// non-existent mapping is treated as already closed.
+pub fn deactivate_volume(name: &str) -> Result<()> {
+    let _t = Timer::new("deactivate_volume");
+    if !valid_mapper_name(name) {
+        bail!("Invalid mapper name");
+    }
+    if !mapping_is_active(name) {
+        return Ok(());
+    }
+    // Refuse to close a mapping whose filesystem is still mounted: tearing the
+    // dm-crypt device down under a live mount loses data. The kernel also
+    // refuses (EBUSY) without a force flag, but checking first lets us return
+    // a clear, actionable message instead of a generic "device busy".
+    if mapping_is_mounted(name) {
+        bail!("The volume's filesystem is mounted; unmount it before closing");
+    }
+    let mut dev = CryptInit::init_by_name_and_header(name, None)
+        .map_err(|e| Error(format!("crypt_init_by_name failed: {e}")))?;
+    dev.activate_handle()
+        .deactivate(name, CryptDeactivate::empty())
+        .map_err(|e| Error(format!("crypt_deactivate failed: {e}")))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Mutations
 // ---------------------------------------------------------------------------
 
@@ -847,5 +954,57 @@ mod tests {
         // A missing tokens section is empty too, not a panic.
         let empty = serde_json::json!({ "keyslots": {} });
         assert!(token_type_keyslots(&empty, "systemd-tpm2").is_empty());
+    }
+
+    #[test]
+    fn mounts_reference_matches_either_spelling() {
+        let mounts = "\
+proc /proc proc rw 0 0
+/dev/sda1 /boot ext4 rw 0 0
+/dev/mapper/luks-abc /mnt/secret ext4 rw 0 0
+tmpfs /run tmpfs rw 0 0
+";
+        // Mounted via the mapper symlink spelling.
+        assert!(mounts_reference(
+            mounts,
+            "/dev/mapper/luks-abc",
+            Some("/dev/dm-3")
+        ));
+        // Mounted via the resolved dm node spelling.
+        let mounts_dm = "/dev/dm-3 /mnt/secret ext4 rw 0 0\n";
+        assert!(mounts_reference(
+            mounts_dm,
+            "/dev/mapper/luks-abc",
+            Some("/dev/dm-3")
+        ));
+        // Not mounted: neither spelling present.
+        assert!(!mounts_reference(
+            mounts,
+            "/dev/mapper/luks-other",
+            Some("/dev/dm-9")
+        ));
+        // A substring of another device must not false-match.
+        let tricky = "/dev/mapper/luks-abc-data /mnt/x ext4 rw 0 0\n";
+        assert!(!mounts_reference(
+            tricky,
+            "/dev/mapper/luks-abc",
+            Some("/dev/dm-3")
+        ));
+    }
+
+    #[test]
+    fn valid_mapper_name_rejects_path_escapes() {
+        // The accepted shape: systemd's `luks-<UUID>` plus plain identifiers.
+        assert!(valid_mapper_name(
+            "luks-1b6e8f0a-2c3d-4e5f-8091-a2b3c4d5e6f7"
+        ));
+        assert!(valid_mapper_name("my_volume"));
+        // Rejected: anything that could escape /dev/mapper or be empty.
+        assert!(!valid_mapper_name(""));
+        assert!(!valid_mapper_name("../etc/passwd"));
+        assert!(!valid_mapper_name("foo/bar"));
+        assert!(!valid_mapper_name("foo.bar"));
+        assert!(!valid_mapper_name("has space"));
+        assert!(!valid_mapper_name(&"x".repeat(129)));
     }
 }

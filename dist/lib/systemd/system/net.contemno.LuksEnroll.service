@@ -33,4 +33,14 @@ DeviceAllow=block-* rw
 DeviceAllow=char-hidraw rw
 DeviceAllow=char-tpm rw
 DeviceAllow=char-tpmrm rw
+# OpenVolume/CloseVolume activate dm-crypt mappings, which the header-only
+# enroll/wipe paths never did. crypt_activate_by_volume_key opens the
+# device-mapper control node to issue the DM_DEV_CREATE ioctl; without it the
+# device cgroup denies the open and activation fails with a generic error.
+# /dev/loop-control is needed when activating a LUKS *container file*, where
+# libcryptsetup attaches a loop device for the backing file. (PrivateDevices
+# is intentionally not set, so the resulting /dev/mapper/<name> node is created
+# in the host's device namespace and is usable system-wide.)
+DeviceAllow=/dev/mapper/control rw
+DeviceAllow=/dev/loop-control rw
 ReadWritePaths=/etc/luks-enroll.conf

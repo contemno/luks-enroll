@@ -298,6 +298,31 @@ class LuksEnrollProxy:
             callback,
         )
 
+    def open_volume(self, device, name, passphrase,
+                    unlock_method="passphrase", unlock_pin=""):
+        """Activate the volume as /dev/mapper/<name> via the cached/extracted
+        volume key. Returns (ok, mapper, stderr). Dispatches to OpenVolumeFd
+        for client-owned container files (needs a read-write fd)."""
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "OpenVolume",
+                GLib.Variant("(sssss)", (device, name, passphrase,
+                                         unlock_method, unlock_pin)),
+                Gio.DBusCallFlags.NONE, 120000, None),
+            "OpenVolumeFd", "(hssss)", device,
+            (name, passphrase, unlock_method, unlock_pin), 120000,
+        )  # (bool, str, str)
+
+    def close_volume(self, name):
+        """Tear down the dm-crypt mapping /dev/mapper/<name>. Path-independent
+        (the name alone identifies the mapping). Returns (ok, stderr)."""
+        result = self.proxy.call_sync(
+            "CloseVolume",
+            GLib.Variant("(s)", (name,)),
+            Gio.DBusCallFlags.NONE, 60000, None,
+        )
+        return result.unpack()  # (bool, str)
+
     def enroll_fido2(self, device, passphrase, pin, fido2_device,
                      unlock_method="passphrase", unlock_pin=""):
         return self._call_path_or_fd_sync(
@@ -546,6 +571,28 @@ def detect_tpm2_device():
         return " — ".join(desc_parts) if desc_parts else "TPM2 detected"
     except (OSError, IOError):
         return "TPM2 detected"
+
+
+def derive_mapper_name(device, uuid):
+    """dm-crypt mapper name for OpenVolume. Prefer the LUKS2 UUID
+    (systemd-cryptsetup's /dev/mapper/luks-<UUID> convention); fall back to the
+    device basename so the Open button still works when the service reports no
+    UUID (e.g. an older service build). Constrained to the charset the
+    service's valid_mapper_name accepts."""
+    base = uuid or os.path.basename(device) or "volume"
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in base)
+    return "luks-" + (safe or "volume")
+
+
+def mount_references(proc_mounts, mapper, dm_node):
+    """True if any mount source in /proc/mounts text is the mapper symlink or
+    the dm node it resolves to — i.e. the mapping has a mounted filesystem.
+    The service refuses to close such a mapping; this is only a UI hint."""
+    for line in proc_mounts.splitlines():
+        src = line.split(" ", 1)[0] if line else ""
+        if src and (src == mapper or (dm_node and src == dm_node)):
+            return True
+    return False
 
 
 # TPM2 PCR descriptions, used by the TPM2 enrollment page.
@@ -1411,6 +1458,33 @@ class DeviceDetailPage(Adw.NavigationPage):
             open_row.set_activatable_widget(open_btn)
             self._info_group.add(open_row)
 
+        # --- Volume mapping group (Open/Close, hidden until unlocked) ---
+        # Lets the user actively map the volume (crypt_activate_by_volume_key)
+        # so the host can mount the filesystem inside — useful on distros that
+        # only offer passphrase unlock at boot (issue #69).
+        self._mapper_name = None
+        # An in-flight open/close suppresses the mount poll so it can't reset
+        # the spinner/button mid-operation; the poll keeps the mounted hint
+        # live when the filesystem is (un)mounted outside this app.
+        self._mapping_busy = False
+        self._mapping_poll_id = None
+        self.connect("destroy", lambda _: self._stop_mapping_poll())
+        self._mapping_group = Adw.PreferencesGroup(
+            title="Volume Mapping",
+            description="Map the volume so the filesystem inside can be mounted.",
+        )
+        self._mapping_group.set_visible(False)
+        self._mapping_row = Adw.ActionRow(title="Mapping")
+        self._mapping_btn = Gtk.Button()
+        self._mapping_btn.set_valign(Gtk.Align.CENTER)
+        self._mapping_btn.connect("clicked", lambda _: self._on_mapping_clicked())
+        self._mapping_spinner = Gtk.Spinner()
+        self._mapping_spinner.set_valign(Gtk.Align.CENTER)
+        self._mapping_row.add_suffix(self._mapping_spinner)
+        self._mapping_row.add_suffix(self._mapping_btn)
+        self._mapping_group.add(self._mapping_row)
+        self._prefs_page.add(self._mapping_group)
+
         # --- Enrollments group (hidden until unlocked) ---
         self._enrollments_group = Adw.PreferencesGroup(title="Current Enrollments")
         self._enrollments_group.set_visible(False)
@@ -1748,6 +1822,120 @@ class DeviceDetailPage(Adw.NavigationPage):
             row_fs = Adw.ActionRow(title="Filesystem", subtitle=info["filesystem"])
             self._add_row(self._info_group, row_fs, "info:fs")
 
+        # Choose the dm-crypt mapper name. Prefer the LUKS2 UUID, matching
+        # systemd-cryptsetup's /dev/mapper/luks-<UUID> convention; fall back to
+        # a name derived from the device path so the Open button still works
+        # when the service doesn't report a UUID (e.g. an older service build).
+        self._mapper_name = derive_mapper_name(self.device, info.get("uuid") or "")
+        self._refresh_mapping_state()
+
+    def _mapper_path(self):
+        return "/dev/mapper/" + self._mapper_name if self._mapper_name else None
+
+    def _mapping_is_mounted(self):
+        """Whether the open mapping has a mounted filesystem. UI hint only —
+        the service is the authority and refuses to close a mounted mapping."""
+        mapper = self._mapper_path()
+        if not mapper:
+            return False
+        try:
+            dm_node = os.path.realpath(mapper)
+        except OSError:
+            dm_node = None
+        try:
+            with open("/proc/mounts") as f:
+                mounts = f.read()
+        except OSError:
+            return False
+        return mount_references(mounts, mapper, dm_node)
+
+    def _start_mapping_poll(self):
+        """Poll mapping/mount state every 2 s so the open/closed and mounted
+        indicators stay live when the volume is mapped or its filesystem is
+        (un)mounted from another app (e.g. Files/Disks)."""
+        if self._mapping_poll_id is None:
+            self._mapping_poll_id = GLib.timeout_add_seconds(
+                2, self._poll_mapping_state
+            )
+
+    def _stop_mapping_poll(self):
+        if self._mapping_poll_id is not None:
+            GLib.source_remove(self._mapping_poll_id)
+            self._mapping_poll_id = None
+
+    def _poll_mapping_state(self):
+        # Skip while an open/close is in flight (don't fight its spinner).
+        if not self._mapping_busy:
+            self._refresh_mapping_state()
+        return GLib.SOURCE_CONTINUE
+
+    def _refresh_mapping_state(self):
+        """Show the mapping group and set the button to Open or Close based on
+        whether /dev/mapper/<name> is currently present, and reflect whether
+        its filesystem is mounted."""
+        name = self._mapper_name
+        if not name:
+            self._mapping_group.set_visible(False)
+            self._stop_mapping_poll()
+            return
+        self._mapping_spinner.stop()
+        self._mapping_btn.set_sensitive(True)
+        is_open = os.path.exists(self._mapper_path())
+        if is_open:
+            if self._mapping_is_mounted():
+                self._mapping_row.set_subtitle("Mounted — unmount before closing")
+            else:
+                self._mapping_row.set_subtitle(f"Open at /dev/mapper/{name}")
+            self._mapping_btn.set_label("Close")
+            self._mapping_btn.remove_css_class("suggested-action")
+            self._mapping_btn.add_css_class("destructive-action")
+        else:
+            self._mapping_row.set_subtitle("Closed")
+            self._mapping_btn.set_label("Open")
+            self._mapping_btn.remove_css_class("destructive-action")
+            self._mapping_btn.add_css_class("suggested-action")
+        self._start_mapping_poll()
+        self._mapping_group.set_visible(True)
+
+    def _on_mapping_clicked(self):
+        """Open or close the dm-crypt mapping, depending on current state."""
+        name = self._mapper_name
+        if not name:
+            return
+        is_open = os.path.exists(self._mapper_path())
+        self._mapping_busy = True
+        self._mapping_btn.set_sensitive(False)
+        self._mapping_spinner.start()
+
+        def work():
+            ok = False
+            err = ""
+            try:
+                if is_open:
+                    ok, err = self.svc.close_volume(name)
+                else:
+                    ok, _mapper, err = self.svc.open_volume(
+                        self.device, name, self.passphrase or "",
+                        self.unlock_method, self.unlock_pin,
+                    )
+            except GLib.Error as e:
+                ok, err = False, e.message
+            GLib.idle_add(self._on_mapping_done, ok, err)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_mapping_done(self, ok, err):
+        self._mapping_busy = False
+        self._mapping_spinner.stop()
+        if not ok:
+            win = self.get_root()
+            dialog = Adw.AlertDialog(
+                heading="Mapping Failed",
+                body=err or "The volume mapping operation failed.",
+            )
+            dialog.add_response("ok", "OK")
+            dialog.present(win)
+        self._refresh_mapping_state()
 
     def _apply_enrollments(self, tokens, pw_slots):
         """List all current enrollments from pre-fetched data."""

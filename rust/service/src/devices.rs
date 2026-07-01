@@ -147,6 +147,10 @@ pub fn get_device_info(device: &str) -> Value {
         "removable": is_removable(device),
         "mount_point": mount_point,
         "filesystem": blkid_tag(device, "TYPE").unwrap_or_default(),
+        // LUKS2 header UUID. The client derives the default dm-crypt mapper
+        // name (`luks-<UUID>`, matching systemd-cryptsetup) for OpenVolume,
+        // and reflects open/closed state by checking /dev/mapper/<name>.
+        "uuid": blkid_tag(device, "UUID").unwrap_or_default(),
     })
 }
 
@@ -208,6 +212,11 @@ pub fn blkid_tag(device: &str, tag: &str) -> Option<String> {
         .set_superblock_flags(BlkidSublksFlags::new(vec![
             BlkidSublks::Label,
             BlkidSublks::Type,
+            // UUID must be requested explicitly, or lookup_value("UUID")
+            // returns nothing — which is why GetDeviceInfo's `uuid` field came
+            // back empty and the client's mapper-name fell back to the device
+            // basename instead of the systemd `luks-<UUID>` convention.
+            BlkidSublks::Uuid,
         ]))
         .ok()?;
     if !matches!(probe.do_safeprobe(), Ok(BlkidSafeprobeRet::Success)) {

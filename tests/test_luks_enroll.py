@@ -274,5 +274,115 @@ class TestRunAsync(unittest.TestCase):
         self.assertEqual(captured, [(cb, False, "", "D-Bus error: nope")])
 
 
+class TestVolumeMappingProxy(unittest.TestCase):
+    """OpenVolume/CloseVolume proxy wrappers (issue #69): correct D-Bus method
+    names, signatures, and path-vs-fd dispatch."""
+
+    @staticmethod
+    def _proxy():
+        # Build a proxy instance without running __init__ (which would try to
+        # connect to the bus); the wrappers only touch .proxy / helpers.
+        return gui.LuksEnrollProxy.__new__(gui.LuksEnrollProxy)
+
+    def test_open_volume_uses_fd_variant_and_signature(self):
+        proxy = self._proxy()
+        captured = {}
+
+        def fake_dispatch(path_call, method_fd, fd_sig, device, extra_args, timeout):
+            captured.update(
+                method_fd=method_fd, fd_sig=fd_sig, device=device, extra_args=extra_args
+            )
+            return (True, "luks-uuid", "")
+
+        proxy._call_path_or_fd_sync = fake_dispatch
+        ok, mapper, err = proxy.open_volume(
+            "/dev/sdb1", "luks-uuid", "pw", "systemd-fido2", "1234"
+        )
+        self.assertEqual((ok, mapper, err), (True, "luks-uuid", ""))
+        self.assertEqual(captured["method_fd"], "OpenVolumeFd")
+        # fd path: index + name + passphrase + unlock_method + unlock_pin.
+        self.assertEqual(captured["fd_sig"], "(hssss)")
+        self.assertEqual(captured["device"], "/dev/sdb1")
+        self.assertEqual(
+            captured["extra_args"], ("luks-uuid", "pw", "systemd-fido2", "1234")
+        )
+
+    def test_close_volume_unpacks_proxy_result(self):
+        proxy = self._proxy()
+
+        class FakeResult:
+            def unpack(self):
+                return (True, "")
+
+        class FakeProxy:
+            def __init__(self):
+                self.calls = []
+
+            def call_sync(self, method, *args, **kwargs):
+                self.calls.append(method)
+                return FakeResult()
+
+        proxy.proxy = FakeProxy()
+        self.assertEqual(proxy.close_volume("luks-uuid"), (True, ""))
+        self.assertEqual(proxy.proxy.calls, ["CloseVolume"])
+
+
+class TestMapperNameDerivation(unittest.TestCase):
+    """The Volume Mapping button must appear even when the service reports no
+    UUID (older service build), so the name derivation falls back to the
+    device path instead of disabling the control (PR #70 review)."""
+
+    @staticmethod
+    def _derive(device, uuid):
+        return gui.derive_mapper_name(device, uuid)
+
+    def test_prefers_uuid(self):
+        self.assertEqual(self._derive("/dev/sdb1", "1b6e-2c3d"), "luks-1b6e-2c3d")
+
+    def test_falls_back_to_device_basename_when_no_uuid(self):
+        # No UUID -> still a valid, non-None name so the button shows.
+        self.assertEqual(self._derive("/dev/sdb1", ""), "luks-sdb1")
+
+    def test_fallback_sanitizes_to_dm_name_charset(self):
+        name = self._derive("/home/user/My Secret.img", "")
+        self.assertTrue(name.startswith("luks-"))
+        # Only the dm-crypt charset the service's valid_mapper_name accepts.
+        self.assertTrue(all(c.isalnum() or c in "-_" for c in name))
+
+
+class TestMountReferences(unittest.TestCase):
+    """The client's mounted-state hint mirrors the service's data-loss guard:
+    a mapping with a mounted filesystem must be recognized so it can be flagged
+    (and the service refuses to close it)."""
+
+    MOUNTS = (
+        "proc /proc proc rw 0 0\n"
+        "/dev/sda1 /boot ext4 rw 0 0\n"
+        "/dev/mapper/luks-abc /mnt/secret ext4 rw 0 0\n"
+    )
+
+    def test_matches_mapper_spelling(self):
+        self.assertTrue(
+            gui.mount_references(self.MOUNTS, "/dev/mapper/luks-abc", "/dev/dm-3")
+        )
+
+    def test_matches_resolved_dm_node(self):
+        mounts = "/dev/dm-3 /mnt/secret ext4 rw 0 0\n"
+        self.assertTrue(
+            gui.mount_references(mounts, "/dev/mapper/luks-abc", "/dev/dm-3")
+        )
+
+    def test_no_match_when_not_mounted(self):
+        self.assertFalse(
+            gui.mount_references(self.MOUNTS, "/dev/mapper/luks-other", "/dev/dm-9")
+        )
+
+    def test_substring_device_does_not_false_match(self):
+        mounts = "/dev/mapper/luks-abc-data /mnt/x ext4 rw 0 0\n"
+        self.assertFalse(
+            gui.mount_references(mounts, "/dev/mapper/luks-abc", "/dev/dm-3")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

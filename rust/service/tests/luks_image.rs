@@ -430,3 +430,118 @@ fn verify_passphrase_primes_volume_key_cache() {
     assert!(slot >= 0);
     assert!(luks::get_volume_key(&img, "passphrase", "definitely-wrong", "").is_ok());
 }
+
+/// GetDeviceInfo must surface the LUKS2 UUID so the client can build the
+/// `luks-<UUID>` mapper name. Regression for the #70 review: the underlying
+/// blkid probe only requested LABEL/TYPE, so the UUID came back empty and the
+/// Open button fell back to the device-basename name.
+#[test]
+fn device_info_reports_luks_uuid() {
+    use luks_enroll_service::devices;
+
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
+
+    let info = devices::get_device_info(&img);
+    let uuid = info.get("uuid").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(!uuid.is_empty(), "GetDeviceInfo should report a LUKS UUID");
+    // Canonical UUID shape: 36 chars, 8-4-4-4-12 hex groups.
+    let groups: Vec<&str> = uuid.split('-').collect();
+    assert_eq!(
+        groups.len(),
+        5,
+        "UUID should have five dash-separated groups"
+    );
+    assert_eq!(
+        groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+        vec![8, 4, 4, 4, 12],
+        "UUID groups should be 8-4-4-4-12"
+    );
+    assert!(
+        uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+        "UUID should be hex digits and dashes only"
+    );
+}
+
+/// OpenVolume must reject a mapper name that could escape /dev/mapper before
+/// it ever touches dm-crypt — the validation happens up front, so this needs
+/// no root and asserts the security boundary at the op entry point.
+#[test]
+fn open_volume_rejects_invalid_mapper_name() {
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
+
+    let (ok, mapper, _err) =
+        service::op_open_volume(&img, "../escape", PASSPHRASE, "passphrase", "");
+    assert!(!ok, "a path-escaping mapper name must be refused");
+    assert!(mapper.is_empty());
+
+    // An empty name is refused too (it would be an invalid dm node).
+    let (ok, _, _) = service::op_open_volume(&img, "", PASSPHRASE, "passphrase", "");
+    assert!(!ok);
+}
+
+/// Closing a mapping that does not exist is a success (idempotent) and refuses
+/// an invalid name. Guarded behind root because `crypt_status` needs access to
+/// the device-mapper control node.
+#[test]
+fn close_volume_is_idempotent_and_validates_name() {
+    if !nix::unistd::Uid::effective().is_root() {
+        eprintln!("not root; skipping CloseVolume idempotency test (needs dm control node)");
+        return;
+    }
+    // Never-mapped name -> already closed -> ok.
+    let (ok, err) = service::op_close_volume("luks-enroll-test-nonexistent-mapping");
+    assert!(ok, "closing a non-existent mapping should succeed: {err}");
+
+    // Invalid name -> refused.
+    let (ok, _) = service::op_close_volume("../escape");
+    assert!(!ok);
+}
+
+/// Full activate -> verify mapping -> deactivate roundtrip against a real
+/// LUKS2 image. Requires root (loop-device + dm-crypt setup), so it is
+/// `#[ignore]`d in the default run; CI's privileged leg runs it explicitly:
+///   sudo -E cargo test -p luks-enroll-service --test luks_image -- \
+///     --ignored open_close_volume_roundtrip
+#[test]
+#[ignore = "requires root: loop-device + dm-crypt activation"]
+fn open_close_volume_roundtrip() {
+    if !nix::unistd::Uid::effective().is_root() {
+        eprintln!("not root; skipping open/close roundtrip");
+        return;
+    }
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
+    // Unique, valid mapper name for this test run.
+    let name = format!("luks-enroll-test-{}", std::process::id());
+    let mapper_path = format!("/dev/mapper/{name}");
+
+    // Open: activates /dev/mapper/<name> from the volume key.
+    let (ok, mapper, err) = service::op_open_volume(&img, &name, PASSPHRASE, "passphrase", "");
+    assert!(ok, "open failed: {err}");
+    assert_eq!(mapper, name);
+    assert!(luks::mapping_is_active(&name), "mapping should be active");
+    assert!(
+        std::path::Path::new(&mapper_path).exists(),
+        "{mapper_path} should exist after open"
+    );
+    // Freshly opened, nothing mounted on it -> close is allowed.
+    assert!(
+        !luks::mapping_is_mounted(&name),
+        "a freshly opened mapping has no mounted filesystem"
+    );
+
+    // Re-open is idempotent: still ok, still one mapping.
+    let (ok, _, err) = service::op_open_volume(&img, &name, PASSPHRASE, "passphrase", "");
+    assert!(ok, "idempotent re-open failed: {err}");
+
+    // Close: tears the mapping down.
+    let (ok, err) = service::op_close_volume(&name);
+    assert!(ok, "close failed: {err}");
+    assert!(!luks::mapping_is_active(&name), "mapping should be gone");
+    assert!(
+        !std::path::Path::new(&mapper_path).exists(),
+        "{mapper_path} should be removed after close"
+    );
+}

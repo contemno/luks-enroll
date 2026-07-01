@@ -519,6 +519,45 @@ pub fn op_wipe_slot(
     })
 }
 
+/// Activate `device` as `/dev/mapper/<name>` using the volume key reached
+/// through `unlock_method` (any enrolled method, via the VK cache). On success
+/// the mapper name is returned in the stdout slot so the GUI can address the
+/// new mapping. Activation is additive — it adds no keyslot and removes
+/// nothing — so it cannot lock the user out.
+/// Unlike the keyslot-mutating ops (which mask failures behind a generic
+/// "Operation failed" so header internals never leak), activation failures are
+/// environmental — device-mapper access, a busy device, a sandbox denial — and
+/// carry no secret, so the real libcryptsetup error is returned to the client.
+/// Without it an activation failure is opaque on both the client and in logs.
+pub fn op_open_volume(
+    device: &str,
+    name: &str,
+    passphrase: &str,
+    unlock_method: &str,
+    unlock_pin: &str,
+) -> Triple {
+    match luks::activate_volume(device, name, unlock_method, passphrase, unlock_pin) {
+        Ok(()) => (true, name.to_string(), String::new()),
+        Err(e) => {
+            eprintln!("OpenVolume failed: {e}");
+            (false, String::new(), e.0)
+        }
+    }
+}
+
+/// Tear down the dm-crypt mapping `/dev/mapper/<name>`. Returns (ok, stderr);
+/// closing an already-closed mapping is a success (idempotent). Surfaces the
+/// real error for the same reason as `op_open_volume`.
+pub fn op_close_volume(name: &str) -> (bool, String) {
+    match luks::deactivate_volume(name) {
+        Ok(()) => (true, String::new()),
+        Err(e) => {
+            eprintln!("CloseVolume failed: {e}");
+            (false, e.0)
+        }
+    }
+}
+
 pub fn op_create_encrypted_image(
     real_path: &str,
     size_mb: i32,
@@ -798,6 +837,45 @@ impl LuksEnrollService {
             },
         )
         .await
+    }
+
+    #[zbus(name = "OpenVolume")]
+    #[allow(clippy::too_many_arguments)]
+    async fn open_volume(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
+        device: String,
+        name: String,
+        passphrase: String,
+        unlock_method: String,
+        unlock_pin: String,
+    ) -> Result<Triple, SvcError> {
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[&name, &passphrase, &unlock_method, &unlock_pin],
+            )
+            .await?;
+        blocking(move || op_open_volume(&device, &name, &passphrase, &unlock_method, &unlock_pin))
+            .await
+    }
+
+    #[zbus(name = "CloseVolume")]
+    async fn close_volume(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+    ) -> Result<(bool, String), SvcError> {
+        // No device path: closing a mapping is gated by the manage polkit
+        // action (there is no file to fall back on for the ownership skip).
+        self.gate(conn, &hdr, AuthKind::Manage, None, false).await?;
+        Self::check_lens(&[&name])?;
+        blocking(move || op_close_volume(&name)).await
     }
 
     #[zbus(name = "EnrollFido2")]
@@ -1187,6 +1265,32 @@ impl LuksEnrollService {
                 }
             },
         )
+        .await
+    }
+
+    #[zbus(name = "OpenVolumeFd")]
+    async fn open_volume_fd(
+        &self,
+        fd: OwnedFd,
+        name: String,
+        passphrase: String,
+        unlock_method: String,
+        unlock_pin: String,
+    ) -> Result<Triple, SvcError> {
+        // A read-write descriptor: a dm-crypt mapping over the container is
+        // writable, so the host can mount and write through it.
+        Self::check_fd(&fd, true, false)?;
+        Self::check_lens(&[&name, &passphrase, &unlock_method, &unlock_pin])?;
+        self.touch_idle();
+        blocking(move || {
+            op_open_volume(
+                &fd_path(&fd),
+                &name,
+                &passphrase,
+                &unlock_method,
+                &unlock_pin,
+            )
+        })
         .await
     }
 
