@@ -558,6 +558,22 @@ pub fn op_close_volume(name: &str) -> (bool, String) {
     }
 }
 
+/// Tear down every dm-crypt mapping whose loop device is backed by the file
+/// identified by `(dev, ino)` — the fd-only close path for client-owned
+/// container files. The mapping set is discovered from the kernel's loop
+/// attach records, never from a caller-supplied name. Zero matches is an
+/// idempotent success with an empty `closed` slot. Surfaces the real error
+/// for the same reason as `op_open_volume`.
+pub fn op_close_volume_fd(dev: u64, ino: u64) -> Triple {
+    match luks::deactivate_volumes_backed_by(dev, ino) {
+        Ok(names) => (true, names.join(" "), String::new()),
+        Err(e) => {
+            eprintln!("CloseVolumeFd failed: {e}");
+            (false, String::new(), e.0)
+        }
+    }
+}
+
 pub fn op_create_encrypted_image(
     real_path: &str,
     size_mb: i32,
@@ -1299,6 +1315,25 @@ impl LuksEnrollService {
             )
         })
         .await
+    }
+
+    /// Close every dm-crypt mapping backed by the container file `fd`.
+    /// Possession of a writable descriptor is the authorization (no polkit),
+    /// mirroring `OpenVolumeFd`: write access to the backing file already
+    /// grants arbitrary corruption of the volume, so tearing its mappings
+    /// down is strictly less power. The mapping set is discovered from the
+    /// kernel's loop attach records by inode — never from a caller-supplied
+    /// name — so there is nothing to validate or forge.
+    #[zbus(name = "CloseVolumeFd")]
+    async fn close_volume_fd(&self, fd: OwnedFd) -> Result<Triple, SvcError> {
+        // Read-write and regular-only: read access to a shared container
+        // must not grant teardown, and block devices keep the polkit-gated
+        // CloseVolume (there is no loop backing file to compare against).
+        Self::check_fd(&fd, true, true)?;
+        self.touch_idle();
+        let st = nix::sys::stat::fstat(&fd)
+            .map_err(|_| SvcError::InvalidArgs("Invalid file descriptor".into()))?;
+        blocking(move || op_close_volume_fd(st.st_dev, st.st_ino)).await
     }
 
     #[zbus(name = "EnrollFido2Fd")]

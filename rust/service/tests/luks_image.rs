@@ -501,9 +501,10 @@ fn close_volume_is_idempotent_and_validates_name() {
 
 /// Full activate -> verify mapping -> deactivate roundtrip against a real
 /// LUKS2 image. Requires root (loop-device + dm-crypt setup), so it is
-/// `#[ignore]`d in the default run; CI's privileged leg runs it explicitly:
-///   sudo -E cargo test -p luks-enroll-service --test luks_image -- \
-///     --ignored open_close_volume_roundtrip
+/// `#[ignore]`d in the default run; the CI `swtpm` job's dm-crypt step runs
+/// every `#[ignore]`d test in this file as root:
+///   sudo -E env "PATH=$PATH" cargo test -p luks-enroll-service \
+///     --test luks_image -- --ignored
 #[test]
 #[ignore = "requires root: loop-device + dm-crypt activation"]
 fn open_close_volume_roundtrip() {
@@ -544,4 +545,115 @@ fn open_close_volume_roundtrip() {
         !std::path::Path::new(&mapper_path).exists(),
         "{mapper_path} should be removed after close"
     );
+}
+
+/// The fd-only close path must select exactly the LUKS dm-crypt mappings
+/// whose loop device is backed by the target file: a different device or
+/// inode is excluded, a foreign dm holder (LVM) or a non-LUKS cryptsetup
+/// subsystem (verity, plain) over the right loop is never touched, and two
+/// loops over the same file are both found, sorted and deduplicated. Pure —
+/// no root, no devices.
+#[test]
+fn crypt_mappings_backed_by_selects_only_matching_crypt_holders() {
+    use luks_enroll_service::luks::{DmHolder, LoopSnapshot};
+    let holder = |uuid: &str, name: &str| DmHolder {
+        dm_uuid: uuid.into(),
+        dm_name: name.into(),
+    };
+    let loops = vec![
+        LoopSnapshot {
+            backing_dev: 5,
+            backing_ino: 100,
+            holders: vec![holder("CRYPT-LUKS2-aaaa-luks-a", "luks-a")],
+        },
+        // The same file attached to a second loop, with its own mapping.
+        LoopSnapshot {
+            backing_dev: 5,
+            backing_ino: 100,
+            holders: vec![holder("CRYPT-LUKS2-bbbb-luks-b", "luks-b")],
+        },
+        // Same inode number on a different filesystem: not our file.
+        LoopSnapshot {
+            backing_dev: 6,
+            backing_ino: 100,
+            holders: vec![holder("CRYPT-LUKS2-cccc-luks-c", "luks-c")],
+        },
+        // A different file on the same filesystem: not our file.
+        LoopSnapshot {
+            backing_dev: 5,
+            backing_ino: 101,
+            holders: vec![holder("CRYPT-LUKS2-dddd-luks-d", "luks-d")],
+        },
+        // A foreign (LVM) holder over the target file: never torn down.
+        LoopSnapshot {
+            backing_dev: 5,
+            backing_ino: 100,
+            holders: vec![holder("LVM-deadbeef", "vg0-lv0")],
+        },
+        // cryptsetup's non-LUKS subsystems over the target file (verity,
+        // integrity, plain): also out of scope for this close path.
+        LoopSnapshot {
+            backing_dev: 5,
+            backing_ino: 100,
+            holders: vec![
+                holder("CRYPT-VERITY-eeee-vroot", "vroot"),
+                holder("CRYPT-PLAIN-plain0", "plain0"),
+            ],
+        },
+    ];
+    assert_eq!(
+        luks::crypt_mappings_backed_by(5, 100, &loops),
+        ["luks-a", "luks-b"]
+    );
+    assert!(luks::crypt_mappings_backed_by(9, 9, &loops).is_empty());
+}
+
+/// CloseVolumeFd over a file that backs no loop device is an idempotent
+/// success with an empty closed list — the fd-only mirror of CloseVolume's
+/// closing-a-non-existent-mapping semantics. Discovery is pure sysfs
+/// reading, so this needs no root.
+#[test]
+fn close_volume_fd_with_unmapped_file_is_idempotent_success() {
+    use std::os::linux::fs::MetadataExt;
+    let dir = tmpdir();
+    let path = dir.path().join("unmapped.img");
+    std::fs::write(&path, b"not a mapped container").unwrap();
+    let md = std::fs::metadata(&path).unwrap();
+
+    let (ok, closed, err) = service::op_close_volume_fd(md.st_dev(), md.st_ino());
+    assert!(ok, "closing an unmapped file should succeed: {err}");
+    assert!(closed.is_empty(), "nothing should have been closed");
+    assert!(err.is_empty());
+}
+
+/// Fd-only close, end to end: open a mapping over a container file, then
+/// close it via discovery from the backing file's identity alone (no name
+/// crosses the boundary), asserting the discovered name matches and the
+/// mapping is gone. Requires root (loop-device + dm-crypt setup), so it is
+/// `#[ignore]`d in the default run; CI's privileged leg runs it (see
+/// `open_close_volume_roundtrip`).
+#[test]
+#[ignore = "requires root: loop-device + dm-crypt activation"]
+fn close_volume_fd_discovers_and_closes_mapping() {
+    if !nix::unistd::Uid::effective().is_root() {
+        eprintln!("not root; skipping fd-close discovery roundtrip");
+        return;
+    }
+    use std::os::linux::fs::MetadataExt;
+    let dir = tmpdir();
+    let img = new_luks_image(&dir);
+    let name = format!("luks-enroll-test-fd-{}", std::process::id());
+
+    let (ok, _, err) = service::op_open_volume(&img, &name, PASSPHRASE, "passphrase", "");
+    assert!(ok, "open failed: {err}");
+    assert!(luks::mapping_is_active(&name), "mapping should be active");
+
+    let md = std::fs::metadata(&img).unwrap();
+    let (ok, closed, err) = service::op_close_volume_fd(md.st_dev(), md.st_ino());
+    assert!(ok, "fd close failed: {err}");
+    assert_eq!(
+        closed, name,
+        "discovery should find exactly the opened mapping"
+    );
+    assert!(!luks::mapping_is_active(&name), "mapping should be gone");
 }

@@ -12,6 +12,7 @@ Run: python3 -m pytest test_luks_enroll.py -v
 import ast
 import glob  # noqa: F401  pre-import so sys.modules patching doesn't evict it
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -382,7 +383,7 @@ class TestVolumeMappingProxy(unittest.TestCase):
             captured["extra_args"], ("luks-uuid", "pw", "systemd-fido2", "1234")
         )
 
-    def test_close_volume_unpacks_proxy_result(self):
+    def test_close_volume_block_device_uses_polkit_gated_close(self):
         proxy = self._proxy()
 
         class FakeResult:
@@ -398,8 +399,103 @@ class TestVolumeMappingProxy(unittest.TestCase):
                 return FakeResult()
 
         proxy.proxy = FakeProxy()
-        self.assertEqual(proxy.close_volume("luks-uuid"), (True, ""))
+        # A block device is not a regular file, so the fd path is skipped.
+        self.assertEqual(proxy.close_volume("/dev/sdb1", "luks-uuid"), (True, ""))
         self.assertEqual(proxy.proxy.calls, ["CloseVolume"])
+
+    def test_close_volume_container_file_uses_fd_discovery(self):
+        # A container file routes to CloseVolumeFd: fd-only signature, no
+        # mapper name crosses the boundary, and the (ok, closed, stderr)
+        # triple collapses to the (ok, stderr) pair callers expect.
+        proxy = self._proxy()
+        captured = {}
+
+        def fake_fd_sync(method_fd, signature, fd, extra_args, timeout):
+            os.fstat(fd)  # the fd must be open and valid at call time
+            captured.update(
+                method_fd=method_fd, signature=signature, fd=fd, extra_args=extra_args
+            )
+            return (True, "luks-uuid", "")
+
+        proxy._call_fd_sync = fake_fd_sync
+        with tempfile.NamedTemporaryFile() as img:
+            self.assertEqual(proxy.close_volume(img.name, "luks-uuid"), (True, ""))
+            # close_volume owns the fd lifecycle (_call_fd_sync must not
+            # close it): after returning, the fd is closed exactly once.
+            with self.assertRaises(OSError):
+                os.fstat(captured["fd"])
+        self.assertEqual(captured["method_fd"], "CloseVolumeFd")
+        self.assertEqual(captured["signature"], "(h)")
+        self.assertEqual(captured["extra_args"], ())
+
+    def test_close_volume_falls_back_when_service_lacks_the_method(self):
+        # An installed service older than CloseVolumeFd raises UnknownMethod;
+        # the client must fall back to the polkit-gated CloseVolume rather
+        # than surface an error (service/client version skew).
+        proxy = self._proxy()
+
+        class FakeGError(Exception):
+            pass
+
+        class FakeResult:
+            def unpack(self):
+                return (True, "")
+
+        class FakeProxy:
+            def __init__(self):
+                self.calls = []
+
+            def call_sync(self, method, *args, **kwargs):
+                self.calls.append(method)
+                return FakeResult()
+
+        def raise_unknown(*args, **kwargs):
+            raise FakeGError("no such method")
+
+        proxy.proxy = FakeProxy()
+        proxy._call_fd_sync = raise_unknown
+        with (
+            mock.patch.object(gui.GLib, "Error", FakeGError),
+            mock.patch.object(
+                gui.Gio.DBusError,
+                "get_remote_error",
+                return_value="org.freedesktop.DBus.Error.UnknownMethod",
+            ),
+            tempfile.NamedTemporaryFile() as img,
+        ):
+            self.assertEqual(proxy.close_volume(img.name, "luks-uuid"), (True, ""))
+        self.assertEqual(proxy.proxy.calls, ["CloseVolume"])
+
+    def test_close_volume_reraises_other_dbus_errors(self):
+        # Only UnknownMethod triggers the fallback; a real failure (denied,
+        # timeout, ...) must propagate, not silently retry with polkit.
+        proxy = self._proxy()
+
+        class FakeGError(Exception):
+            pass
+
+        def raise_failure(*args, **kwargs):
+            raise FakeGError("operation failed")
+
+        proxy._call_fd_sync = raise_failure
+        with (
+            mock.patch.object(gui.GLib, "Error", FakeGError),
+            mock.patch.object(
+                gui.Gio.DBusError,
+                "get_remote_error",
+                return_value="org.freedesktop.DBus.Error.Failed",
+            ),
+            tempfile.NamedTemporaryFile() as img,
+        ):
+            with self.assertRaises(FakeGError):
+                proxy.close_volume(img.name, "luks-uuid")
+
+    def test_is_unknown_method_matches_only_the_dbus_unknown_method_name(self):
+        self.assertTrue(
+            gui.is_unknown_method("org.freedesktop.DBus.Error.UnknownMethod")
+        )
+        self.assertFalse(gui.is_unknown_method("org.freedesktop.DBus.Error.Failed"))
+        self.assertFalse(gui.is_unknown_method(None))
 
 
 class TestMapperNameDerivation(unittest.TestCase):

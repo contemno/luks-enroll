@@ -116,8 +116,9 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
   docs (lint/test/rust skip); `rust/**` → Rust jobs; `*.py` / `tests/**` → Python jobs;
   anything else → both. Keep diffs scoped so the right checks run.
 - The Rust check fans out into two **parallel, cached** jobs — `rust-build`
-  (fmt/clippy/build/`cargo test --workspace`) and `swtpm` (the TPM2 seal/unseal roundtrips
-  against `swtpm`) — aggregated by the required `rust` check, which passes only if both do, so
+  (fmt/clippy/build/`cargo test --workspace`) and `swtpm` (the privileged roundtrips: TPM2
+  seal/unseal against `swtpm`, plus the root dm-crypt open/close tests from
+  `rust/service/tests/luks_image.rs`) — aggregated by the required `rust` check, which passes only if both do, so
   TPM failures still gate merges with no branch-protection change. Both share a
   `Swatinem/rust-cache` workspace (cargo registry + `rust/target`, keyed on `rust/Cargo.lock`).
   `swtpm` runs on every `rust/**` change (not path-gated): it's the only real-TPM coverage and
