@@ -1,0 +1,178 @@
+name: PR test build
+
+# Label-driven test build for manual testing BEFORE a PR merges to dev.
+#
+# A maintainer applies the `test-build` label to a PR; this tags the PR's HEAD
+# with a `-`-suffixed (so prerelease-shaped) tag and calls build-release.yml
+# with `publish: false`: the .deb is uploaded as a WORKFLOW-RUN ARTIFACT and a
+# PR comment links to it — no entry is created on the Releases page. (Create
+# the `test-build` label once in the repo; the trigger requires it to exist
+# before it can be applied.)
+#
+# Security: pull_request_target runs in the BASE repo context with a write
+# token, and this builds the PR HEAD — which is attacker-controllable on a fork
+# PR. The `authorize` job restricts the whole flow to labels applied by a user
+# with write/maintain/admin permission, so an untrusted fork PR cannot
+# self-trigger a privileged build. GitHub already requires triage+ to apply a
+# label, but triage alone is not enough trust to build untrusted code with
+# secrets in scope, hence the explicit permission check.
+#
+# A tag pushed with the default GITHUB_TOKEN does not trigger release.yml's
+# `on: push: tags`, which is exactly what we want here: the preview tag exists
+# only to pin/version the build (gen-changelog.sh derives the .deb version from
+# it). Its non-plain form (`-pr<N>.…`) means next-version.sh ignores it, so a
+# preview never bumps the release-version floor.
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One build per PR; a newer label supersedes nothing in flight (don't cancel a
+  # half-done tag/build), it just queues behind it.
+  group: pr-test-build-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    # Only react to our trigger label; ignore every other label event.
+    if: github.event.label.name == 'test-build'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the labeler to have write access
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.event.sender.login }}
+        run: |
+          set -euo pipefail
+          perm="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" --jq .permission)"
+          echo "Labeler ${ACTOR} has permission: ${perm}"
+          case "$perm" in
+            admin|write|maintain) ;;
+            *) echo "::error::${ACTOR} lacks write access; refusing to build PR HEAD." ; exit 1 ;;
+          esac
+
+  tag:
+    needs: authorize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create + push the preview tag
+      pull-requests: write  # remove the label after dispatch
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      created: ${{ steps.create.outputs.created }}
+    steps:
+      - name: Checkout PR HEAD
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0  # need all tags for next-version.sh
+
+      - name: Compute prerelease tag
+        id: compute
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # next = max(patch-bump of latest release, ./VERSION floor); see
+          # scripts/next-version.sh. The `-pr<N>.` suffix makes the tag a
+          # prerelease and keeps next-version.sh from ever counting it.
+          next="$(./scripts/next-version.sh)"
+          tag="v${next}-pr${PR}.$(date -u +%Y%m%d).$(git rev-parse --short HEAD)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Computed preview tag: $tag"
+
+      - name: Create and push tag at PR HEAD
+        id: create
+        env:
+          TAG: ${{ steps.compute.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on origin; skipping."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Remove the label so re-applying re-triggers a fresh build
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh api -X DELETE \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels/test-build" \
+            >/dev/null 2>&1 || true
+
+  build:
+    needs: tag
+    if: needs.tag.outputs.created == 'true'
+    # contents:write here is an ENVELOPE requirement only: GitHub statically
+    # validates every job in a called workflow against this grant — even jobs
+    # skipped by `if:` — and build-release.yml's release job (skipped via
+    # publish: false) requests contents:write. No job that actually runs on
+    # this path gets more than contents:read (build-release.yml's top-level
+    # default).
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-release.yml
+    with:
+      ref: ${{ needs.tag.outputs.tag }}
+      publish: false   # run artifact only — no Releases-page entry
+      prerelease: true # unused when publish is false; what it would be
+
+  comment:
+    # The label is long gone by now (removed at dispatch), so this comment is
+    # the only feedback the labeler gets — post on failure too. !cancelled()
+    # (not always()) avoids a bogus "failed" comment on cancellation; the tag
+    # guard keeps unauthorized or tag-failed runs silent.
+    needs: [tag, build]
+    if: ${{ !cancelled() && needs.tag.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment build result on the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TAG: ${{ needs.tag.outputs.tag }}
+          RESULT: ${{ needs.build.result }}
+          ARTIFACT_URL: ${{ needs.build.outputs.artifact_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # printf, not a heredoc: inside this YAML block scalar a heredoc body
+        # would keep its relative indentation, and 4-space-indented lines
+        # render as Markdown code blocks in the comment.
+        run: |
+          set -euo pipefail
+          if [ "${RESULT}" = "success" ]; then
+            # Mirror gen-changelog.sh's tag_to_upstream for the .deb name.
+            deb="luks-enroll_$(printf '%s' "${TAG#v}" \
+              | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-/\1~/')-1_amd64.deb"
+            body="$(printf '%s\n' \
+              "### Test build ready: \`${TAG}\`" \
+              "" \
+              "Built from ${HEAD_SHA}." \
+              "" \
+              "* **Download:** [artifact](${ARTIFACT_URL}) — contains \`${deb}\` (+ .buildinfo/.changes)" \
+              "* Workflow run: ${RUN_URL}" \
+              "" \
+              "Downloading requires being logged in to GitHub; the artifact expires with the repo retention window (default 90 days). Re-apply the \`test-build\` label to build a newer HEAD.")"
+          else
+            body="$(printf '%s\n' \
+              "### Test build FAILED: \`${TAG}\` (${HEAD_SHA})" \
+              "" \
+              "See the run log: ${RUN_URL}" \
+              "" \
+              "Re-apply the \`test-build\` label to retry.")"
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="${body}"

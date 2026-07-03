@@ -125,6 +125,17 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
   (`scripts/next-version.sh`); bump **`VERSION`** for a minor/major release, patch is automatic.
 - `ci.yml` gates PRs into **both** `dev` and `main` (feature→dev PRs and the dev→main release
   PR); it stays PR-only, since the release pipeline already validates the post-merge push.
+- **PR test builds** (`pr-test-build.yml`): a maintainer applies the `test-build` label to a PR
+  to get an installable `.deb` of that PR's HEAD for manual testing **before** it merges to
+  `dev`. It runs on `pull_request_target`, gates on the labeler having write access (the PR HEAD
+  is attacker-controllable on fork PRs, and the token is privileged), tags HEAD as
+  `vX.Y.Z-prN.<date>.<sha>` (the tag only pins/versions the build; its `-pr<N>.` suffix keeps
+  `next-version.sh` from counting it, so previews never bump the release floor), and calls
+  `build-release.yml` with **`publish: false`** — **no Releases-page entry**; the `.deb` is
+  uploaded as a **workflow-run artifact** (login required to download, default 90-day retention)
+  and a PR comment links to it (posted on build failure too). The label is auto-removed after
+  dispatch so re-labeling re-triggers. (The `test-build` label must exist in the repo for the
+  trigger to be appliable.)
 - **Supply-chain**: Dependabot (`.github/dependabot.yml`) covers GitHub Actions, the **`cargo`**
   workspace (`rust/`), and pip dev tooling, each with a 14-day **cooldown** (minimum package
   age) so a freshly published, possibly compromised release ages before adoption — cooldown

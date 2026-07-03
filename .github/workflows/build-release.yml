@@ -2,8 +2,10 @@ name: Build & Release
 
 # Reusable workflow: lint, test, build the .deb for a given tag, then publish a
 # GitHub release with the package attached. Called by:
-#   * release.yml  — when a v* tag is pushed by a human (manual path)
-#   * autotag.yml  — after it auto-creates a tag on push to dev/main
+#   * release.yml       — when a v* tag is pushed by a human (manual path)
+#   * autotag.yml       — after it auto-creates a tag on push to dev/main
+#   * pr-test-build.yml — with `publish: false`: build + run artifact only,
+#                         no Releases-page entry
 #
 # It is factored out so both paths build and release identically. The release
 # is created as a draft *with* the .deb attached and then flipped to published,
@@ -21,6 +23,20 @@ on:
         description: Mark the GitHub release as a prerelease.
         required: true
         type: boolean
+      publish:
+        description: >-
+          Create the GitHub release. When false, stop after uploading the run
+          artifact (PR test builds).
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      artifact_id:
+        description: GitHub ID of the uploaded build-artifact bundle.
+        value: ${{ jobs.build.outputs.artifact_id }}
+      artifact_url:
+        description: Download URL for the run artifact (requires being logged in).
+        value: ${{ jobs.build.outputs.artifact_url }}
 
 permissions:
   contents: read
@@ -58,6 +74,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
 
     steps:
       - name: Install build dependencies
@@ -125,6 +144,7 @@ jobs:
           cp ../*.deb ../*.buildinfo ../*.changes artifacts/
 
       - name: Upload artifacts
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: luks-enroll-noble
@@ -132,6 +152,11 @@ jobs:
 
   release:
     needs: build
+    # Skipped for PR test builds (publish: false): those ship as a run artifact
+    # only. NOTE: this job's contents:write still forces every caller to grant
+    # contents:write — GitHub validates nested job permissions statically, even
+    # for jobs skipped by `if:`.
+    if: inputs.publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
