@@ -644,6 +644,163 @@ pub fn deactivate_volume(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// One dm device holding a loop device open: its device-mapper UUID (which
+/// encodes the subsystem, e.g. `CRYPT-LUKS2-...` for cryptsetup mappings)
+/// and its mapper name.
+pub struct DmHolder {
+    pub dm_uuid: String,
+    pub dm_name: String,
+}
+
+/// One attached loop device: the backing file's identity as recorded by the
+/// kernel at attach time (`LOOP_GET_STATUS64`'s `lo_device`/`lo_inode`), plus
+/// the dm devices holding it open.
+pub struct LoopSnapshot {
+    pub backing_dev: u64,
+    pub backing_ino: u64,
+    pub holders: Vec<DmHolder>,
+}
+
+/// Pure matcher for the fd-only close path: the dm-crypt mapping names whose
+/// loop device is backed by the file identified by `(dev, ino)`. Only
+/// `CRYPT-LUKS`-uuid'd dm devices count (LUKS1/LUKS2 — everything this
+/// service can create): a foreign holder (LVM, ...) and even cryptsetup's
+/// other subsystems (`CRYPT-VERITY-`, `CRYPT-INTEGRITY-`, `CRYPT-PLAIN-`)
+/// sitting on the user's loop must never be torn down by this path. Sorted
+/// and deduplicated so the teardown order is deterministic.
+pub fn crypt_mappings_backed_by(dev: u64, ino: u64, loops: &[LoopSnapshot]) -> Vec<String> {
+    let mut names: Vec<String> = loops
+        .iter()
+        .filter(|l| l.backing_dev == dev && l.backing_ino == ino)
+        .flat_map(|l| l.holders.iter())
+        .filter(|h| h.dm_uuid.starts_with("CRYPT-LUKS"))
+        .map(|h| h.dm_name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// `struct loop_info64` from `<linux/loop.h>`, for `LOOP_GET_STATUS64`.
+#[repr(C)]
+struct LoopInfo64 {
+    lo_device: u64,
+    lo_inode: u64,
+    lo_rdevice: u64,
+    lo_offset: u64,
+    lo_sizelimit: u64,
+    lo_number: u32,
+    lo_encrypt_type: u32,
+    lo_encrypt_key_size: u32,
+    lo_flags: u32,
+    lo_file_name: [u8; 64],
+    lo_crypt_name: [u8; 64],
+    lo_encrypt_key: [u8; 32],
+    lo_init: [u64; 2],
+}
+
+const LOOP_GET_STATUS64: libc::c_ulong = 0x4C05;
+
+/// Snapshot every attached loop device with its dm holders, via sysfs and the
+/// `LOOP_GET_STATUS64` ioctl. The ioctl reports the backing file's
+/// `(st_dev, st_ino)` from the kernel's own attach record — not a re-resolved
+/// path — so the identity survives renames and cannot be spoofed by file
+/// contents (the LUKS header is never consulted). Unattached or unreadable
+/// loop devices are skipped.
+fn snapshot_loop_devices() -> Vec<LoopSnapshot> {
+    let Ok(entries) = std::fs::read_dir("/sys/block") else {
+        return Vec::new();
+    };
+    let mut snaps = Vec::new();
+    for entry in entries.flatten() {
+        let dev_name = entry.file_name();
+        let Some(dev_name) = dev_name.to_str() else {
+            continue;
+        };
+        if !dev_name.starts_with("loop") {
+            continue;
+        }
+        let Some(info) = loop_status(&format!("/dev/{dev_name}")) else {
+            continue;
+        };
+        snaps.push(LoopSnapshot {
+            backing_dev: info.lo_device,
+            backing_ino: info.lo_inode,
+            holders: dm_holders(dev_name),
+        });
+    }
+    snaps
+}
+
+/// `LOOP_GET_STATUS64` for one loop device node; `None` when the device is
+/// unattached (ENXIO) or unreadable.
+fn loop_status(node: &str) -> Option<LoopInfo64> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::open(node).ok()?;
+    // SAFETY: all-zero bytes are a valid LoopInfo64 (integers and byte
+    // arrays only).
+    let mut info: LoopInfo64 = unsafe { std::mem::zeroed() };
+    // SAFETY: LOOP_GET_STATUS64 writes a loop_info64 into the pointed-to
+    // buffer and nothing else; `info` is a properly sized, owned #[repr(C)]
+    // mirror of that struct.
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), LOOP_GET_STATUS64, &mut info) };
+    (rc == 0).then_some(info)
+}
+
+/// The dm devices holding `loop<N>` — or any of its partitions — open.
+/// A holder of a *partition* registers under the partition's own sysfs
+/// directory (`/sys/block/loopN/loopNpM/holders`), not the whole disk's, so
+/// a mapping over a partitioned container would be invisible to a
+/// whole-disk-only walk and CloseVolumeFd would falsely report success.
+/// Non-dm holders (no `dm/uuid` attribute) are skipped.
+fn dm_holders(dev_name: &str) -> Vec<DmHolder> {
+    let base = format!("/sys/block/{dev_name}");
+    // The whole disk, plus each partition (the only `/sys/block/loopN`
+    // entries whose names share the device's prefix).
+    let mut holder_dirs = vec![format!("{base}/holders")];
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            if let Some(part) = entry.file_name().to_str() {
+                if part.starts_with(dev_name) {
+                    holder_dirs.push(format!("{base}/{part}/holders"));
+                }
+            }
+        }
+    }
+    let read_attr = |holder: &str, attr: &str| -> Option<String> {
+        std::fs::read_to_string(format!("/sys/class/block/{holder}/dm/{attr}"))
+            .ok()
+            .map(|s| s.trim_end().to_string())
+    };
+    holder_dirs
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|h| {
+            let holder = h.file_name().to_str()?.to_string();
+            Some(DmHolder {
+                dm_uuid: read_attr(&holder, "uuid")?,
+                dm_name: read_attr(&holder, "name")?,
+            })
+        })
+        .collect()
+}
+
+/// Tear down every dm-crypt mapping whose loop device is backed by the file
+/// identified by `(dev, ino)` — the discovery core of `CloseVolumeFd`. Each
+/// teardown goes through `deactivate_volume`, so the mounted-filesystem guard
+/// and name validation apply per mapping. Zero matches is a success (the
+/// idempotence of `deactivate_volume`, extended to the fd-only path). Returns
+/// the names closed; on a failure the offending name prefixes the error.
+pub fn deactivate_volumes_backed_by(dev: u64, ino: u64) -> Result<Vec<String>> {
+    let _t = Timer::new("deactivate_volumes_backed_by");
+    let names = crypt_mappings_backed_by(dev, ino, &snapshot_loop_devices());
+    for name in &names {
+        deactivate_volume(name).map_err(|e| Error(format!("{name}: {}", e.0)))?;
+    }
+    Ok(names)
+}
+
 // ---------------------------------------------------------------------------
 // Mutations
 // ---------------------------------------------------------------------------

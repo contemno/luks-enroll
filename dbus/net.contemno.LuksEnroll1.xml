@@ -200,6 +200,21 @@
       <arg direction="out" type="s" name="mapper"/>
       <arg direction="out" type="s" name="stderr"/>
     </method>
+    <!-- CloseVolume for a client-owned container file. Tears down every
+         LUKS dm-crypt mapping whose loop device is backed by the fd's
+         inode, as recorded by the kernel at loop-attach time — no
+         caller-supplied name. Possession of a writable fd is the
+         authorization (no polkit), mirroring OpenVolumeFd. On success
+         `closed` lists the mapper names torn down (space-joined); zero
+         matches is an idempotent success. On failure `closed` is empty,
+         `stderr` is prefixed with the mapping that refused (e.g. still
+         mounted), and mappings sorting before it may already be closed. -->
+    <method name="CloseVolumeFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="out" type="b" name="ok"/>
+      <arg direction="out" type="s" name="closed"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
     <method name="EnrollFido2Fd">
       <arg direction="in" type="h" name="fd"/>
       <arg direction="in" type="s" name="passphrase"/>

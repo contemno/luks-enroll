@@ -313,9 +313,27 @@ class LuksEnrollProxy:
             (name, passphrase, unlock_method, unlock_pin), 120000,
         )  # (bool, str, str)
 
-    def close_volume(self, name):
-        """Tear down the dm-crypt mapping /dev/mapper/<name>. Path-independent
-        (the name alone identifies the mapping). Returns (ok, stderr)."""
+    def close_volume(self, device, name):
+        """Tear down the dm-crypt mapping over `device`. For client-owned
+        container files, CloseVolumeFd discovers the mapping from a writable
+        fd's inode and skips polkit (possession of the fd is the
+        authorization, mirroring OpenVolumeFd); an installed service too old
+        to have the method falls back to the name-addressed, polkit-gated
+        CloseVolume. Block devices always use CloseVolume — there is no
+        backing file whose fd could prove anything. Returns (ok, stderr)."""
+        if self._is_regular_file(device):
+            fd = os.open(device, os.O_RDWR)
+            try:
+                ok, _closed, err = self._call_fd_sync(
+                    "CloseVolumeFd", "(h)", fd, (), 60000
+                )
+                return ok, err
+            except GLib.Error as e:
+                if not is_unknown_method(Gio.DBusError.get_remote_error(e)):
+                    raise
+                # Fall through to the polkit-gated close below.
+            finally:
+                os.close(fd)
         result = self.proxy.call_sync(
             "CloseVolume",
             GLib.Variant("(s)", (name,)),
@@ -593,6 +611,13 @@ def mount_references(proc_mounts, mapper, dm_node):
         if src and (src == mapper or (dm_node and src == dm_node)):
             return True
     return False
+
+
+def is_unknown_method(remote_error):
+    """True when a D-Bus remote error name means the installed service
+    predates the called method — the signal to fall back to an older code
+    path instead of surfacing an error (service/client version skew)."""
+    return remote_error == "org.freedesktop.DBus.Error.UnknownMethod"
 
 
 # TPM2 PCR descriptions, used by the TPM2 enrollment page.
@@ -1912,7 +1937,7 @@ class DeviceDetailPage(Adw.NavigationPage):
             err = ""
             try:
                 if is_open:
-                    ok, err = self.svc.close_volume(name)
+                    ok, err = self.svc.close_volume(self.device, name)
                 else:
                     ok, _mapper, err = self.svc.open_volume(
                         self.device, name, self.passphrase or "",
@@ -1920,6 +1945,11 @@ class DeviceDetailPage(Adw.NavigationPage):
                     )
             except GLib.Error as e:
                 ok, err = False, e.message
+            except OSError as e:
+                # The fd dispatch opens the container file itself; a raced
+                # delete or permission change must fail the dialog, not
+                # strand the button on a worker-thread traceback.
+                ok, err = False, str(e)
             GLib.idle_add(self._on_mapping_done, ok, err)
 
         threading.Thread(target=work, daemon=True).start()
