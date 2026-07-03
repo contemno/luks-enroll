@@ -111,25 +111,17 @@ pub fn detect_removable_devices() -> Value {
 /// filesystem}.
 pub fn get_device_info(device: &str) -> Value {
     // Size: file length for regular files, sysfs sector count otherwise.
-    let mut size = String::new();
-    match fs::metadata(device) {
-        Ok(md) if md.is_file() => size = format_size(md.len()),
+    let size = match fs::metadata(device) {
+        Ok(md) if md.is_file() => format_size(md.len()),
         _ => {
             let parent = parent_device_name(device);
             let base = basename(device);
-            // Prefer the parent-qualified sysfs `size` (a partition under its
-            // disk), falling back to the bare basename (a whole disk).
-            // sysfs_size_bytes does the read -> parse -> *512, returning 0 for
-            // a missing/unparseable file.
-            let bytes = match sysfs_size_bytes(&format!("/sys/block/{parent}/{base}/size")) {
-                0 => sysfs_size_bytes(&format!("/sys/block/{base}/size")),
-                n => n,
-            };
-            if bytes > 0 {
-                size = format_size(bytes);
-            }
+            block_device_size(
+                &format!("/sys/block/{parent}/{base}/size"),
+                &format!("/sys/block/{base}/size"),
+            )
         }
-    }
+    };
 
     // Mount point: second field of the first /proc/mounts line whose
     // first field is exactly this device path.
@@ -285,12 +277,32 @@ pub(crate) fn read_sysfs(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+/// Sector count from a sysfs `size` file, or None if missing/unparseable.
+/// Kept distinct from `sysfs_size_bytes`' 0 so a genuine zero-sector device
+/// is not conflated with an absent file (see `block_device_size`).
+fn sysfs_sectors(path: &str) -> Option<u64> {
+    read_sysfs(path).and_then(|s| s.parse::<u64>().ok())
+}
+
 /// Sector count from a sysfs `size` file, in bytes (0 if missing/bad).
 fn sysfs_size_bytes(path: &str) -> u64 {
-    read_sysfs(path)
-        .and_then(|s| s.parse::<u64>().ok())
+    sysfs_sectors(path)
         .map(|sectors| sectors * 512)
         .unwrap_or(0)
+}
+
+/// Human-readable size for a block device from its sysfs `size` (a sector
+/// count): try the parent-qualified path first (a partition under its disk),
+/// then the bare basename (a whole disk). Empty when neither file exists; a
+/// present zero-sector device still formats to "0 B" -- matching
+/// `detect_removable_devices` and the pre-consolidation behaviour, which is
+/// why this reads sectors as an Option instead of folding a real 0 into
+/// `sysfs_size_bytes`' missing-sentinel.
+fn block_device_size(parent_size_path: &str, base_size_path: &str) -> String {
+    sysfs_sectors(parent_size_path)
+        .or_else(|| sysfs_sectors(base_size_path))
+        .map(|sectors| format_size(sectors * 512))
+        .unwrap_or_default()
 }
 
 /// Directory entry names, sorted; empty when unreadable.
@@ -411,7 +423,7 @@ mod tests {
         fs::write(&ok, "2048\n").unwrap();
         // sectors * 512.
         assert_eq!(sysfs_size_bytes(ok.to_str().unwrap()), 2048 * 512);
-        // Missing or non-numeric -> 0 (the fallback signal in get_device_info).
+        // Missing or non-numeric -> 0 (used by detect_removable_devices).
         assert_eq!(
             sysfs_size_bytes(dir.path().join("absent").to_str().unwrap()),
             0
@@ -419,6 +431,44 @@ mod tests {
         let bad = dir.path().join("bad");
         fs::write(&bad, "not-a-number").unwrap();
         assert_eq!(sysfs_size_bytes(bad.to_str().unwrap()), 0);
+    }
+
+    #[test]
+    fn block_device_size_prefers_parent_then_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent_size");
+        let base = dir.path().join("base_size");
+        let (parent_p, base_p) = (parent.to_str().unwrap(), base.to_str().unwrap());
+
+        // Parent-qualified path present -> used.
+        fs::write(&parent, "2048\n").unwrap();
+        fs::write(&base, "4096\n").unwrap();
+        assert_eq!(block_device_size(parent_p, base_p), format_size(2048 * 512));
+
+        // Parent missing -> fall back to the bare basename.
+        fs::remove_file(&parent).unwrap();
+        assert_eq!(block_device_size(parent_p, base_p), format_size(4096 * 512));
+
+        // Regression guard (get_device_info parity): a present zero-sector
+        // device still reports "0 B" -- it must NOT be swallowed as if the
+        // file were missing.
+        fs::write(&base, "0\n").unwrap();
+        assert_eq!(block_device_size(parent_p, base_p), "0 B");
+
+        // Neither present -> empty string.
+        fs::remove_file(&base).unwrap();
+        assert_eq!(block_device_size(parent_p, base_p), "");
+    }
+
+    #[test]
+    fn get_device_info_reports_regular_file_size() {
+        // The regular-file branch of the GetDeviceInfo entry point is the one
+        // size path testable without /sys: size is the file length.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        fs::write(f.path(), vec![0u8; 3000]).unwrap();
+        let info = get_device_info(f.path().to_str().unwrap());
+        assert_eq!(info["size"], json!(format_size(3000)));
+        assert_eq!(info["device"], json!(f.path().to_str().unwrap()));
     }
 
     #[test]
