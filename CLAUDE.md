@@ -28,6 +28,12 @@ and recovery keys into LUKS2 volumes.
 - Releases are auto-tagged; the version is `max(patch-bump, ./VERSION)`. Patch releases are
   automatic — to cut a **minor/major** release, bump **`VERSION`** (e.g. `0.2.0`) in the `dev`
   PR, and merging `dev → main` releases it.
+- **When opening a `dev → main` promotion PR, decide the version deliberately** — don't let
+  the automatic patch bump default the decision. Review the commits being promoted: new
+  user-facing features, a new/changed D-Bus surface, or other additive functionality warrant a
+  **minor** bump (breaking changes → **major**); only pure fixes/chores stay a patch. If a bump
+  is needed, land a `VERSION` bump on `dev` first (via its own PR), then the promotion publishes
+  that version. Note the intended release version in the promotion PR body.
 
 ## Work loop
 
