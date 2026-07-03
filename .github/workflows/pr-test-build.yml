@@ -1,11 +1,13 @@
 name: PR test build
 
-# Label-driven prerelease build for manual testing BEFORE a PR merges to dev.
+# Label-driven test build for manual testing BEFORE a PR merges to dev.
 #
 # A maintainer applies the `test-build` label to a PR; this tags the PR's HEAD
-# with a `-`-suffixed (so prerelease) tag and calls build-release.yml to publish
-# an installable .deb as a GitHub *prerelease*. (Create the `test-build` label
-# once in the repo; the trigger requires it to exist before it can be applied.)
+# with a `-`-suffixed (so prerelease-shaped) tag and calls build-release.yml
+# with `publish: false`: the .deb is uploaded as a WORKFLOW-RUN ARTIFACT and a
+# PR comment links to it — no entry is created on the Releases page. (Create
+# the `test-build` label once in the repo; the trigger requires it to exist
+# before it can be applied.)
 #
 # Security: pull_request_target runs in the BASE repo context with a write
 # token, and this builds the PR HEAD — which is attacker-controllable on a fork
@@ -15,11 +17,11 @@ name: PR test build
 # label, but triage alone is not enough trust to build untrusted code with
 # secrets in scope, hence the explicit permission check.
 #
-# Like autotag.yml, this calls build-release.yml directly rather than pushing a
-# tag and relying on release.yml: a tag pushed with the default GITHUB_TOKEN
-# does not trigger another workflow's `on: push: tags`. The preview tag's
-# non-plain form (`-pr<N>.…`) means next-version.sh ignores it, so a preview
-# never bumps the release-version floor.
+# A tag pushed with the default GITHUB_TOKEN does not trigger release.yml's
+# `on: push: tags`, which is exactly what we want here: the preview tag exists
+# only to pin/version the build (gen-changelog.sh derives the .deb version from
+# it). Its non-plain form (`-pr<N>.…`) means next-version.sh ignores it, so a
+# preview never bumps the release-version floor.
 
 on:
   pull_request_target:
@@ -30,7 +32,7 @@ permissions:
 
 concurrency:
   # One build per PR; a newer label supersedes nothing in flight (don't cancel a
-  # half-done tag/release), it just queues behind it.
+  # half-done tag/build), it just queues behind it.
   group: pr-test-build-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
@@ -110,12 +112,67 @@ jobs:
             "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels/test-build" \
             >/dev/null 2>&1 || true
 
-  release:
+  build:
     needs: tag
     if: needs.tag.outputs.created == 'true'
+    # contents:write here is an ENVELOPE requirement only: GitHub statically
+    # validates every job in a called workflow against this grant — even jobs
+    # skipped by `if:` — and build-release.yml's release job (skipped via
+    # publish: false) requests contents:write. No job that actually runs on
+    # this path gets more than contents:read (build-release.yml's top-level
+    # default).
     permissions:
       contents: write
     uses: ./.github/workflows/build-release.yml
     with:
       ref: ${{ needs.tag.outputs.tag }}
-      prerelease: true
+      publish: false   # run artifact only — no Releases-page entry
+      prerelease: true # unused when publish is false; what it would be
+
+  comment:
+    # The label is long gone by now (removed at dispatch), so this comment is
+    # the only feedback the labeler gets — post on failure too. !cancelled()
+    # (not always()) avoids a bogus "failed" comment on cancellation; the tag
+    # guard keeps unauthorized or tag-failed runs silent.
+    needs: [tag, build]
+    if: ${{ !cancelled() && needs.tag.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment build result on the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TAG: ${{ needs.tag.outputs.tag }}
+          RESULT: ${{ needs.build.result }}
+          ARTIFACT_URL: ${{ needs.build.outputs.artifact_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # printf, not a heredoc: inside this YAML block scalar a heredoc body
+        # would keep its relative indentation, and 4-space-indented lines
+        # render as Markdown code blocks in the comment.
+        run: |
+          set -euo pipefail
+          if [ "${RESULT}" = "success" ]; then
+            # Mirror gen-changelog.sh's tag_to_upstream for the .deb name.
+            deb="luks-enroll_$(printf '%s' "${TAG#v}" \
+              | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-/\1~/')-1_amd64.deb"
+            body="$(printf '%s\n' \
+              "### Test build ready: \`${TAG}\`" \
+              "" \
+              "Built from ${HEAD_SHA}." \
+              "" \
+              "* **Download:** [artifact](${ARTIFACT_URL}) — contains \`${deb}\` (+ .buildinfo/.changes)" \
+              "* Workflow run: ${RUN_URL}" \
+              "" \
+              "Downloading requires being logged in to GitHub; the artifact expires with the repo retention window (default 90 days). Re-apply the \`test-build\` label to build a newer HEAD.")"
+          else
+            body="$(printf '%s\n' \
+              "### Test build FAILED: \`${TAG}\` (${HEAD_SHA})" \
+              "" \
+              "See the run log: ${RUN_URL}" \
+              "" \
+              "Re-apply the \`test-build\` label to retry.")"
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="${body}"
