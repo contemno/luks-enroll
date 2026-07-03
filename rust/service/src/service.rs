@@ -76,6 +76,12 @@ impl LuksEnrollService {
     }
 
     /// os.path.realpath equivalent: resolve as far as possible, never fail.
+    ///
+    /// Distinct from `devices::canonicalize_lossy` (which just falls back to
+    /// the input on failure): this variant, on a nonexistent path, resolves
+    /// the parent and re-appends the file name so `CreateEncryptedImage` can
+    /// canonicalize a not-yet-created file. That extra fallback is why the two
+    /// are not merged.
     fn realpath(path: &str) -> String {
         if let Ok(p) = std::fs::canonicalize(path) {
             return p.to_string_lossy().into_owned();
@@ -198,10 +204,10 @@ impl LuksEnrollService {
         Ok(())
     }
 
-    /// Reject a token type that isn't FIDO2/TPM2, logging under `method` and
-    /// returning the generic D-Bus failure -- the parity behaviour that the
+    /// Require a token type to be FIDO2/TPM2, else log under `method` and
+    /// return the generic D-Bus failure -- the parity behaviour that the
     /// UnlockWithToken / UnlockWithTokenFd handlers share.
-    fn unsupported_token_type(token_type: &str, method: &str) -> MethodResult<()> {
+    fn ensure_supported_token_type(token_type: &str, method: &str) -> MethodResult<()> {
         if token_type != TOKEN_TYPE_FIDO2 && token_type != TOKEN_TYPE_TPM2 {
             eprintln!("Method {method} failed: Unsupported token type");
             return Err(SvcError::Failed("Operation failed".into()));
@@ -212,7 +218,9 @@ impl LuksEnrollService {
     /// Shared preamble for the `*Fd` methods: validate the descriptor, length-
     /// check `lens`, then reset the idle timer -- in that order, so an
     /// over-length argument is rejected before the idle timer is touched, as
-    /// before. Pass `&[]` when the method has no string arguments to check.
+    /// before. `lens` holds the scalar string args to cap; pass `&[]` when
+    /// there are none (matching the pre-consolidation call sites -- note this
+    /// does not cover `Vec<String>` args, which were never length-checked).
     fn prep_fd<Fd: AsFd>(
         &self,
         fd: Fd,
@@ -369,19 +377,11 @@ fn run_op(op: &str, body: impl FnOnce() -> crate::error::Result<Triple>) -> Trip
 }
 
 /// Shape a verify/unlock keyslot result into the `(bool, i32)` reply the
-/// VerifyPassphrase / UnlockWithToken methods return. When `log_label` is set,
-/// an error is logged as `{label}: {e}` (the token-unlock methods); the
-/// passphrase methods pass `None` and discard the error, as before.
-fn slot_result(r: std::result::Result<i32, String>, log_label: Option<&str>) -> (bool, i32) {
-    match r {
-        Ok(slot) => (true, slot),
-        Err(e) => {
-            if let Some(label) = log_label {
-                eprintln!("{label}: {e}");
-            }
-            (false, -1)
-        }
-    }
+/// VerifyPassphrase / UnlockWithToken methods return. The token-unlock methods
+/// log the error before calling this (via `.inspect_err`); the passphrase
+/// methods discard it.
+fn slot_result(r: std::result::Result<i32, String>) -> (bool, i32) {
+    r.map_or((false, -1), |slot| (true, slot))
 }
 
 /// What an enrollment modality produces before the shared keyslot + token spine
@@ -647,8 +647,9 @@ pub fn create_fd_is_empty<Fd: std::os::fd::AsFd>(fd: Fd) -> bool {
 
 pub fn op_format_partition(device: &str, passphrase: &str) -> Triple {
     run_op("FormatPartition", || {
-        let partition =
-            format::format_removable_partition(device, passphrase).map_err(crate::error::Error)?;
+        // format_removable_partition's String error converts via
+        // `impl From<String> for Error`, so `?` suffices.
+        let partition = format::format_removable_partition(device, passphrase)?;
         Ok((true, partition, String::new()))
     })
 }
@@ -805,7 +806,7 @@ impl LuksEnrollService {
         let device = self
             .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
             .await?;
-        blocking(move || slot_result(luks::verify_passphrase(&device, &passphrase), None)).await
+        blocking(move || slot_result(luks::verify_passphrase(&device, &passphrase))).await
     }
 
     #[zbus(name = "UnlockWithToken")]
@@ -822,11 +823,11 @@ impl LuksEnrollService {
             .await?;
         // Parity: an unsupported token type raised out of the Python
         // handler and surfaced as a generic D-Bus failure.
-        Self::unsupported_token_type(&token_type, "UnlockWithToken")?;
+        Self::ensure_supported_token_type(&token_type, "UnlockWithToken")?;
         blocking(move || {
             slot_result(
-                luks::verify_token(&device, &token_type, &pin),
-                Some("UnlockWithToken"),
+                luks::verify_token(&device, &token_type, &pin)
+                    .inspect_err(|e| eprintln!("UnlockWithToken: {e}")),
             )
         })
         .await
@@ -1178,8 +1179,7 @@ impl LuksEnrollService {
     ) -> Result<(bool, i32), SvcError> {
         // Verify only reads the header, so a read-only descriptor suffices.
         self.prep_fd(&fd, false, false, &[&passphrase])?;
-        blocking(move || slot_result(luks::verify_passphrase(&fd_path(&fd), &passphrase), None))
-            .await
+        blocking(move || slot_result(luks::verify_passphrase(&fd_path(&fd), &passphrase))).await
     }
 
     #[zbus(name = "UnlockWithTokenFd")]
@@ -1191,12 +1191,12 @@ impl LuksEnrollService {
     ) -> Result<(bool, i32), SvcError> {
         Self::check_fd(&fd, false, false)?;
         Self::check_lens(&[&token_type, &pin])?;
-        Self::unsupported_token_type(&token_type, "UnlockWithTokenFd")?;
+        Self::ensure_supported_token_type(&token_type, "UnlockWithTokenFd")?;
         self.touch_idle();
         blocking(move || {
             slot_result(
-                luks::verify_token(&fd_path(&fd), &token_type, &pin),
-                Some("UnlockWithTokenFd"),
+                luks::verify_token(&fd_path(&fd), &token_type, &pin)
+                    .inspect_err(|e| eprintln!("UnlockWithTokenFd: {e}")),
             )
         })
         .await
@@ -1479,26 +1479,23 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_token_type_accepts_known_rejects_unknown() {
+    fn ensure_supported_token_type_accepts_known_rejects_unknown() {
         // FIDO2 and TPM2 pass; anything else is the generic D-Bus failure
         // (the parity behaviour shared by UnlockWithToken / UnlockWithTokenFd).
-        LuksEnrollService::unsupported_token_type(TOKEN_TYPE_FIDO2, "X").expect("fido2 accepted");
-        LuksEnrollService::unsupported_token_type(TOKEN_TYPE_TPM2, "X").expect("tpm2 accepted");
-        let err = LuksEnrollService::unsupported_token_type(TOKEN_TYPE_RECOVERY, "X")
+        LuksEnrollService::ensure_supported_token_type(TOKEN_TYPE_FIDO2, "X")
+            .expect("fido2 accepted");
+        LuksEnrollService::ensure_supported_token_type(TOKEN_TYPE_TPM2, "X")
+            .expect("tpm2 accepted");
+        let err = LuksEnrollService::ensure_supported_token_type(TOKEN_TYPE_RECOVERY, "X")
             .expect_err("unknown type rejected");
         assert!(matches!(err, SvcError::Failed(_)));
     }
 
     #[test]
     fn slot_result_shapes_ok_and_err() {
-        // Ok -> (true, slot); Err -> (false, -1), regardless of the log label.
-        assert_eq!(slot_result(Ok(2), None), (true, 2));
-        assert_eq!(slot_result(Ok(2), Some("Label")), (true, 2));
-        assert_eq!(slot_result(Err("boom".to_string()), None), (false, -1));
-        assert_eq!(
-            slot_result(Err("boom".to_string()), Some("Label")),
-            (false, -1)
-        );
+        // Ok -> (true, slot); Err -> (false, -1).
+        assert_eq!(slot_result(Ok(2)), (true, 2));
+        assert_eq!(slot_result(Err("boom".to_string())), (false, -1));
     }
 
     #[test]
