@@ -212,14 +212,14 @@ fn tokens_iter(meta: &serde_json::Value) -> impl Iterator<Item = (&String, &serd
         .flatten()
 }
 
-/// Whether a token-info object's `type` field equals `token_type`.
-fn token_type_is(tinfo: &serde_json::Value, token_type: &str) -> bool {
-    tinfo.get("type").and_then(|t| t.as_str()) == Some(token_type)
-}
-
 /// A string field of a token-info object, or None if absent / not a string.
 fn token_str<'a>(tinfo: &'a serde_json::Value, field: &str) -> Option<&'a str> {
     tinfo.get(field).and_then(|v| v.as_str())
+}
+
+/// Whether a token-info object's `type` field equals `token_type`.
+fn token_type_is(tinfo: &serde_json::Value, token_type: &str) -> bool {
+    token_str(tinfo, "type") == Some(token_type)
 }
 
 /// Ordered, de-duplicated keyslots bound to tokens of `token_type` in the

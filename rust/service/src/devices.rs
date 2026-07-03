@@ -324,12 +324,11 @@ fn is_virtual_block_name(name: &str) -> bool {
 }
 
 /// Parse an `nvme<ctrl>n<ns>` device name (the whole-disk shape). Returns the
-/// byte offset just past the namespace -- the end of the whole-disk name --
-/// and the remaining suffix after it, or None when the name isn't a
-/// well-formed nvme namespace. `nvme0n1` -> Some((7, "")); `nvme0n1p2` ->
-/// Some((7, "p2")). Shared by `nvme_partition_parent` here and
-/// `format::is_nvme_whole_disk`.
-pub(crate) fn parse_nvme(name: &str) -> Option<(usize, &str)> {
+/// whole-disk name slice and the remaining suffix after the namespace, or
+/// None when the name isn't a well-formed nvme namespace. `nvme0n1` ->
+/// Some(("nvme0n1", "")); `nvme0n1p2` -> Some(("nvme0n1", "p2")). Shared by
+/// `nvme_partition_parent` here and `format::is_nvme_whole_disk`.
+pub(crate) fn parse_nvme(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_prefix("nvme")?;
     let b = rest.as_bytes();
     let mut i = 0;
@@ -349,16 +348,16 @@ pub(crate) fn parse_nvme(name: &str) -> Option<(usize, &str)> {
         return None;
     }
     let end = "nvme".len() + i;
-    Some((end, &name[end..]))
+    Some((&name[..end], &name[end..]))
 }
 
 /// Hand-rolled `^(nvme[0-9]+n[0-9]+)p[0-9]+$` -> group 1.
 fn nvme_partition_parent(name: &str) -> Option<&str> {
-    let (parent_end, suffix) = parse_nvme(name)?;
+    let (parent, suffix) = parse_nvme(name)?;
     // The suffix must be exactly `p` followed by one or more digits.
     let digits = suffix.strip_prefix('p')?;
     if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
-        Some(&name[..parent_end])
+        Some(parent)
     } else {
         None
     }
@@ -406,10 +405,10 @@ mod tests {
     #[test]
     fn parse_nvme_shared() {
         // Whole disk: namespace runs to the end, empty suffix.
-        assert_eq!(parse_nvme("nvme0n1"), Some((7, "")));
-        assert_eq!(parse_nvme("nvme12n34"), Some((9, "")));
-        // Partition: suffix is the trailing `p<part>`.
-        assert_eq!(parse_nvme("nvme0n1p2"), Some((7, "p2")));
+        assert_eq!(parse_nvme("nvme0n1"), Some(("nvme0n1", "")));
+        assert_eq!(parse_nvme("nvme12n34"), Some(("nvme12n34", "")));
+        // Partition: parent is the whole-disk name, suffix the trailing `p<part>`.
+        assert_eq!(parse_nvme("nvme0n1p2"), Some(("nvme0n1", "p2")));
         // Not a well-formed namespace.
         assert_eq!(parse_nvme("nvme0"), None); // no `n<ns>`
         assert_eq!(parse_nvme("nvme0n"), None); // empty namespace
