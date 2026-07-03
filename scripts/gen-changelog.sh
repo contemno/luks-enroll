@@ -69,7 +69,14 @@ emit_stanza() {
         "$MAINTAINER_NAME" "$MAINTAINER_EMAIL" "$(format_date "$ref")"
 }
 
-tags="$(git tag --list 'v*' --sort=-v:refname)"
+# Exclude PR-preview tags (vX.Y.Z-pr<N>.…, created by pr-test-build.yml). They
+# pin an ephemeral per-PR build and point at unmerged PR commits that are not
+# part of release history, so they must not become changelog stanzas — and a
+# tag that isn't an ancestor of HEAD would otherwise reach the range logic
+# below. next-version.sh already ignores this non-plain form for the same
+# reason.
+tags="$(git tag --list 'v*' --sort=-v:refname \
+    | grep -vE '^v[0-9]+\.[0-9]+\.[0-9]+-pr[0-9]+\.' || true)"
 out=""
 
 # A tag pointing exactly at HEAD means we're building that tagged release (the
@@ -106,21 +113,12 @@ else
 fi
 
 # One stanza per tag, newest to oldest.
-prev=""
 for tag in $tags; do
     upstream="$(tag_to_upstream "$tag")"
-    if [ -z "$prev" ]; then
-        range="$tag"
-    else
-        range="${tag}..${prev}"
-        # We want commits *belonging to* $tag, i.e. up to and including $tag,
-        # but excluding commits from older tags. Recompute:
-        range="$(git merge-base "$tag" HEAD)..$tag"
-        # Simpler: list commits reachable from $tag but not from the previous
-        # (older) tag.
-    fi
-    # Always express the range as "older_tag..tag"; for the oldest tag use the
-    # full history up to that tag.
+    # Express the range as "older_tag..tag" — commits reachable from $tag but
+    # not from the next-older tag; for the oldest tag use the full history up to
+    # it. (Deliberately no `git merge-base` here: it aborts under `set -e` for a
+    # tag that shares no ancestor with HEAD, and the range below never needs it.)
     older="$(printf '%s\n' "$tags" | awk -v t="$tag" 'found{print;exit} $0==t{found=1}')"
     if [ -n "$older" ]; then
         range="${older}..${tag}"
@@ -128,7 +126,6 @@ for tag in $tags; do
         range="$tag"
     fi
     out+="$(emit_stanza "$upstream" "$range" "$tag")"$'\n'
-    prev="$tag"
 done
 
 mkdir -p debian
