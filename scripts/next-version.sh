@@ -16,7 +16,7 @@
 # floor never lowers or re-cuts a version.
 #
 # Prints the bare X.Y.Z to stdout; autotag.yml decorates it into the
-# vX.Y.Z / vX.Y.Z-dev.<date>.<sha> tag.
+# vX.Y.Z / vX.Y.Z-dev.<date>.<time>.<sha> tag.
 
 set -euo pipefail
 
