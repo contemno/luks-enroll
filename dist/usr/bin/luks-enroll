@@ -1025,23 +1025,29 @@ class EncryptDevicePage(Adw.NavigationPage):
         )
         prefs.add(warning_group)
 
-        pw_group = Adw.PreferencesGroup(title="Passphrase")
-        prefs.add(pw_group)
+        # No passphrase here: the partition is formatted with a cached volume
+        # key and you enroll a real method (FIDO2/TPM2/recovery, or a
+        # passphrase if you want one) on the detail page that opens next. This
+        # avoids a throwaway passphrase whose only job was to wrap a volume
+        # key we already know (issue #82, matching #58's image-file path).
+        info_group = Adw.PreferencesGroup()
+        prefs.add(info_group)
+        info_group.add(
+            Adw.ActionRow(
+                title="No passphrase needed",
+                subtitle="Pick how to unlock it on the next screen.",
+            )
+        )
 
-        self._pw_row = Adw.PasswordEntryRow(title="Passphrase")
-        pw_group.add(self._pw_row)
-
-        self._pw_confirm_row = Adw.PasswordEntryRow(title="Confirm Passphrase")
-        self._pw_confirm_row.connect("entry-activated", lambda _: self._do_encrypt())
-        pw_group.add(self._pw_confirm_row)
-
+        btn_group = Adw.PreferencesGroup()
+        prefs.add(btn_group)
         btn_row = Adw.ActionRow()
         self._encrypt_btn = Gtk.Button(label="Encrypt")
         self._encrypt_btn.add_css_class("destructive-action")
         self._encrypt_btn.set_valign(Gtk.Align.CENTER)
         self._encrypt_btn.connect("clicked", lambda _: self._do_encrypt())
         btn_row.add_suffix(self._encrypt_btn)
-        pw_group.add(btn_row)
+        btn_group.add(btn_row)
 
         # Status
         status_group = Adw.PreferencesGroup()
@@ -1056,26 +1062,16 @@ class EncryptDevicePage(Adw.NavigationPage):
         status_group.add(status_row)
 
     def _do_encrypt(self):
-        pw = self._pw_row.get_text()
-        confirm = self._pw_confirm_row.get_text()
-        if not pw:
-            self._status_label.set_text("Passphrase cannot be empty.")
-            self._status_label.add_css_class("error")
-            return
-        if pw != confirm:
-            self._status_label.set_text("Passphrases do not match.")
-            self._status_label.add_css_class("error")
-            return
-
         self._status_label.set_text("Encrypting…")
         self._status_label.remove_css_class("error")
         self._status_label.remove_css_class("success")
         self._spinner.start()
         self._encrypt_btn.set_sensitive(False)
-        self._pending_pw = pw
 
+        # Empty passphrase: the service formats a keyslot-less partition and
+        # caches its volume key for the first enrollment (issue #82).
         run_async(
-            lambda: self.svc.format_partition(self.device, pw), self._on_format_done
+            lambda: self.svc.format_partition(self.device, ""), self._on_format_done
         )
 
     def _on_format_done(self, ok, partition, stderr):
@@ -1086,11 +1082,12 @@ class EncryptDevicePage(Adw.NavigationPage):
             self._status_label.remove_css_class("error")
             self._status_label.add_css_class("success")
             self.list_page._populate()
-            # Navigate to the new encrypted partition's detail page
+            # Navigate to the new encrypted partition's detail page,
+            # pre-unlocked via the cached volume key (no passphrase was set).
             target = partition or self.device
             nav = self.get_ancestor(Adw.NavigationView)
             if nav:
-                detail = DeviceDetailPage(self.svc, target, passphrase=self._pending_pw)
+                detail = DeviceDetailPage(self.svc, target, volume_key_cached=True)
                 nav.push(detail)
         else:
             self._status_label.set_text(f"Failed: {stderr}")

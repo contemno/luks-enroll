@@ -186,9 +186,10 @@ class TestAppVersion(unittest.TestCase):
 
 
 class TestKeylessImageCreation(unittest.TestCase):
-    """Issue #58: creating an encrypted container needs no passphrase. The
-    service formats it with a cached volume key and the detail page opens
-    already unlocked, so the first enrollment wraps that key directly.
+    """Issue #58 (image files) and #82 (block devices): creating/encrypting a
+    container needs no passphrase. The service formats it with a cached
+    volume key and the detail page opens already unlocked, so the first
+    enrollment wraps that key directly.
 
     The GUI page classes subclass mocked GTK bases (so they're MagicMocks at
     import), hence these assert on the parsed source of each class body."""
@@ -222,11 +223,21 @@ class TestKeylessImageCreation(unittest.TestCase):
         # ... then hand off to the detail page as already-unlocked.
         self.assertIn("volume_key_cached=True", create)
 
-    def test_block_device_flow_still_uses_a_passphrase(self):
-        # Scope guard: this change is image-files-only. The block-device
-        # encrypt flow keeps its passphrase hand-off (its keyless/deferred
-        # variant is tracked separately).
-        self.assertIn("passphrase=self._pending_pw", self.classes["EncryptDevicePage"])
+    def test_encrypt_device_page_drops_passphrase_fields(self):
+        # Issue #82: extends the keyless format to the block-device path.
+        # The passphrase entry rows and their validation are gone — the user
+        # is never asked for a throwaway passphrase on encrypt.
+        encrypt = self.classes["EncryptDevicePage"]
+        self.assertNotIn("PasswordEntryRow", encrypt)
+        self.assertNotIn("Passphrases do not match", encrypt)
+        self.assertNotIn("Passphrase cannot be empty", encrypt)
+
+    def test_encrypt_device_uses_empty_passphrase_and_cached_handoff(self):
+        encrypt = self.classes["EncryptDevicePage"]
+        # Encrypt with an empty passphrase (keyless format) ...
+        self.assertIn('self.svc.format_partition(self.device, "")', encrypt)
+        # ... then hand off to the detail page as already-unlocked.
+        self.assertIn("volume_key_cached=True", encrypt)
 
 
 class TestRunAsync(unittest.TestCase):
