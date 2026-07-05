@@ -175,16 +175,20 @@ fn wait_for_partition_node(device: &str, partition: &str) -> bool {
     )
 }
 
-/// Subscribe to udev "block" events *before* triggering a `partprobe`,
-/// so the new partition's "add" event can't fire before we're
-/// listening, then wait up to `timeout` for it. Returns true once the
-/// wait completed one way or another (event seen, or timeout) — the
-/// caller checks the node's existence afterward, which is authoritative
-/// either way. Returns false only if the monitor itself couldn't be
-/// created (e.g. no /run/udev on this system), signaling the caller to
-/// fall back to polling.
+/// Subscribe directly to the kernel's "block" uevents (not udevd's
+/// re-broadcast socket — devtmpfs creates the device node the instant
+/// the kernel processes the partition table, independent of and
+/// earlier than udevd's own rule processing/blkid probing, so waiting
+/// on udevd here would reintroduce the same latency `udevadm settle`
+/// had) *before* triggering a `partprobe`, so the new partition's "add"
+/// event can't fire before we're listening, then wait up to `timeout`
+/// for it. Returns true once the wait completed one way or another
+/// (event seen, or timeout) — the caller checks the node's existence
+/// afterward, which is authoritative either way. Returns false only if
+/// the monitor itself couldn't be created (e.g. insufficient
+/// privilege), signaling the caller to fall back to polling.
 fn udev_wait_for_partition(device: &str, partition: &str, timeout: Duration) -> bool {
-    let Ok(socket) = MonitorBuilder::new()
+    let Ok(socket) = MonitorBuilder::new_kernel()
         .and_then(|b| b.match_subsystem("block"))
         .and_then(|b| b.listen())
     else {
