@@ -155,6 +155,13 @@ pub fn partprobe(device: &str) {
 /// partition first; existing partitions are wiped and formatted directly.
 /// Refuses non-removable devices. Returns the LUKS partition path, or an
 /// error message (logged, not sent to clients).
+///
+/// An empty passphrase means "no passphrase keyslot": the partition is
+/// formatted with a cached volume key and the first enrollment wraps it, so
+/// the user is never asked for a throwaway passphrase (mirrors the
+/// `CreateEncryptedImage` keyless path from issue #58, extended to removable
+/// media by #82). A non-empty passphrase keeps the classic behavior of
+/// seeding a password keyslot.
 pub fn format_removable_partition(
     device: &str,
     passphrase: &str,
@@ -167,7 +174,7 @@ pub fn format_removable_partition(
     if devices::is_partition(device) {
         // Existing partition: wipefs + luksFormat it directly.
         wipefs(device).map_err(|e| format!("wipefs failed: {e}"))?;
-        luks::format_luks2(device, passphrase).map_err(|e| format!("luksFormat failed: {e}"))?;
+        format_luks2(device, passphrase).map_err(|e| format!("luksFormat failed: {e}"))?;
         return Ok(device.to_string());
     }
 
@@ -199,8 +206,18 @@ pub fn format_removable_partition(
         ));
     }
 
-    luks::format_luks2(&partition, passphrase).map_err(|e| format!("luksFormat failed: {e}"))?;
+    format_luks2(&partition, passphrase).map_err(|e| format!("luksFormat failed: {e}"))?;
     Ok(partition)
+}
+
+/// Format `path` as LUKS2: keyless (cached volume key, no keyslot) when
+/// `passphrase` is empty, otherwise the classic passphrase-keyslot format.
+fn format_luks2(path: &str, passphrase: &str) -> Result<()> {
+    if passphrase.is_empty() {
+        luks::format_luks2_keyless(path)
+    } else {
+        luks::format_luks2(path, passphrase).map(|_| ())
+    }
 }
 
 /// Create a sparse image file of `size_mb` MiB (1..=8192) at `path`,
@@ -347,6 +364,54 @@ mod tests {
     fn format_removable_partition_refuses_non_removable() {
         let err = format_removable_partition("/nonexistent/luks-enroll-dev", "pw").unwrap_err();
         assert_eq!(err, "Refusing to format non-removable device");
+    }
+
+    // `format_removable_partition` itself can't be exercised end-to-end here
+    // (it gates on a real sysfs "removable" device), so these pin the
+    // passphrase-vs-keyless branch in its `format_luks2` dispatch helper
+    // directly -- the same logic `format_removable_partition` calls at both
+    // of its call sites (issue #82).
+
+    #[test]
+    fn format_luks2_dispatch_seeds_a_keyslot_for_a_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pw.img").to_string_lossy().into_owned();
+        File::create(&path)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+
+        format_luks2(&path, "correcthorse").unwrap();
+
+        assert_eq!(luks::password_keyslots(&path), vec![0]);
+        assert_eq!(luks::verify_passphrase(&path, "correcthorse"), Ok(0));
+    }
+
+    #[test]
+    fn format_luks2_dispatch_is_keyless_and_caches_vk_for_an_empty_passphrase() {
+        // Mirrors the CreateEncryptedImage keyless path (issue #58): an empty
+        // passphrase must create no keyslot and instead cache the volume key
+        // so the first enrollment can wrap it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("keyless.img")
+            .to_string_lossy()
+            .into_owned();
+        File::create(&path)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        luks::clear_volume_key_cache(&path);
+
+        format_luks2(&path, "").unwrap();
+
+        assert!(
+            luks::list_keyslots(&path).is_empty(),
+            "no keyslots persisted"
+        );
+        // The only way to get a volume key back with no keyslot is the cache.
+        assert!(luks::get_volume_key(&path, "passphrase", "", "").is_ok());
     }
 
     #[test]
