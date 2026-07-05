@@ -151,6 +151,64 @@ pub fn partprobe(device: &str) {
     }
 }
 
+/// Worst-case fallback poll budget, matching the pre-existing behavior:
+/// up to 20 x 500ms = 10s.
+const FALLBACK_POLL_ITERATIONS: u32 = 20;
+const FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// `udevadm settle` timeout, bounded to the same 10s worst case.
+const UDEVADM_SETTLE_TIMEOUT_SECS: u64 = 10;
+
+/// Wait for a partition device node to appear after (re)partitioning.
+/// Prefers an event-driven `udevadm settle` over sleep-polling; falls
+/// back to the fixed-interval poll when `udevadm` isn't installed.
+fn wait_for_partition_node(device: &str, partition: &str) -> bool {
+    partprobe(device);
+    wait_for_node(
+        partition,
+        || udevadm_settle(UDEVADM_SETTLE_TIMEOUT_SECS),
+        || partprobe(device),
+        FALLBACK_POLL_ITERATIONS,
+        FALLBACK_POLL_INTERVAL,
+    )
+}
+
+/// Run `udevadm settle --timeout=<secs>`. Returns true if udevadm could
+/// be spawned (regardless of its exit status — node existence is
+/// checked separately and is authoritative either way), false if it
+/// isn't installed (spawn failed, e.g. ENOENT), signaling the caller to
+/// fall back to polling.
+fn udevadm_settle(timeout_secs: u64) -> bool {
+    std::process::Command::new("udevadm")
+        .arg("settle")
+        .arg(format!("--timeout={timeout_secs}"))
+        .status()
+        .is_ok()
+}
+
+/// Testable core of `wait_for_partition_node`: `settle` attempts the
+/// event-driven wait (true if it ran, false if unavailable); on `false`,
+/// `reprobe` is called between up to `fallback_iterations` existence
+/// checks spaced `fallback_interval` apart.
+fn wait_for_node(
+    partition: &str,
+    settle: impl FnOnce() -> bool,
+    mut reprobe: impl FnMut(),
+    fallback_iterations: u32,
+    fallback_interval: Duration,
+) -> bool {
+    if settle() {
+        return Path::new(partition).exists();
+    }
+    for _ in 0..fallback_iterations {
+        if Path::new(partition).exists() {
+            return true;
+        }
+        reprobe();
+        thread::sleep(fallback_interval);
+    }
+    Path::new(partition).exists()
+}
+
 /// Format a removable device with LUKS2. Whole disks get GPT + one LUKS
 /// partition first; existing partitions are wiped and formatted directly.
 /// Refuses non-removable devices. Returns the LUKS partition path, or an
@@ -191,16 +249,7 @@ pub fn format_removable_partition(
     };
 
     // Wait for the partition device node to appear.
-    let mut appeared = false;
-    for _ in 0..20 {
-        if Path::new(&partition).exists() {
-            appeared = true;
-            break;
-        }
-        partprobe(device);
-        thread::sleep(Duration::from_millis(500));
-    }
-    if !appeared {
+    if !wait_for_partition_node(device, &partition) {
         return Err(format!(
             "Partition {partition} did not appear after formatting"
         ));
@@ -358,6 +407,64 @@ mod tests {
         );
         // Rejected before any file I/O.
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn partition_wait_returns_once_node_appears_via_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part1");
+        File::create(&path).unwrap();
+        // settle "ran" (true) and the node already exists: no polling.
+        assert!(wait_for_node(
+            path.to_str().unwrap(),
+            || true,
+            || panic!("reprobe should not be called when settle succeeds"),
+            0,
+            Duration::from_millis(0),
+        ));
+    }
+
+    #[test]
+    fn partition_wait_errors_on_timeout_via_settle() {
+        // settle "ran" (true) but the node never shows up: no fallback
+        // poll is attempted, so this returns immediately.
+        assert!(!wait_for_node(
+            "/nonexistent/luks-enroll-partition",
+            || true,
+            || panic!("reprobe should not be called when settle succeeds"),
+            0,
+            Duration::from_millis(0),
+        ));
+    }
+
+    #[test]
+    fn partition_wait_falls_back_to_polling_when_settle_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part1");
+        // Node appears only after the first reprobe.
+        let mut reprobed = false;
+        assert!(wait_for_node(
+            path.to_str().unwrap(),
+            || false,
+            || {
+                reprobed = true;
+                File::create(&path).unwrap();
+            },
+            FALLBACK_POLL_ITERATIONS,
+            Duration::from_millis(0),
+        ));
+        assert!(reprobed);
+    }
+
+    #[test]
+    fn partition_wait_fallback_poll_errors_on_timeout() {
+        assert!(!wait_for_node(
+            "/nonexistent/luks-enroll-partition",
+            || false,
+            || {},
+            2,
+            Duration::from_millis(0),
+        ));
     }
 
     #[test]
