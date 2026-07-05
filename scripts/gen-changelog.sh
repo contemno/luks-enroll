@@ -40,7 +40,7 @@ format_date() {
 
 # Convert a tag to a Debian upstream version:
 #   "v1.2.3"                      -> "1.2.3"
-#   "v1.2.3-dev.20260616.2eaa4ff" -> "1.2.3~dev.20260616.2eaa4ff"
+#   "v1.2.3-dev.20260616.140533.2eaa4ff" -> "1.2.3~dev.20260616.140533.2eaa4ff"
 # Any prerelease suffix after the X.Y.Z core has its leading '-' turned into
 # '~' so the prerelease sorts *below* the corresponding release in dpkg's
 # version ordering, and the upstream version carries no '-' (which would
