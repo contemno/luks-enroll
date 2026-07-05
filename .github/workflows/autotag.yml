@@ -1,8 +1,9 @@
 name: Auto-tag
 
 # Automatically tag (and release) on every push/merge to a tracked branch:
-#   * dev  -> prerelease tag  vX.Y.Z-dev.<UTC-date>.<short-sha>, published as a
-#             GitHub *prerelease*.
+#   * dev  -> prerelease tag  vX.Y.Z-dev.<UTC-date>.<UTC-time>.<short-sha>,
+#             published as a GitHub *prerelease*. The <UTC-time> (HHMMSS)
+#             keeps same-day prereleases sorting chronologically (see #79).
 #   * main -> release tag     vX.Y.Z (next version per scripts/next-version.sh),
 #             published as a full release.
 #
@@ -70,7 +71,13 @@ jobs:
             tag="v${next}"
             prerelease=false
           else
-            tag="v${next}-dev.$(date -u +%Y%m%d).$(git rev-parse --short HEAD)"
+            # Include the UTC time (.HHMMSS) alongside the date so multiple
+            # prereleases built on the same day sort chronologically: semver
+            # compares the dot-separated <date>.<time> as numeric identifiers
+            # left-to-right, so the newer build always ranks above the older
+            # one. Without the time the same-day tie-break fell to the short
+            # SHA, which semver compares lexically (effectively random). See #79.
+            tag="v${next}-dev.$(date -u +%Y%m%d.%H%M%S).$(git rev-parse --short HEAD)"
             prerelease=true
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
