@@ -10,14 +10,16 @@
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpt::disk::LogicalBlockSize;
 use gpt::mbr::ProtectiveMBR;
 use gpt::{partition_types, GptConfig};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use udev::{EventType, MonitorBuilder};
 
 use crate::error::{cstring, Error, Result};
 use crate::{bail, devices, luks};
@@ -155,34 +157,61 @@ pub fn partprobe(device: &str) {
 /// up to 20 x 500ms = 10s.
 const FALLBACK_POLL_ITERATIONS: u32 = 20;
 const FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(500);
-/// `udevadm settle` timeout, bounded to the same 10s worst case.
-const UDEVADM_SETTLE_TIMEOUT_SECS: u64 = 10;
+/// Bound on the event-driven udev wait, matching the same 10s worst case.
+const UDEV_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wait for a partition device node to appear after (re)partitioning.
-/// Prefers an event-driven `udevadm settle` over sleep-polling; falls
-/// back to the fixed-interval poll when `udevadm` isn't installed.
+/// Prefers an in-process udev netlink monitor (reacting to the kernel's
+/// "add" uevent for the new partition the moment it fires) over
+/// sleep-polling; falls back to the fixed-interval poll if a udev
+/// monitor can't be set up on this system.
 fn wait_for_partition_node(device: &str, partition: &str) -> bool {
-    partprobe(device);
     wait_for_node(
         partition,
-        || udevadm_settle(UDEVADM_SETTLE_TIMEOUT_SECS),
+        || udev_wait_for_partition(device, partition, UDEV_WAIT_TIMEOUT),
         || partprobe(device),
         FALLBACK_POLL_ITERATIONS,
         FALLBACK_POLL_INTERVAL,
     )
 }
 
-/// Run `udevadm settle --timeout=<secs>`. Returns true if udevadm could
-/// be spawned (regardless of its exit status — node existence is
-/// checked separately and is authoritative either way), false if it
-/// isn't installed (spawn failed, e.g. ENOENT), signaling the caller to
+/// Subscribe to udev "block" events *before* triggering a `partprobe`,
+/// so the new partition's "add" event can't fire before we're
+/// listening, then wait up to `timeout` for it. Returns true once the
+/// wait completed one way or another (event seen, or timeout) — the
+/// caller checks the node's existence afterward, which is authoritative
+/// either way. Returns false only if the monitor itself couldn't be
+/// created (e.g. no /run/udev on this system), signaling the caller to
 /// fall back to polling.
-fn udevadm_settle(timeout_secs: u64) -> bool {
-    std::process::Command::new("udevadm")
-        .arg("settle")
-        .arg(format!("--timeout={timeout_secs}"))
-        .status()
-        .is_ok()
+fn udev_wait_for_partition(device: &str, partition: &str, timeout: Duration) -> bool {
+    let Ok(socket) = MonitorBuilder::new()
+        .and_then(|b| b.match_subsystem("block"))
+        .and_then(|b| b.listen())
+    else {
+        return false;
+    };
+
+    let sysname = devices::basename(partition);
+    partprobe(device);
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return true;
+        };
+        let Ok(timeout_ms) = PollTimeout::try_from(remaining) else {
+            return true;
+        };
+        let mut fds = [PollFd::new(socket.as_fd(), PollFlags::POLLIN)];
+        if poll(&mut fds, timeout_ms).is_err() {
+            return true;
+        }
+        for event in socket.iter() {
+            if event.event_type() == EventType::Add && event.sysname().to_str() == Some(sysname) {
+                return true;
+            }
+        }
+    }
 }
 
 /// Testable core of `wait_for_partition_node`: `settle` attempts the
