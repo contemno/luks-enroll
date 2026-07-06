@@ -192,6 +192,10 @@ fn udev_wait_for_partition(device: &str, partition: &str, timeout: Duration) -> 
         .and_then(|b| b.match_subsystem("block"))
         .and_then(|b| b.listen())
     else {
+        eprintln!(
+            "udev kernel-uevent monitor unavailable (falling back to polling): \
+             is AF_NETLINK in the service unit's RestrictAddressFamilies?"
+        );
         return false;
     };
 

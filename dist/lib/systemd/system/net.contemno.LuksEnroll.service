@@ -26,7 +26,11 @@ RestrictSUIDSGID=yes
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
 RestrictNamespaces=yes
-RestrictAddressFamilies=AF_UNIX
+# AF_NETLINK: format.rs's udev partition-wait opens a NETLINK_KOBJECT_UEVENT
+# socket (kernel uevents only, no actual network I/O) to react to the new
+# partition device node the instant it appears; without it, socket() fails
+# with EAFNOSUPPORT and the code silently falls back to sleep-polling.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
 DeviceAllow=block-* rw
