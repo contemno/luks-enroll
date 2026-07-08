@@ -111,19 +111,17 @@ pub fn detect_removable_devices() -> Value {
 /// filesystem}.
 pub fn get_device_info(device: &str) -> Value {
     // Size: file length for regular files, sysfs sector count otherwise.
-    let mut size = String::new();
-    match fs::metadata(device) {
-        Ok(md) if md.is_file() => size = format_size(md.len()),
+    let size = match fs::metadata(device) {
+        Ok(md) if md.is_file() => format_size(md.len()),
         _ => {
             let parent = parent_device_name(device);
             let base = basename(device);
-            let sectors = read_sysfs(&format!("/sys/block/{parent}/{base}/size"))
-                .or_else(|| read_sysfs(&format!("/sys/block/{base}/size")));
-            if let Some(n) = sectors.and_then(|s| s.parse::<u64>().ok()) {
-                size = format_size(n * 512);
-            }
+            block_device_size(
+                &format!("/sys/block/{parent}/{base}/size"),
+                &format!("/sys/block/{base}/size"),
+            )
         }
-    }
+    };
 
     // Mount point: second field of the first /proc/mounts line whose
     // first field is exactly this device path.
@@ -269,8 +267,10 @@ fn crypttab_devices(crypttab: &Path, by_uuid_dir: &Path) -> Vec<String> {
 }
 
 /// Like Python's os.path.realpath: canonicalize, falling back to the
-/// input path when resolution fails.
-fn canonicalize_lossy(path: &Path) -> String {
+/// input path when resolution fails. Accepts `&Path` or `&str` so the
+/// device-path callers in `luks` share this one implementation.
+pub(crate) fn canonicalize_lossy(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
     fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
@@ -286,12 +286,32 @@ pub(crate) fn read_sysfs(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+/// Sector count from a sysfs `size` file, or None if missing/unparseable.
+/// Kept distinct from `sysfs_size_bytes`' 0 so a genuine zero-sector device
+/// is not conflated with an absent file (see `block_device_size`).
+fn sysfs_sectors(path: &str) -> Option<u64> {
+    read_sysfs(path).and_then(|s| s.parse::<u64>().ok())
+}
+
 /// Sector count from a sysfs `size` file, in bytes (0 if missing/bad).
 fn sysfs_size_bytes(path: &str) -> u64 {
-    read_sysfs(path)
-        .and_then(|s| s.parse::<u64>().ok())
+    sysfs_sectors(path)
         .map(|sectors| sectors * 512)
         .unwrap_or(0)
+}
+
+/// Human-readable size for a block device from its sysfs `size` (a sector
+/// count): try the parent-qualified path first (a partition under its disk),
+/// then the bare basename (a whole disk). Empty when neither file exists; a
+/// present zero-sector device still formats to "0 B" -- matching
+/// `detect_removable_devices` and the pre-consolidation behaviour, which is
+/// why this reads sectors as an Option instead of folding a real 0 into
+/// `sysfs_size_bytes`' missing-sentinel.
+fn block_device_size(parent_size_path: &str, base_size_path: &str) -> String {
+    sysfs_sectors(parent_size_path)
+        .or_else(|| sysfs_sectors(base_size_path))
+        .map(|sectors| format_size(sectors * 512))
+        .unwrap_or_default()
 }
 
 /// Directory entry names, sorted; empty when unreadable.
@@ -312,8 +332,12 @@ fn is_virtual_block_name(name: &str) -> bool {
     name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram")
 }
 
-/// Hand-rolled `^(nvme[0-9]+n[0-9]+)p[0-9]+$` -> group 1.
-fn nvme_partition_parent(name: &str) -> Option<&str> {
+/// Parse an `nvme<ctrl>n<ns>` device name (the whole-disk shape). Returns the
+/// whole-disk name slice and the remaining suffix after the namespace, or
+/// None when the name isn't a well-formed nvme namespace. `nvme0n1` ->
+/// Some(("nvme0n1", "")); `nvme0n1p2` -> Some(("nvme0n1", "p2")). Shared by
+/// `nvme_partition_parent` here and `format::is_nvme_whole_disk`.
+pub(crate) fn parse_nvme(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_prefix("nvme")?;
     let b = rest.as_bytes();
     let mut i = 0;
@@ -329,19 +353,23 @@ fn nvme_partition_parent(name: &str) -> Option<&str> {
     while i < b.len() && b[i].is_ascii_digit() {
         i += 1;
     }
-    if i == ns_start || i >= b.len() || b[i] != b'p' {
+    if i == ns_start {
         return None;
     }
-    let parent_end = "nvme".len() + i;
-    i += 1;
-    let part_start = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
+    let end = "nvme".len() + i;
+    Some((&name[..end], &name[end..]))
+}
+
+/// Hand-rolled `^(nvme[0-9]+n[0-9]+)p[0-9]+$` -> group 1.
+fn nvme_partition_parent(name: &str) -> Option<&str> {
+    let (parent, suffix) = parse_nvme(name)?;
+    // The suffix must be exactly `p` followed by one or more digits.
+    let digits = suffix.strip_prefix('p')?;
+    if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
+        Some(parent)
+    } else {
+        None
     }
-    if i == part_start || i != b.len() {
-        return None;
-    }
-    Some(&name[..parent_end])
 }
 
 /// Hand-rolled `^([a-z]+)[0-9]+$` -> the letters. Lowercase ASCII only,
@@ -384,6 +412,74 @@ mod tests {
     }
 
     #[test]
+    fn parse_nvme_shared() {
+        // Whole disk: namespace runs to the end, empty suffix.
+        assert_eq!(parse_nvme("nvme0n1"), Some(("nvme0n1", "")));
+        assert_eq!(parse_nvme("nvme12n34"), Some(("nvme12n34", "")));
+        // Partition: parent is the whole-disk name, suffix the trailing `p<part>`.
+        assert_eq!(parse_nvme("nvme0n1p2"), Some(("nvme0n1", "p2")));
+        // Not a well-formed namespace.
+        assert_eq!(parse_nvme("nvme0"), None); // no `n<ns>`
+        assert_eq!(parse_nvme("nvme0n"), None); // empty namespace
+        assert_eq!(parse_nvme("sda"), None); // not nvme
+    }
+
+    #[test]
+    fn sysfs_size_bytes_reads_sectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("size");
+        fs::write(&ok, "2048\n").unwrap();
+        // sectors * 512.
+        assert_eq!(sysfs_size_bytes(ok.to_str().unwrap()), 2048 * 512);
+        // Missing or non-numeric -> 0 (used by detect_removable_devices).
+        assert_eq!(
+            sysfs_size_bytes(dir.path().join("absent").to_str().unwrap()),
+            0
+        );
+        let bad = dir.path().join("bad");
+        fs::write(&bad, "not-a-number").unwrap();
+        assert_eq!(sysfs_size_bytes(bad.to_str().unwrap()), 0);
+    }
+
+    #[test]
+    fn block_device_size_prefers_parent_then_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent_size");
+        let base = dir.path().join("base_size");
+        let (parent_p, base_p) = (parent.to_str().unwrap(), base.to_str().unwrap());
+
+        // Parent-qualified path present -> used.
+        fs::write(&parent, "2048\n").unwrap();
+        fs::write(&base, "4096\n").unwrap();
+        assert_eq!(block_device_size(parent_p, base_p), format_size(2048 * 512));
+
+        // Parent missing -> fall back to the bare basename.
+        fs::remove_file(&parent).unwrap();
+        assert_eq!(block_device_size(parent_p, base_p), format_size(4096 * 512));
+
+        // Regression guard (get_device_info parity): a present zero-sector
+        // device still reports "0 B" -- it must NOT be swallowed as if the
+        // file were missing.
+        fs::write(&base, "0\n").unwrap();
+        assert_eq!(block_device_size(parent_p, base_p), "0 B");
+
+        // Neither present -> empty string.
+        fs::remove_file(&base).unwrap();
+        assert_eq!(block_device_size(parent_p, base_p), "");
+    }
+
+    #[test]
+    fn get_device_info_reports_regular_file_size() {
+        // The regular-file branch of the GetDeviceInfo entry point is the one
+        // size path testable without /sys: size is the file length.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        fs::write(f.path(), vec![0u8; 3000]).unwrap();
+        let info = get_device_info(f.path().to_str().unwrap());
+        assert_eq!(info["size"], json!(format_size(3000)));
+        assert_eq!(info["device"], json!(f.path().to_str().unwrap()));
+    }
+
+    #[test]
     fn parent_device_name_cases() {
         assert_eq!(parent_device_name("sda1"), "sda");
         assert_eq!(parent_device_name("sdb"), "sdb");
@@ -397,6 +493,26 @@ mod tests {
         // Full paths reduce to their basename first.
         assert_eq!(parent_device_name("/dev/sda1"), "sda");
         assert_eq!(parent_device_name("/dev/nvme0n1p2"), "nvme0n1");
+    }
+
+    #[test]
+    fn canonicalize_lossy_str_and_path() {
+        // A nonexistent path resolves to nothing, so the input is returned
+        // verbatim -- and the &str overload (the luks cache call site) yields
+        // the same string as the original input.
+        assert_eq!(
+            canonicalize_lossy("/nonexistent/luks-enroll-canon-test"),
+            "/nonexistent/luks-enroll-canon-test"
+        );
+
+        // A real path resolves the same whether passed as &str or &Path.
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let want = fs::canonicalize(f.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(canonicalize_lossy(f.path()), want);
+        assert_eq!(canonicalize_lossy(f.path().to_str().unwrap()), want);
     }
 
     #[test]
