@@ -69,14 +69,14 @@ emit_stanza() {
         "$MAINTAINER_NAME" "$MAINTAINER_EMAIL" "$(format_date "$ref")"
 }
 
-# Exclude PR-preview tags (vX.Y.Z-pr<N>.…, created by pr-test-build.yml). They
-# pin an ephemeral per-PR build and point at unmerged PR commits that are not
-# part of release history, so they must not become changelog stanzas — and a
-# tag that isn't an ancestor of HEAD would otherwise reach the range logic
+# Exclude PR-preview tags (vX.Y.Z-<date>.pr<N>.…, created by pr-test-build.yml).
+# They pin an ephemeral per-PR build and point at unmerged PR commits that are
+# not part of release history, so they must not become changelog stanzas — and
+# a tag that isn't an ancestor of HEAD would otherwise reach the range logic
 # below. next-version.sh already ignores this non-plain form for the same
 # reason.
 tags="$(git tag --list 'v*' --sort=-v:refname \
-    | grep -vE '^v[0-9]+\.[0-9]+\.[0-9]+-pr[0-9]+\.' || true)"
+    | grep -vE '^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+\.pr[0-9]+\.' || true)"
 out=""
 
 # A tag pointing exactly at HEAD means we're building that tagged release (the

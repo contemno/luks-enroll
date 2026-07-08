@@ -5,10 +5,12 @@ gen-changelog.sh runs inside the Debian build (via debian/rules) and derives
 the package version + changelog from git tags. It iterates every `v*` tag, so
 tags that are NOT part of release history must not break it.
 
-pr-test-build.yml tags a labeled PR's HEAD as `v<ver>-pr<N>.<...>`. That commit
-is unmerged and can share no common ancestor with the release HEAD (e.g. after
-dev is rebased), which previously aborted the build: a `git merge-base <tag>
-HEAD` under `set -e` exited non-zero on such a tag. These tests pin that a
+pr-test-build.yml tags a labeled PR's HEAD as `v<ver>-<date>.pr<N>.<sha>` (the
+timestamp precedes `pr<N>` so a later build always outranks an earlier one in
+dpkg's version comparison, regardless of PR number). That commit is unmerged
+and can share no common ancestor with the release HEAD (e.g. after dev is
+rebased), which previously aborted the build: a `git merge-base <tag> HEAD`
+under `set -e` exited non-zero on such a tag. These tests pin that a
 PR-preview tag on an unrelated commit (a) doesn't break generation and (b) is
 excluded from the changelog, while a real release tag still versions the top
 stanza.
@@ -78,10 +80,17 @@ class GenChangelogTests(unittest.TestCase):
         # exact shape that broke the release build.
         git(self.repo, "checkout", "-q", "--orphan", "pr-branch")
         pr_sha = commit(self.repo, "fix: work in progress on a PR", "d")
-        git(self.repo, "tag", f"v0.2.1-pr99.{pr_sha}")
+        git(self.repo, "tag", f"v0.2.1-202601010000.pr99.{pr_sha}")
         self.assertEqual(
             subprocess.run(
-                ["git", "-C", self.repo, "merge-base", f"v0.2.1-pr99.{pr_sha}", "main"],
+                [
+                    "git",
+                    "-C",
+                    self.repo,
+                    "merge-base",
+                    f"v0.2.1-202601010000.pr99.{pr_sha}",
+                    "main",
+                ],
                 env=GIT_ENV,
                 capture_output=True,
             ).returncode,
@@ -124,7 +133,7 @@ class GenChangelogTests(unittest.TestCase):
         self.assertEqual(self._run().returncode, 0)
         changelog = self._changelog()
         self.assertNotIn("pr99", changelog)
-        self.assertNotIn("~pr", changelog)
+        self.assertNotIn("~202601010000", changelog)
         # Real releases and mainline prereleases are still present.
         self.assertIn("(0.2.0-1)", changelog)
         self.assertIn("(0.1.0-1)", changelog)
