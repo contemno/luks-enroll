@@ -935,18 +935,14 @@ class DeviceListPage(Adw.NavigationPage):
             nav.push(detail)
 
     def _on_encrypt_clicked(self, _btn, device, size_str):
-        """Push the encrypt page for an unencrypted device."""
-        nav = self.get_ancestor(Adw.NavigationView)
-        if nav:
-            page = EncryptDevicePage(self.svc, device, size_str, self)
-            nav.push(page)
+        """Present the encrypt dialog for an unencrypted device."""
+        dialog = EncryptDevicePage(self.svc, device, size_str, self)
+        dialog.present(self)
 
     def _on_create_image(self, _row):
-        """Push the create image page onto the navigation view."""
-        nav = self.get_ancestor(Adw.NavigationView)
-        if nav:
-            page = CreateImagePage(self.svc, self)
-            nav.push(page)
+        """Present the create-image dialog."""
+        dialog = CreateImagePage(self.svc, self)
+        dialog.present(self)
 
     def _on_open_image(self, _row):
         """Open a file chooser to select an existing encrypted image file."""
@@ -995,14 +991,38 @@ class DeviceListPage(Adw.NavigationPage):
             self._populate()
 
 
-class EncryptDevicePage(Adw.NavigationPage):
-    """Page for encrypting an unencrypted removable device."""
+class FormatDialogBase(Adw.Dialog):
+    """Shared chrome for the one-shot format dialogs (encrypt a device,
+    create an image file): header/toolbar, status spinner + label + submit
+    button row, and the common success/failure tail. Each is used exactly
+    once per device/file, so it's a modal dialog rather than a pushed nav
+    page — closing it always returns to the device list, never to a stale
+    format page (issue #86).
 
-    def __init__(self, svc, device, size_str, list_page):
-        super().__init__(title="Encrypt Device")
+    Subclasses supply the target-specific input widgets (``build_target_
+    groups``) and the submit handler that makes the actual D-Bus call
+    (``_on_submit_clicked``), then report the outcome via
+    ``_on_format_success``/``_on_format_failure``. The two targets format
+    differently under the hood — a block device is a sync call that polls
+    for a new partition node, an image file is an async fd-based call with
+    no polling (see issue #86's investigation comment) — so that dispatch
+    stays in the subclasses; only the chrome and hand-off are shared.
+    """
+
+    def __init__(
+        self, svc, list_page, *, title, submit_label, submit_css_class, success_text
+    ):
+        super().__init__(title=title)
+        # Adw.Dialog shrinks to its content's natural size by default, which
+        # for a PreferencesPage-based form ends up far smaller than the old
+        # full-page layout (issue #86 review: rendered as ~a quarter of the
+        # main window). Pin a size closer to what the pushed pages used to
+        # occupy; the inner ScrolledWindow still scrolls if content grows.
+        self.set_content_width(480)
+        self.set_content_height(560)
         self.svc = svc
-        self.device = device
         self.list_page = list_page
+        self._success_text = success_text
 
         toolbar_view = Adw.ToolbarView()
         self.set_child(toolbar_view)
@@ -1015,10 +1035,101 @@ class EncryptDevicePage(Adw.NavigationPage):
         prefs = Adw.PreferencesPage()
         scroll.set_child(prefs)
 
+        self.build_target_groups(prefs)
+
+        action_group = Adw.PreferencesGroup()
+        prefs.add(action_group)
+
+        self._status_label = Gtk.Label(label="", xalign=0, wrap=True)
+        self._status_label.set_margin_start(16)
+        self._status_label.set_margin_end(16)
+
+        self._spinner = Gtk.Spinner()
+        self._spinner.set_margin_start(16)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_margin_start(16)
+        btn_box.set_margin_end(16)
+        btn_box.set_margin_top(8)
+        btn_box.set_margin_bottom(16)
+        btn_box.append(self._spinner)
+        btn_box.append(self._status_label)
+
+        self._submit_btn = Gtk.Button(label=submit_label)
+        self._submit_btn.add_css_class(submit_css_class)
+        self._submit_btn.set_halign(Gtk.Align.END)
+        self._submit_btn.set_hexpand(True)
+        self._submit_btn.connect("clicked", self._on_submit_clicked)
+        btn_box.append(self._submit_btn)
+
+        status_row = Adw.ActionRow()
+        status_row.set_child(btn_box)
+        action_group.add(status_row)
+
+    def build_target_groups(self, prefs):
+        """Subclasses add their target-specific PreferencesGroups here."""
+        raise NotImplementedError
+
+    def _on_submit_clicked(self, _btn):
+        """Subclasses validate input and kick off the D-Bus call."""
+        raise NotImplementedError
+
+    def _begin_submit(self, busy_text):
+        self._status_label.set_text(busy_text)
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+        self._spinner.start()
+        self._submit_btn.set_sensitive(False)
+
+    def refresh_list(self):
+        """Refresh the device list after a successful format. Overridden by
+        subclasses whose target isn't already tracked (e.g. a brand-new
+        image file needs to be added, not just re-scanned)."""
+        self.list_page._populate()
+
+    def _on_format_success(self, target):
+        self._spinner.stop()
+        self._submit_btn.set_sensitive(True)
+        self._status_label.set_text(self._success_text)
+        self._status_label.remove_css_class("error")
+        self._status_label.add_css_class("success")
+        self.refresh_list()
+        self.close()
+        # Open the new volume's detail page, pre-unlocked via the cached
+        # volume key (no passphrase was set on create).
+        nav = self.list_page.get_ancestor(Adw.NavigationView)
+        if nav:
+            detail = DeviceDetailPage(self.svc, target, volume_key_cached=True)
+            nav.push(detail)
+
+    def _on_format_failure(self, error):
+        self._spinner.stop()
+        self._submit_btn.set_sensitive(True)
+        self._status_label.set_text(f"Failed: {error}")
+        self._status_label.add_css_class("error")
+        self._status_label.remove_css_class("success")
+
+
+class EncryptDevicePage(FormatDialogBase):
+    """Dialog for encrypting an unencrypted removable device."""
+
+    def __init__(self, svc, device, size_str, list_page):
+        self.device = device
+        self.size_str = size_str
+        super().__init__(
+            svc,
+            list_page,
+            title="Encrypt Device",
+            submit_label="Encrypt",
+            submit_css_class="destructive-action",
+            success_text="Encrypted successfully.",
+        )
+
+    def build_target_groups(self, prefs):
         warning_group = Adw.PreferencesGroup(
             title="Encrypt Device",
             description=(
-                f"This will erase ALL data on {device} ({size_str}) "
+                f"This will erase ALL data on {self.device} ({self.size_str}) "
                 "and create an encrypted LUKS2 partition.\n\n"
                 "This action cannot be undone."
             ),
@@ -1039,35 +1150,8 @@ class EncryptDevicePage(Adw.NavigationPage):
             )
         )
 
-        btn_group = Adw.PreferencesGroup()
-        prefs.add(btn_group)
-        btn_row = Adw.ActionRow()
-        self._encrypt_btn = Gtk.Button(label="Encrypt")
-        self._encrypt_btn.add_css_class("destructive-action")
-        self._encrypt_btn.set_valign(Gtk.Align.CENTER)
-        self._encrypt_btn.connect("clicked", lambda _: self._do_encrypt())
-        btn_row.add_suffix(self._encrypt_btn)
-        btn_group.add(btn_row)
-
-        # Status
-        status_group = Adw.PreferencesGroup()
-        prefs.add(status_group)
-        self._spinner = Gtk.Spinner()
-        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
-        status_row = Adw.ActionRow()
-        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        status_box.append(self._spinner)
-        status_box.append(self._status_label)
-        status_row.add_suffix(status_box)
-        status_group.add(status_row)
-
-    def _do_encrypt(self):
-        self._status_label.set_text("Encrypting…")
-        self._status_label.remove_css_class("error")
-        self._status_label.remove_css_class("success")
-        self._spinner.start()
-        self._encrypt_btn.set_sensitive(False)
-
+    def _on_submit_clicked(self, _btn):
+        self._begin_submit("Encrypting…")
         # Empty passphrase: the service formats a keyslot-less partition and
         # caches its volume key for the first enrollment (issue #82).
         run_async(
@@ -1075,45 +1159,26 @@ class EncryptDevicePage(Adw.NavigationPage):
         )
 
     def _on_format_done(self, ok, partition, stderr):
-        self._spinner.stop()
-        self._encrypt_btn.set_sensitive(True)
         if ok:
-            self._status_label.set_text("Encrypted successfully.")
-            self._status_label.remove_css_class("error")
-            self._status_label.add_css_class("success")
-            self.list_page._populate()
-            # Navigate to the new encrypted partition's detail page,
-            # pre-unlocked via the cached volume key (no passphrase was set).
-            target = partition or self.device
-            nav = self.get_ancestor(Adw.NavigationView)
-            if nav:
-                detail = DeviceDetailPage(self.svc, target, volume_key_cached=True)
-                nav.push(detail)
+            self._on_format_success(partition or self.device)
         else:
-            self._status_label.set_text(f"Failed: {stderr}")
-            self._status_label.add_css_class("error")
-            self._status_label.remove_css_class("success")
+            self._on_format_failure(stderr)
 
 
-class CreateImagePage(Adw.NavigationPage):
-    """Page for creating a new LUKS-encrypted image file."""
+class CreateImagePage(FormatDialogBase):
+    """Dialog for creating a new LUKS-encrypted image file."""
 
     def __init__(self, svc, list_page):
-        super().__init__(title="Create Encrypted File")
-        self.svc = svc
-        self.list_page = list_page
+        super().__init__(
+            svc,
+            list_page,
+            title="Create Encrypted File",
+            submit_label="Create",
+            submit_css_class="suggested-action",
+            success_text="Created successfully.",
+        )
 
-        toolbar_view = Adw.ToolbarView()
-        self.set_child(toolbar_view)
-        toolbar_view.add_top_bar(Adw.HeaderBar())
-
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        toolbar_view.set_content(scroll)
-
-        prefs = Adw.PreferencesPage()
-        scroll.set_child(prefs)
-
+    def build_target_groups(self, prefs):
         # File location group
         loc_group = Adw.PreferencesGroup(
             title="File Location",
@@ -1158,36 +1223,6 @@ class CreateImagePage(Adw.NavigationPage):
             )
         )
 
-        # Status + action
-        action_group = Adw.PreferencesGroup()
-        prefs.add(action_group)
-
-        self._status_label = Gtk.Label(label="", xalign=0, wrap=True)
-        self._status_label.set_margin_start(16)
-        self._status_label.set_margin_end(16)
-
-        self._spinner = Gtk.Spinner()
-        self._spinner.set_margin_start(16)
-
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        btn_box.set_margin_start(16)
-        btn_box.set_margin_end(16)
-        btn_box.set_margin_top(8)
-        btn_box.set_margin_bottom(16)
-        btn_box.append(self._spinner)
-        btn_box.append(self._status_label)
-
-        self._create_btn = Gtk.Button(label="Create")
-        self._create_btn.add_css_class("suggested-action")
-        self._create_btn.set_halign(Gtk.Align.END)
-        self._create_btn.set_hexpand(True)
-        self._create_btn.connect("clicked", self._on_create)
-        btn_box.append(self._create_btn)
-
-        status_row = Adw.ActionRow()
-        status_row.set_child(btn_box)
-        action_group.add(status_row)
-
     def _on_browse(self, _row):
         """Open a save-file dialog for choosing image location."""
         win = self.get_root()
@@ -1206,7 +1241,7 @@ class CreateImagePage(Adw.NavigationPage):
         if path:
             self._path_row.set_text(path)
 
-    def _on_create(self, _btn):
+    def _on_submit_clicked(self, _btn):
         path = self._path_row.get_text().strip()
         size_mb = int(self._size_spin.get_value())
 
@@ -1215,43 +1250,28 @@ class CreateImagePage(Adw.NavigationPage):
             self._status_label.add_css_class("error")
             return
 
-        self._status_label.set_text("Creating…")
-        self._status_label.remove_css_class("error")
-        self._status_label.remove_css_class("success")
-        self._spinner.start()
-        self._create_btn.set_sensitive(False)
+        self._begin_submit("Creating…")
         self._pending_path = path
 
         # Empty passphrase: the service formats a keyslot-less container and
         # caches its volume key for the first enrollment (issue #58).
         self.svc.create_encrypted_image_async(path, size_mb, "", self._on_create_finish)
 
+    def refresh_list(self):
+        self.list_page.add_image_file(self._pending_path)
+
     def _on_create_finish(self, proxy, result):
         """Async callback — runs on main thread after D-Bus call completes."""
-        path = self._pending_path
         try:
             res = self.svc.finish_async(proxy, result)
             ok, _keyslot, error = res.unpack()
         except GLib.Error as e:
             ok, error = False, f"D-Bus error: {e.message}"
 
-        self._spinner.stop()
-        self._create_btn.set_sensitive(True)
         if ok:
-            self._status_label.set_text("Created successfully.")
-            self._status_label.remove_css_class("error")
-            self._status_label.add_css_class("success")
-            self.list_page.add_image_file(path)
-            # Replace this page with the device detail page, pre-unlocked via
-            # the cached volume key (no passphrase was set on create).
-            nav = self.get_ancestor(Adw.NavigationView)
-            if nav:
-                detail = DeviceDetailPage(self.svc, path, volume_key_cached=True)
-                nav.push(detail)
+            self._on_format_success(self._pending_path)
         else:
-            self._status_label.set_text(f"Failed: {error}")
-            self._status_label.add_css_class("error")
-            self._status_label.remove_css_class("success")
+            self._on_format_failure(error)
 
 
 class DeviceDetailPage(Adw.NavigationPage):
