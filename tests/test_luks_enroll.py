@@ -220,8 +220,9 @@ class TestKeylessImageCreation(unittest.TestCase):
         create = self.classes["CreateImagePage"]
         # Create with an empty passphrase (keyless format) ...
         self.assertIn('create_encrypted_image_async(path, size_mb, "", ', create)
-        # ... then hand off to the detail page as already-unlocked.
-        self.assertIn("volume_key_cached=True", create)
+        # ... then hand off to the shared success tail (FormatDialogBase),
+        # which does the volume_key_cached=True detail-page push.
+        self.assertIn("self._on_format_success(self._pending_path)", create)
 
     def test_encrypt_device_page_drops_passphrase_fields(self):
         # Issue #82: extends the keyless format to the block-device path.
@@ -236,8 +237,63 @@ class TestKeylessImageCreation(unittest.TestCase):
         encrypt = self.classes["EncryptDevicePage"]
         # Encrypt with an empty passphrase (keyless format) ...
         self.assertIn('self.svc.format_partition(self.device, "")', encrypt)
-        # ... then hand off to the detail page as already-unlocked.
-        self.assertIn("volume_key_cached=True", encrypt)
+        # ... then hand off to the shared success tail (FormatDialogBase),
+        # which does the volume_key_cached=True detail-page push.
+        self.assertIn("self._on_format_success(partition or self.device)", encrypt)
+
+
+class TestFormatDialogConsolidation(unittest.TestCase):
+    """Issue #86: EncryptDevicePage/CreateImagePage became Adw.Dialogs (not
+    pushed Adw.NavigationPages), so the back button from the detail page that
+    opens after a successful format lands on the device list, never on a now-
+    stale format page. The two share a FormatDialogBase for their chrome and
+    the success/failure hand-off; only the target-specific input widgets and
+    the D-Bus dispatch stay in the subclasses.
+
+    Same source-based approach as TestKeylessImageCreation: the page classes
+    subclass mocked GTK bases, so real instantiation isn't meaningful here."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        cls.classes = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+        cls.bases = {
+            node.name: [ast.unparse(b) for b in node.bases]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+
+    def test_format_dialogs_subclass_shared_base_not_nav_page(self):
+        self.assertEqual(self.bases["FormatDialogBase"], ["Adw.Dialog"])
+        self.assertEqual(self.bases["EncryptDevicePage"], ["FormatDialogBase"])
+        self.assertEqual(self.bases["CreateImagePage"], ["FormatDialogBase"])
+
+    def test_list_page_presents_dialogs_instead_of_pushing(self):
+        list_page = self.classes["DeviceListPage"]
+        self.assertIn("EncryptDevicePage(self.svc, device, size_str, self)", list_page)
+        self.assertIn("CreateImagePage(self.svc, self)", list_page)
+        self.assertIn("dialog.present(self)", list_page)
+        # No more pushing these onto the nav stack.
+        self.assertNotIn("nav.push(page)", list_page)
+
+    def test_shared_success_and_failure_tail_lives_in_base_only(self):
+        base = self.classes["FormatDialogBase"]
+        self.assertIn("self.close()", base)
+        self.assertIn("volume_key_cached=True", base)
+        self.assertIn("nav.push(detail)", base)
+        # Subclasses delegate rather than duplicating the close/push tail.
+        for name in ("EncryptDevicePage", "CreateImagePage"):
+            cls_src = self.classes[name]
+            self.assertNotIn("self.close()", cls_src)
+            self.assertNotIn("volume_key_cached=True", cls_src)
+            self.assertIn("_on_format_success", cls_src)
+            self.assertIn("_on_format_failure", cls_src)
 
 
 class TestRunAsync(unittest.TestCase):
