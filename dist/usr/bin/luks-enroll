@@ -883,6 +883,18 @@ class DeviceListPage(Adw.NavigationPage):
                         row.add_suffix(encrypt_btn)
                         self._apply_lock_state(row, part_path)
                         self._add_row(self.removable_group, row, f"rem:{part_path}")
+            elif rdev.get("size_bytes") == 0:
+                # Empty reader (e.g. an SD/TF card slot with no card
+                # inserted): zero-size and no partitions, so there's
+                # nothing to encrypt yet.
+                row = Adw.ActionRow(
+                    title=dev_path,
+                    subtitle="Empty — insert a memory card to encrypt",
+                )
+                row.add_css_class("dim-label")
+                row.set_activatable(False)
+                row.set_sensitive(False)
+                self._add_row(self.removable_group, row, f"rem:{dev_path}")
             else:
                 subtitle = f"{dev_size}"
                 if dev_label:
