@@ -305,6 +305,43 @@ class TestFormatDialogConsolidation(unittest.TestCase):
             self.assertIn("_on_format_failure", cls_src)
 
 
+class TestEmptyRemovableReaderRendering(unittest.TestCase):
+    """A removable device with size_bytes == 0 and no partitions (e.g. an
+    empty SD/TF card reader) must render as a dimmed, non-activatable row
+    with no Encrypt button (#89), distinct from a real zero-partition
+    device that just hasn't been formatted yet.
+
+    Same AST source-based approach as TestFormatDialogConsolidation: the
+    page classes subclass mocked GTK bases, so real instantiation isn't
+    meaningful here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        cls.classes = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+
+    def test_empty_reader_branch_is_dimmed_and_not_activatable(self):
+        list_page = self.classes["DeviceListPage"]
+        self.assertIn('rdev.get("size_bytes") == 0', list_page)
+        self.assertIn("Empty — insert a memory card to encrypt", list_page)
+
+    def test_empty_reader_branch_precedes_the_no_partitions_fallback(self):
+        # The zero-size check must be an elif ahead of the generic
+        # no-partitions branch, or every unformatted device (not just
+        # empty readers) would lose its Encrypt button.
+        list_page = self.classes["DeviceListPage"]
+        empty_idx = list_page.index('rdev.get("size_bytes") == 0')
+        fallback_idx = list_page.index('subtitle += " — No partitions"')
+        self.assertLess(empty_idx, fallback_idx)
+
+
 class TestRunAsync(unittest.TestCase):
     """run_async runs the call off-thread and routes the result (or a
     synthesized D-Bus error triple) to the callback via GLib.idle_add."""
