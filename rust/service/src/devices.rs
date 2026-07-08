@@ -53,8 +53,14 @@ pub fn find_luks_block_devices() -> Vec<String> {
 
 /// Removable devices with their partitions, as the JSON structure the
 /// client expects from DetectRemovableDevices:
-/// [{device, partitions: [{device, size, label, encrypted, luks_device?}],
-///   size, label}]
+/// [{device, partitions: [{device, size, size_bytes, label, encrypted,
+///   luks_device?}], size, size_bytes, label}]
+///
+/// `size_bytes` is additive alongside the existing formatted `size`
+/// string, so the D-Bus signature (a JSON string) is unchanged; it lets
+/// the client distinguish a real zero-byte device (e.g. an empty memory
+/// card reader) from one it just hasn't sized yet, without parsing the
+/// human-readable string.
 pub fn detect_removable_devices() -> Value {
     // Get all LUKS devices in one scan for efficiency.
     let luks_devices: HashSet<String> = find_luks_block_devices().into_iter().collect();
@@ -83,27 +89,44 @@ pub fn detect_removable_devices() -> Value {
             let part_size_bytes = sysfs_size_bytes(&format!("/sys/block/{dev_name}/{entry}/size"));
             let part_label = blkid_tag(&part_path, "LABEL").unwrap_or_default();
             let part_encrypted = luks_devices.contains(&part_path);
-            let mut part_info = json!({
-                "device": part_path,
-                "size": format_size(part_size_bytes),
-                "label": part_label,
-                "encrypted": part_encrypted,
-            });
-            if part_encrypted {
-                part_info["luks_device"] = Value::String(part_path);
-            }
-            partitions.push(part_info);
+            partitions.push(partition_json(
+                &part_path,
+                part_size_bytes,
+                &part_label,
+                part_encrypted,
+            ));
         }
 
-        results.push(json!({
-            "device": dev_path,
-            "partitions": partitions,
-            "size": format_size(size_bytes),
-            "label": label,
-        }));
+        results.push(device_json(&dev_path, partitions, size_bytes, &label));
     }
 
     Value::Array(results)
+}
+
+/// JSON for one removable-device partition entry (pure, for testability).
+fn partition_json(part_path: &str, size_bytes: u64, label: &str, encrypted: bool) -> Value {
+    let mut part_info = json!({
+        "device": part_path,
+        "size": format_size(size_bytes),
+        "size_bytes": size_bytes,
+        "label": label,
+        "encrypted": encrypted,
+    });
+    if encrypted {
+        part_info["luks_device"] = Value::String(part_path.to_string());
+    }
+    part_info
+}
+
+/// JSON for one removable-device entry (pure, for testability).
+fn device_json(dev_path: &str, partitions: Vec<Value>, size_bytes: u64, label: &str) -> Value {
+    json!({
+        "device": dev_path,
+        "partitions": partitions,
+        "size": format_size(size_bytes),
+        "size_bytes": size_bytes,
+        "label": label,
+    })
 }
 
 /// Detailed info for one device, as the JSON structure the client expects
@@ -381,6 +404,32 @@ mod tests {
         assert_eq!(format_size(1_500_000), "1.5 MB");
         assert_eq!(format_size(32_000_000_000), "32.0 GB");
         assert_eq!(format_size(2_000_000_000_000), "2.0 TB");
+    }
+
+    #[test]
+    fn device_json_includes_numeric_size_bytes() {
+        // Pins the empty-reader case (#89): a zero-size removable device
+        // with no partitions must round-trip size_bytes == 0 so the
+        // client can distinguish it from a real device without parsing
+        // the formatted "size" string.
+        let empty_reader = device_json("/dev/sdb", Vec::new(), 0, "");
+        assert_eq!(empty_reader["size_bytes"], json!(0));
+        assert_eq!(empty_reader["size"], json!("0 B"));
+
+        let real_device = device_json("/dev/sda", Vec::new(), 32_000_000_000, "USB");
+        assert_eq!(real_device["size_bytes"], json!(32_000_000_000_u64));
+        assert_eq!(real_device["size"], json!("32.0 GB"));
+    }
+
+    #[test]
+    fn partition_json_includes_numeric_size_bytes() {
+        let part = partition_json("/dev/sdb1", 1_500_000, "DATA", false);
+        assert_eq!(part["size_bytes"], json!(1_500_000_u64));
+        assert_eq!(part["size"], json!("1.5 MB"));
+        assert!(part.get("luks_device").is_none());
+
+        let encrypted = partition_json("/dev/sda1", 32_000_000_000, "", true);
+        assert_eq!(encrypted["luks_device"], json!("/dev/sda1"));
     }
 
     #[test]
