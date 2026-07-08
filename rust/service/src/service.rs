@@ -988,16 +988,14 @@ impl LuksEnrollService {
         device: String,
         passphrase: String,
     ) -> Result<Triple, SvcError> {
-        // Timed alongside format_removable_partition's per-stage logs (#84):
-        // delay in the polkit gate would be invisible to those.
-        let t = std::time::Instant::now();
-        let device = self
-            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
-            .await?;
-        eprintln!(
-            "FormatPartition: polkit/device gate took {}ms",
-            t.elapsed().as_millis()
-        );
+        // Timed alongside format_removable_partition's per-stage timers
+        // (#84, LUKS_ENROLL_TIMING gated): delay in the polkit gate would
+        // be invisible to those.
+        let device = {
+            let _t = crate::luks::Timer::new("FormatPartition: polkit/device gate");
+            self.gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
+                .await?
+        };
         blocking(move || op_format_partition(&device, &passphrase)).await
     }
 

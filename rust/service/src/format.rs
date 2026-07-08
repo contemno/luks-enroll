@@ -22,6 +22,7 @@ use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use udev::{EventType, MonitorBuilder};
 
 use crate::error::{cstring, Error, Result};
+use crate::luks::Timer;
 use crate::{bail, devices, luks};
 
 /// Linux LUKS partition type GUID (sgdisk shortcode 8309).
@@ -261,15 +262,10 @@ pub fn format_removable_partition(
     device: &str,
     passphrase: &str,
 ) -> std::result::Result<String, String> {
-    // Per-stage timing to the journal: the whole-disk delay (#84) survived
-    // three fixes to the partition-node wait, so instrument every stage to
-    // pinpoint where the wall-clock time actually goes on real hardware.
-    let timed = |stage: &str, since: Instant| {
-        eprintln!(
-            "format_removable_partition: {stage} took {}ms",
-            since.elapsed().as_millis()
-        );
-    };
+    // Per-stage timing (LUKS_ENROLL_TIMING gated, like luks::Timer's other
+    // users): the whole-disk delay (#84) survived three fixes to the
+    // partition-node wait before per-stage timing pinned it on the
+    // crypt_format keyslots-area wipe, so keep the stages measurable.
 
     // Safety: refuse non-removable.
     if !devices::is_removable(device) {
@@ -278,22 +274,24 @@ pub fn format_removable_partition(
 
     if devices::is_partition(device) {
         // Existing partition: wipefs + luksFormat it directly.
-        let t = Instant::now();
-        wipefs(device).map_err(|e| format!("wipefs failed: {e}"))?;
-        timed("wipefs", t);
-        let t = Instant::now();
+        {
+            let _t = Timer::new("format_removable_partition: wipefs");
+            wipefs(device).map_err(|e| format!("wipefs failed: {e}"))?;
+        }
+        let _t = Timer::new("format_removable_partition: luksFormat");
         format_luks2(device, passphrase).map_err(|e| format!("luksFormat failed: {e}"))?;
-        timed("luksFormat", t);
         return Ok(device.to_string());
     }
 
     // Whole disk: wipe signatures, then GPT + single LUKS partition.
-    let t = Instant::now();
-    wipefs(device).map_err(|e| format!("wipefs failed: {e}"))?;
-    timed("wipefs", t);
-    let t = Instant::now();
-    gpt_zap_and_partition(device).map_err(|e| format!("GPT partitioning failed: {e}"))?;
-    timed("GPT partitioning", t);
+    {
+        let _t = Timer::new("format_removable_partition: wipefs");
+        wipefs(device).map_err(|e| format!("wipefs failed: {e}"))?;
+    }
+    {
+        let _t = Timer::new("format_removable_partition: GPT partitioning");
+        gpt_zap_and_partition(device).map_err(|e| format!("GPT partitioning failed: {e}"))?;
+    }
 
     // Partition node naming: nvme whole disks get a "p" separator.
     let base = devices::basename(device);
@@ -304,17 +302,17 @@ pub fn format_removable_partition(
     };
 
     // Wait for the partition device node to appear.
-    let t = Instant::now();
-    if !wait_for_partition_node(device, &partition) {
-        return Err(format!(
-            "Partition {partition} did not appear after formatting"
-        ));
+    {
+        let _t = Timer::new("format_removable_partition: partition-node wait");
+        if !wait_for_partition_node(device, &partition) {
+            return Err(format!(
+                "Partition {partition} did not appear after formatting"
+            ));
+        }
     }
-    timed("partition-node wait", t);
 
-    let t = Instant::now();
+    let _t = Timer::new("format_removable_partition: luksFormat");
     format_luks2(&partition, passphrase).map_err(|e| format!("luksFormat failed: {e}"))?;
-    timed("luksFormat", t);
     Ok(partition)
 }
 
