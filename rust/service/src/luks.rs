@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use libcryptsetup_rs::consts::flags::{CryptPbkdf, CryptVolumeKey};
-use libcryptsetup_rs::consts::vals::{CryptKdf, EncryptionFormat};
+use libcryptsetup_rs::consts::vals::{CryptKdf, EncryptionFormat, KeyslotsSize, MetadataSize};
 use libcryptsetup_rs::{CryptDevice, CryptInit, CryptPbkdfType, Either, LibcryptErr, TokenInput};
 use zeroize::Zeroizing;
 
@@ -615,11 +615,43 @@ pub fn destroy_keyslot(device: &str, slot: i32) -> Result<()> {
         .map_err(|e| Error(format!("crypt_keyslot_destroy failed: {e}")))
 }
 
+/// Keyslots-area size used when formatting removable media: 4 MiB (~14
+/// 512-bit argon2 keyslots) instead of libcryptsetup's 16 MiB default (32).
+/// `crypt_format` zero-wipes the entire keyslots area, and on slow USB flash
+/// that wipe dominated whole-disk encryption wall-clock time (#84): measured
+/// 33.5 MB written per format at the default vs 9.5 MB at 4 MiB.
+pub const COMPACT_KEYSLOTS_SIZE: u64 = 4 * 1024 * 1024;
+
+/// The keyslots-area size to format with. `Compact` trades unused keyslot
+/// capacity for a much smaller format-time wipe on slow media (see
+/// [`COMPACT_KEYSLOTS_SIZE`]); `Default` keeps libcryptsetup's 16 MiB.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyslotsArea {
+    Default,
+    Compact,
+}
+
+/// Apply `area` to a not-yet-formatted crypt device. Must run before
+/// `crypt_format`, which snapshots the sizes into the on-disk header.
+fn apply_keyslots_area(dev: &mut CryptDevice, area: KeyslotsArea) -> Result<()> {
+    if area == KeyslotsArea::Compact {
+        dev.settings_handle()
+            .set_metadata_size(
+                MetadataSize::Kb16, // the libcryptsetup default, stated explicitly
+                KeyslotsSize::try_from(COMPACT_KEYSLOTS_SIZE)
+                    .expect("4 MiB is 4 KiB-aligned and under the 128 MiB cap"),
+            )
+            .map_err(|e| Error(format!("crypt_set_metadata_size failed: {e}")))?;
+    }
+    Ok(())
+}
+
 /// LUKS2-format a device or image file (aes-xts-plain64, 512-bit volume
 /// key) and add the passphrase. Returns the keyslot number.
-pub fn format_luks2(path: &str, passphrase: &str) -> Result<i32> {
+pub fn format_luks2(path: &str, passphrase: &str, area: KeyslotsArea) -> Result<i32> {
     let _t = Timer::new("format_luks2");
     let mut dev = CryptInit::init(Path::new(path)).map_err(|_| Error::from("crypt_init failed"))?;
+    apply_keyslots_area(&mut dev, area)?;
     dev.context_handle()
         .format::<()>(
             EncryptionFormat::Luks2,
@@ -650,11 +682,12 @@ pub fn format_luks2(path: &str, passphrase: &str) -> Result<i32> {
 /// normal (keyslot) path, so an abandoned, never-enrolled volume is an empty
 /// throwaway, not a lock-out. The caller MUST make the next step a
 /// keyslot-adding enrollment (which `get_volume_key` serves from this cache).
-pub fn format_luks2_keyless(path: &str) -> Result<()> {
+pub fn format_luks2_keyless(path: &str, area: KeyslotsArea) -> Result<()> {
     let _t = Timer::new("format_luks2_keyless");
     let mut vk = Zeroizing::new(vec![0u8; 64]);
     getrandom::fill(vk.as_mut_slice()).expect("OS RNG unavailable");
     let mut dev = CryptInit::init(Path::new(path)).map_err(|_| Error::from("crypt_init failed"))?;
+    apply_keyslots_area(&mut dev, area)?;
     dev.context_handle()
         .format::<()>(
             EncryptionFormat::Luks2,

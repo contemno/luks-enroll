@@ -10,16 +10,19 @@
 use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpt::disk::LogicalBlockSize;
 use gpt::mbr::ProtectiveMBR;
 use gpt::{partition_types, GptConfig};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use udev::{EventType, MonitorBuilder};
 
 use crate::error::{cstring, Error, Result};
+use crate::luks::Timer;
 use crate::{bail, devices, luks};
 
 /// Linux LUKS partition type GUID (sgdisk shortcode 8309).
@@ -151,6 +154,99 @@ pub fn partprobe(device: &str) {
     }
 }
 
+/// Worst-case fallback poll budget, matching the pre-existing behavior:
+/// up to 20 x 500ms = 10s.
+const FALLBACK_POLL_ITERATIONS: u32 = 20;
+const FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Bound on the event-driven udev wait, matching the same 10s worst case.
+const UDEV_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wait for a partition device node to appear after (re)partitioning.
+/// Prefers an in-process udev netlink monitor (reacting to the kernel's
+/// "add" uevent for the new partition the moment it fires) over
+/// sleep-polling; falls back to the fixed-interval poll if a udev
+/// monitor can't be set up on this system.
+fn wait_for_partition_node(device: &str, partition: &str) -> bool {
+    wait_for_node(
+        partition,
+        || udev_wait_for_partition(device, partition, UDEV_WAIT_TIMEOUT),
+        || partprobe(device),
+        FALLBACK_POLL_ITERATIONS,
+        FALLBACK_POLL_INTERVAL,
+    )
+}
+
+/// Subscribe directly to the kernel's "block" uevents (not udevd's
+/// re-broadcast socket — devtmpfs creates the device node the instant
+/// the kernel processes the partition table, independent of and
+/// earlier than udevd's own rule processing/blkid probing, so waiting
+/// on udevd here would reintroduce the same latency `udevadm settle`
+/// had) *before* triggering a `partprobe`, so the new partition's "add"
+/// event can't fire before we're listening, then wait up to `timeout`
+/// for it. Returns true once the wait completed one way or another
+/// (event seen, or timeout) — the caller checks the node's existence
+/// afterward, which is authoritative either way. Returns false only if
+/// the monitor itself couldn't be created (e.g. insufficient
+/// privilege), signaling the caller to fall back to polling.
+fn udev_wait_for_partition(device: &str, partition: &str, timeout: Duration) -> bool {
+    let Ok(socket) = MonitorBuilder::new_kernel()
+        .and_then(|b| b.match_subsystem("block"))
+        .and_then(|b| b.listen())
+    else {
+        eprintln!(
+            "udev kernel-uevent monitor unavailable (falling back to polling): \
+             is AF_NETLINK in the service unit's RestrictAddressFamilies?"
+        );
+        return false;
+    };
+
+    let sysname = devices::basename(partition);
+    partprobe(device);
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return true;
+        };
+        let Ok(timeout_ms) = PollTimeout::try_from(remaining) else {
+            return true;
+        };
+        let mut fds = [PollFd::new(socket.as_fd(), PollFlags::POLLIN)];
+        if poll(&mut fds, timeout_ms).is_err() {
+            return true;
+        }
+        for event in socket.iter() {
+            if event.event_type() == EventType::Add && event.sysname().to_str() == Some(sysname) {
+                return true;
+            }
+        }
+    }
+}
+
+/// Testable core of `wait_for_partition_node`: `settle` attempts the
+/// event-driven wait (true if it ran, false if unavailable); on `false`,
+/// `reprobe` is called between up to `fallback_iterations` existence
+/// checks spaced `fallback_interval` apart.
+fn wait_for_node(
+    partition: &str,
+    settle: impl FnOnce() -> bool,
+    mut reprobe: impl FnMut(),
+    fallback_iterations: u32,
+    fallback_interval: Duration,
+) -> bool {
+    if settle() {
+        return Path::new(partition).exists();
+    }
+    for _ in 0..fallback_iterations {
+        if Path::new(partition).exists() {
+            return true;
+        }
+        reprobe();
+        thread::sleep(fallback_interval);
+    }
+    Path::new(partition).exists()
+}
+
 /// Format a removable device with LUKS2. Whole disks get GPT + one LUKS
 /// partition first; existing partitions are wiped and formatted directly.
 /// Refuses non-removable devices. Returns the LUKS partition path, or an
@@ -166,6 +262,11 @@ pub fn format_removable_partition(
     device: &str,
     passphrase: &str,
 ) -> std::result::Result<String, String> {
+    // Per-stage timing (LUKS_ENROLL_TIMING gated, like luks::Timer's other
+    // users): the whole-disk delay (#84) survived three fixes to the
+    // partition-node wait before per-stage timing pinned it on the
+    // crypt_format keyslots-area wipe, so keep the stages measurable.
+
     // Safety: refuse non-removable.
     if !devices::is_removable(device) {
         return Err("Refusing to format non-removable device".to_string());
@@ -173,14 +274,24 @@ pub fn format_removable_partition(
 
     if devices::is_partition(device) {
         // Existing partition: wipefs + luksFormat it directly.
-        wipefs(device).map_err(|e| format!("wipefs failed: {e}"))?;
+        {
+            let _t = Timer::new("format_removable_partition: wipefs");
+            wipefs(device).map_err(|e| format!("wipefs failed: {e}"))?;
+        }
+        let _t = Timer::new("format_removable_partition: luksFormat");
         format_luks2(device, passphrase).map_err(|e| format!("luksFormat failed: {e}"))?;
         return Ok(device.to_string());
     }
 
     // Whole disk: wipe signatures, then GPT + single LUKS partition.
-    wipefs(device).map_err(|e| format!("wipefs failed: {e}"))?;
-    gpt_zap_and_partition(device).map_err(|e| format!("GPT partitioning failed: {e}"))?;
+    {
+        let _t = Timer::new("format_removable_partition: wipefs");
+        wipefs(device).map_err(|e| format!("wipefs failed: {e}"))?;
+    }
+    {
+        let _t = Timer::new("format_removable_partition: GPT partitioning");
+        gpt_zap_and_partition(device).map_err(|e| format!("GPT partitioning failed: {e}"))?;
+    }
 
     // Partition node naming: nvme whole disks get a "p" separator.
     let base = devices::basename(device);
@@ -191,32 +302,30 @@ pub fn format_removable_partition(
     };
 
     // Wait for the partition device node to appear.
-    let mut appeared = false;
-    for _ in 0..20 {
-        if Path::new(&partition).exists() {
-            appeared = true;
-            break;
+    {
+        let _t = Timer::new("format_removable_partition: partition-node wait");
+        if !wait_for_partition_node(device, &partition) {
+            return Err(format!(
+                "Partition {partition} did not appear after formatting"
+            ));
         }
-        partprobe(device);
-        thread::sleep(Duration::from_millis(500));
-    }
-    if !appeared {
-        return Err(format!(
-            "Partition {partition} did not appear after formatting"
-        ));
     }
 
+    let _t = Timer::new("format_removable_partition: luksFormat");
     format_luks2(&partition, passphrase).map_err(|e| format!("luksFormat failed: {e}"))?;
     Ok(partition)
 }
 
 /// Format `path` as LUKS2: keyless (cached volume key, no keyslot) when
 /// `passphrase` is empty, otherwise the classic passphrase-keyslot format.
+/// Removable media always get the compact keyslots area: `crypt_format`
+/// zero-wipes the whole area, and on slow USB flash the default 16 MiB
+/// wipe was the dominant cost of whole-disk encryption (#84).
 fn format_luks2(path: &str, passphrase: &str) -> Result<()> {
     if passphrase.is_empty() {
-        luks::format_luks2_keyless(path)
+        luks::format_luks2_keyless(path, luks::KeyslotsArea::Compact)
     } else {
-        luks::format_luks2(path, passphrase).map(|_| ())
+        luks::format_luks2(path, passphrase, luks::KeyslotsArea::Compact).map(|_| ())
     }
 }
 
@@ -361,6 +470,64 @@ mod tests {
     }
 
     #[test]
+    fn partition_wait_returns_once_node_appears_via_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part1");
+        File::create(&path).unwrap();
+        // settle "ran" (true) and the node already exists: no polling.
+        assert!(wait_for_node(
+            path.to_str().unwrap(),
+            || true,
+            || panic!("reprobe should not be called when settle succeeds"),
+            0,
+            Duration::from_millis(0),
+        ));
+    }
+
+    #[test]
+    fn partition_wait_errors_on_timeout_via_settle() {
+        // settle "ran" (true) but the node never shows up: no fallback
+        // poll is attempted, so this returns immediately.
+        assert!(!wait_for_node(
+            "/nonexistent/luks-enroll-partition",
+            || true,
+            || panic!("reprobe should not be called when settle succeeds"),
+            0,
+            Duration::from_millis(0),
+        ));
+    }
+
+    #[test]
+    fn partition_wait_falls_back_to_polling_when_settle_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part1");
+        // Node appears only after the first reprobe.
+        let mut reprobed = false;
+        assert!(wait_for_node(
+            path.to_str().unwrap(),
+            || false,
+            || {
+                reprobed = true;
+                File::create(&path).unwrap();
+            },
+            FALLBACK_POLL_ITERATIONS,
+            Duration::from_millis(0),
+        ));
+        assert!(reprobed);
+    }
+
+    #[test]
+    fn partition_wait_fallback_poll_errors_on_timeout() {
+        assert!(!wait_for_node(
+            "/nonexistent/luks-enroll-partition",
+            || false,
+            || {},
+            2,
+            Duration::from_millis(0),
+        ));
+    }
+
+    #[test]
     fn format_removable_partition_refuses_non_removable() {
         let err = format_removable_partition("/nonexistent/luks-enroll-dev", "pw").unwrap_err();
         assert_eq!(err, "Refusing to format non-removable device");
@@ -412,6 +579,38 @@ mod tests {
         );
         // The only way to get a volume key back with no keyslot is the cache.
         assert!(luks::get_volume_key(&path, "passphrase", "", "").is_ok());
+    }
+
+    #[test]
+    fn removable_format_uses_compact_keyslots_area() {
+        // The removable dispatch must format with the shrunken keyslots
+        // area: crypt_format wipes the whole area and the default 16 MiB
+        // wipe was the dominant whole-disk encryption cost on USB flash
+        // (#84). Pin the on-disk size so a refactor can't silently revert
+        // to the slow default.
+        use libcryptsetup_rs::consts::vals::EncryptionFormat;
+        use libcryptsetup_rs::CryptInit;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("compact.img")
+            .to_string_lossy()
+            .into_owned();
+        File::create(&path)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        luks::clear_volume_key_cache(&path);
+
+        format_luks2(&path, "").unwrap();
+
+        let mut dev = CryptInit::init(Path::new(&path)).unwrap();
+        dev.context_handle()
+            .load::<()>(Some(EncryptionFormat::Luks2), None)
+            .unwrap();
+        let (_, keyslots_size) = dev.settings_handle().get_metadata_size().unwrap();
+        assert_eq!(*keyslots_size, luks::COMPACT_KEYSLOTS_SIZE);
     }
 
     #[test]

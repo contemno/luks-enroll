@@ -578,11 +578,13 @@ pub fn op_create_image_fd(path: &str, passphrase: &str) -> (bool, i32, String) {
 /// of seeding a password keyslot. Returns the first keyslot, or -1 when none
 /// was created.
 fn format_container(path: &str, passphrase: &str) -> crate::error::Result<i32> {
+    // Image files keep libcryptsetup's default keyslots area; only the
+    // removable-media path opts into the compact one (see format.rs / #84).
     if passphrase.is_empty() {
-        luks::format_luks2_keyless(path)?;
+        luks::format_luks2_keyless(path, luks::KeyslotsArea::Default)?;
         Ok(-1)
     } else {
-        luks::format_luks2(path, passphrase)
+        luks::format_luks2(path, passphrase, luks::KeyslotsArea::Default)
     }
 }
 
@@ -986,9 +988,14 @@ impl LuksEnrollService {
         device: String,
         passphrase: String,
     ) -> Result<Triple, SvcError> {
-        let device = self
-            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
-            .await?;
+        // Timed alongside format_removable_partition's per-stage timers
+        // (#84, LUKS_ENROLL_TIMING gated): delay in the polkit gate would
+        // be invisible to those.
+        let device = {
+            let _t = crate::luks::Timer::new("FormatPartition: polkit/device gate");
+            self.gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
+                .await?
+        };
         blocking(move || op_format_partition(&device, &passphrase)).await
     }
 
