@@ -320,11 +320,14 @@ pub fn format_removable_partition(
 
 /// Format `path` as LUKS2: keyless (cached volume key, no keyslot) when
 /// `passphrase` is empty, otherwise the classic passphrase-keyslot format.
+/// Removable media always get the compact keyslots area: `crypt_format`
+/// zero-wipes the whole area, and on slow USB flash the default 16 MiB
+/// wipe was the dominant cost of whole-disk encryption (#84).
 fn format_luks2(path: &str, passphrase: &str) -> Result<()> {
     if passphrase.is_empty() {
-        luks::format_luks2_keyless(path)
+        luks::format_luks2_keyless(path, luks::KeyslotsArea::Compact)
     } else {
-        luks::format_luks2(path, passphrase).map(|_| ())
+        luks::format_luks2(path, passphrase, luks::KeyslotsArea::Compact).map(|_| ())
     }
 }
 
@@ -578,6 +581,38 @@ mod tests {
         );
         // The only way to get a volume key back with no keyslot is the cache.
         assert!(luks::get_volume_key(&path, "passphrase", "", "").is_ok());
+    }
+
+    #[test]
+    fn removable_format_uses_compact_keyslots_area() {
+        // The removable dispatch must format with the shrunken keyslots
+        // area: crypt_format wipes the whole area and the default 16 MiB
+        // wipe was the dominant whole-disk encryption cost on USB flash
+        // (#84). Pin the on-disk size so a refactor can't silently revert
+        // to the slow default.
+        use libcryptsetup_rs::consts::vals::EncryptionFormat;
+        use libcryptsetup_rs::CryptInit;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("compact.img")
+            .to_string_lossy()
+            .into_owned();
+        File::create(&path)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        luks::clear_volume_key_cache(&path);
+
+        format_luks2(&path, "").unwrap();
+
+        let mut dev = CryptInit::init(Path::new(&path)).unwrap();
+        dev.context_handle()
+            .load::<()>(Some(EncryptionFormat::Luks2), None)
+            .unwrap();
+        let (_, keyslots_size) = dev.settings_handle().get_metadata_size().unwrap();
+        assert_eq!(*keyslots_size, luks::COMPACT_KEYSLOTS_SIZE);
     }
 
     #[test]

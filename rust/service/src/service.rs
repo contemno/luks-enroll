@@ -578,11 +578,13 @@ pub fn op_create_image_fd(path: &str, passphrase: &str) -> (bool, i32, String) {
 /// of seeding a password keyslot. Returns the first keyslot, or -1 when none
 /// was created.
 fn format_container(path: &str, passphrase: &str) -> crate::error::Result<i32> {
+    // Image files keep libcryptsetup's default keyslots area; only the
+    // removable-media path opts into the compact one (see format.rs / #84).
     if passphrase.is_empty() {
-        luks::format_luks2_keyless(path)?;
+        luks::format_luks2_keyless(path, luks::KeyslotsArea::Default)?;
         Ok(-1)
     } else {
-        luks::format_luks2(path, passphrase)
+        luks::format_luks2(path, passphrase, luks::KeyslotsArea::Default)
     }
 }
 
