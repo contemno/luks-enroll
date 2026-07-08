@@ -1013,6 +1013,13 @@ class FormatDialogBase(Adw.Dialog):
         self, svc, list_page, *, title, submit_label, submit_css_class, success_text
     ):
         super().__init__(title=title)
+        # Adw.Dialog shrinks to its content's natural size by default, which
+        # for a PreferencesPage-based form ends up far smaller than the old
+        # full-page layout (issue #86 review: rendered as ~a quarter of the
+        # main window). Pin a size closer to what the pushed pages used to
+        # occupy; the inner ScrolledWindow still scrolls if content grows.
+        self.set_content_width(480)
+        self.set_content_height(560)
         self.svc = svc
         self.list_page = list_page
         self._success_text = success_text

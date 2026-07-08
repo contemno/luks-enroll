@@ -274,6 +274,14 @@ class TestFormatDialogConsolidation(unittest.TestCase):
         self.assertEqual(self.bases["EncryptDevicePage"], ["FormatDialogBase"])
         self.assertEqual(self.bases["CreateImagePage"], ["FormatDialogBase"])
 
+    def test_format_dialog_base_pins_a_non_tiny_content_size(self):
+        # Adw.Dialog defaults to its content's natural size, which for a
+        # PreferencesPage-based form rendered as ~a quarter of the main
+        # window (PR #87 review feedback). Pin an explicit size instead.
+        base = self.classes["FormatDialogBase"]
+        self.assertIn("self.set_content_width(", base)
+        self.assertIn("self.set_content_height(", base)
+
     def test_list_page_presents_dialogs_instead_of_pushing(self):
         list_page = self.classes["DeviceListPage"]
         self.assertIn("EncryptDevicePage(self.svc, device, size_str, self)", list_page)
