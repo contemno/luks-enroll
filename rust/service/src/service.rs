@@ -807,6 +807,23 @@ impl LuksEnrollService {
         Ok(luks::password_keyslots(&device))
     }
 
+    // Lets the client offer a reformat action for a volume with zero
+    // enrolled keyslots (issue #88): such a volume is only recoverable while
+    // its VK is cached, so once this returns false it can never be unlocked
+    // and reformatting it destroys nothing reachable.
+    #[zbus(name = "IsVolumeKeyCached")]
+    async fn is_volume_key_cached(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
+        device: String,
+    ) -> Result<bool, SvcError> {
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
+            .await?;
+        Ok(luks::is_volume_key_cached(&device))
+    }
+
     #[zbus(name = "VerifyPassphrase")]
     async fn verify_passphrase(
         &self,
@@ -1226,6 +1243,13 @@ impl LuksEnrollService {
         Self::check_fd(&fd, false, false)?;
         self.touch_idle();
         blocking(move || luks::password_keyslots(&fd_path(&fd))).await
+    }
+
+    #[zbus(name = "IsVolumeKeyCachedFd")]
+    async fn is_volume_key_cached_fd(&self, fd: OwnedFd) -> Result<bool, SvcError> {
+        Self::check_fd(&fd, false, false)?;
+        self.touch_idle();
+        blocking(move || luks::is_volume_key_cached(&fd_path(&fd))).await
     }
 
     #[zbus(name = "GetDeviceInfoFd")]

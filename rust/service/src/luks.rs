@@ -130,6 +130,14 @@ fn cached_volume_key(device: &str) -> Option<VolumeKey> {
     }
 }
 
+/// Whether a device's volume key is currently recoverable from the cache
+/// (issue #88: a keyless-formatted volume with zero enrolled keyslots is
+/// only reachable through this cache, so its absence marks the volume as
+/// stuck and safe to offer for reformat).
+pub fn is_volume_key_cached(device: &str) -> bool {
+    cached_volume_key(device).is_some()
+}
+
 // ---------------------------------------------------------------------------
 // Device open helpers
 // ---------------------------------------------------------------------------
@@ -1084,6 +1092,21 @@ mod tests {
 
         clear_volume_key_cache(dev);
         assert!(cached_volume_key(dev).is_none(), "cleared explicitly");
+    }
+
+    // Pins the query surface issue #88's reformat gating relies on: a stuck
+    // (zero-keyslot) volume is only offered for reformat once its VK is gone.
+    #[test]
+    fn is_volume_key_cached_reflects_cache_state() {
+        let dev = "/dev/luks-enroll-vk-cache-test-query";
+        clear_volume_key_cache(dev);
+        assert!(!is_volume_key_cached(dev), "starts uncached");
+
+        cache_volume_key(dev, VolumeKey::new(vec![5, 6, 7, 8]));
+        assert!(is_volume_key_cached(dev), "cached after insert");
+
+        clear_volume_key_cache(dev);
+        assert!(!is_volume_key_cached(dev), "uncached after explicit clear");
     }
 
     #[test]
