@@ -342,6 +342,93 @@ class TestEmptyRemovableReaderRendering(unittest.TestCase):
         self.assertLess(empty_idx, fallback_idx)
 
 
+class TestReformatStuckVolumes(unittest.TestCase):
+    """Issue #88: a removable partition or image file with zero enrolled
+    keyslots and no cached volume key can never be unlocked again, so the
+    list page offers a reformat/recreate action instead of a dead-end detail
+    view. GTK page classes subclass mocked bases (MagicMocks at import, per
+    TestKeylessImageCreation's docstring), so this asserts on source."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        cls.classes = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+        cls.bases = {
+            node.name: [ast.unparse(b) for b in node.bases]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+
+    def test_is_reformattable_requires_zero_keyslots_and_uncached_vk(self):
+        list_page = self.classes["DeviceListPage"]
+        self.assertIn('summary != "No keyslots"', list_page)
+        self.assertIn("self.svc.is_volume_key_cached(path)", list_page)
+
+    def test_removable_and_image_rows_gate_on_reformattable_set(self):
+        list_page = self.classes["DeviceListPage"]
+        self.assertIn("if part_path in reformattable:", list_page)
+        self.assertIn("if img_path in reformattable:", list_page)
+        # Internal (non-removable) volumes are deliberately never offered a
+        # reformat: this is a recovery path for removable media and
+        # containers, not a way to nuke an in-use system volume.
+        internal_render_loop = list_page.split("for dev in devices:")[1].split(
+            "for rdev in removable_devs:"
+        )[0]
+        self.assertNotIn("reformattable", internal_render_loop)
+
+    def test_reformat_image_page_subclasses_shared_base(self):
+        self.assertEqual(self.bases["ReformatImagePage"], ["FormatDialogBase"])
+
+    def test_reformat_image_page_drops_passphrase_fields(self):
+        reformat = self.classes["ReformatImagePage"]
+        self.assertNotIn("PasswordEntryRow", reformat)
+        self.assertNotIn("Passphrases do not match", reformat)
+        self.assertNotIn("Passphrase cannot be empty", reformat)
+
+    def test_reformat_image_page_removes_then_recreates_keylessly(self):
+        reformat = self.classes["ReformatImagePage"]
+        self.assertIn("os.remove(self.path)", reformat)
+        self.assertIn('self.path, self.size_mb, "", self._on_create_finish', reformat)
+        # ... then hand off to the shared success tail (FormatDialogBase),
+        # which does the volume_key_cached=True detail-page push.
+        self.assertIn("self._on_format_success(self.path)", reformat)
+
+    def test_proxy_is_volume_key_cached_dispatches_by_path_or_fd(self):
+        proxy = gui.LuksEnrollProxy.__new__(gui.LuksEnrollProxy)
+        proxy.proxy = mock.MagicMock()
+        proxy.proxy.call_sync.return_value.unpack.return_value = (True,)
+        captured = {}
+
+        def fake_dispatch(
+            path_call, method_fd, fd_sig, device, extra_args, timeout, read_only=False
+        ):
+            captured.update(
+                method_fd=method_fd,
+                fd_sig=fd_sig,
+                device=device,
+                read_only=read_only,
+            )
+            return path_call().unpack()
+
+        proxy._call_path_or_fd_sync = fake_dispatch
+        result = proxy.is_volume_key_cached("/dev/sdx1")
+
+        self.assertTrue(result)
+        self.assertEqual(captured["method_fd"], "IsVolumeKeyCachedFd")
+        self.assertEqual(captured["fd_sig"], "(h)")
+        self.assertEqual(captured["device"], "/dev/sdx1")
+        self.assertTrue(captured["read_only"])
+        proxy.proxy.call_sync.assert_called_once_with(
+            "IsVolumeKeyCached", mock.ANY, gui.Gio.DBusCallFlags.NONE, 30000, None
+        )
+
+
 class TestRunAsync(unittest.TestCase):
     """run_async runs the call off-thread and routes the result (or a
     synthesized D-Bus error triple) to the callback via GLib.idle_add."""

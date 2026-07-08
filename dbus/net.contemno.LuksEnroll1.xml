@@ -16,6 +16,14 @@
       <arg direction="in" type="s" name="device"/>
       <arg direction="out" type="ai" name="keyslots"/>
     </method>
+    <!-- A volume with zero enrolled keyslots is only recoverable while its
+         volume key is cached (see CreateEncryptedImage's keyless-format
+         note below); once this returns false, the client may offer to
+         reformat it (issue #88). -->
+    <method name="IsVolumeKeyCached">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="out" type="b" name="cached"/>
+    </method>
     <method name="VerifyPassphrase">
       <arg direction="in" type="s" name="device"/>
       <arg direction="in" type="s" name="passphrase"/>
@@ -175,6 +183,10 @@
     <method name="FindPasswordKeyslotsFd">
       <arg direction="in" type="h" name="fd"/>
       <arg direction="out" type="ai" name="keyslots"/>
+    </method>
+    <method name="IsVolumeKeyCachedFd">
+      <arg direction="in" type="h" name="fd"/>
+      <arg direction="out" type="b" name="cached"/>
     </method>
     <method name="VerifyPassphraseFd">
       <arg direction="in" type="h" name="fd"/>
