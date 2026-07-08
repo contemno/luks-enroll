@@ -20,8 +20,11 @@ name: PR test build
 # A tag pushed with the default GITHUB_TOKEN does not trigger release.yml's
 # `on: push: tags`, which is exactly what we want here: the preview tag exists
 # only to pin/version the build (gen-changelog.sh derives the .deb version from
-# it). Its non-plain form (`-pr<N>.…`) means next-version.sh ignores it, so a
-# preview never bumps the release-version floor.
+# it). Its non-plain form (`-<date>.pr<N>.…`) means next-version.sh ignores it,
+# so a preview never bumps the release-version floor. The timestamp comes
+# before `pr<N>` so dpkg's version comparison sorts by build recency first —
+# a newer build from a numerically lower PR still outranks an older build from
+# a higher-numbered one, so apt always upgrades to the latest install.
 
 on:
   pull_request_target:
@@ -78,10 +81,12 @@ jobs:
         run: |
           set -euo pipefail
           # next = max(patch-bump of latest release, ./VERSION floor); see
-          # scripts/next-version.sh. The `-pr<N>.` suffix makes the tag a
-          # prerelease and keeps next-version.sh from ever counting it.
+          # scripts/next-version.sh. The `-<date>.pr<N>.` suffix makes the tag
+          # a prerelease and keeps next-version.sh from ever counting it. The
+          # timestamp sorts before pr<N> so a later build always compares as
+          # newer to apt/dpkg, regardless of PR number (#92).
           next="$(./scripts/next-version.sh)"
-          tag="v${next}-pr${PR}.$(date -u +%Y%m%d).$(git rev-parse --short HEAD)"
+          tag="v${next}-$(date -u +%Y%m%d%H%M).pr${PR}.$(git rev-parse --short HEAD)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Computed preview tag: $tag"
 
