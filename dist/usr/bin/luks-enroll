@@ -270,6 +270,17 @@ class LuksEnrollProxy:
             "FindPasswordKeyslotsFd", "(h)", device, (), 30000, read_only=True,
         )[0]
 
+    def is_volume_key_cached(self, device):
+        """True if the service still holds device's volume key in its
+        in-process cache (issue #88): a zero-keyslot volume is only
+        recoverable while this is true."""
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "IsVolumeKeyCached", GLib.Variant("(s)", (device,)),
+                Gio.DBusCallFlags.NONE, 30000, None),
+            "IsVolumeKeyCachedFd", "(h)", device, (), 30000, read_only=True,
+        )[0]
+
     def verify_passphrase(self, device, passphrase):
         return self._call_path_or_fd_sync(
             lambda: self.proxy.call_sync(
@@ -297,6 +308,49 @@ class LuksEnrollProxy:
             "UnlockWithTokenFd", "(hss)", device, (token_type, pin), 60000,
             callback,
         )
+
+    def open_volume(self, device, name, passphrase,
+                    unlock_method="passphrase", unlock_pin=""):
+        """Activate the volume as /dev/mapper/<name> via the cached/extracted
+        volume key. Returns (ok, mapper, stderr). Dispatches to OpenVolumeFd
+        for client-owned container files (needs a read-write fd)."""
+        return self._call_path_or_fd_sync(
+            lambda: self.proxy.call_sync(
+                "OpenVolume",
+                GLib.Variant("(sssss)", (device, name, passphrase,
+                                         unlock_method, unlock_pin)),
+                Gio.DBusCallFlags.NONE, 120000, None),
+            "OpenVolumeFd", "(hssss)", device,
+            (name, passphrase, unlock_method, unlock_pin), 120000,
+        )  # (bool, str, str)
+
+    def close_volume(self, device, name):
+        """Tear down the dm-crypt mapping over `device`. For client-owned
+        container files, CloseVolumeFd discovers the mapping from a writable
+        fd's inode and skips polkit (possession of the fd is the
+        authorization, mirroring OpenVolumeFd); an installed service too old
+        to have the method falls back to the name-addressed, polkit-gated
+        CloseVolume. Block devices always use CloseVolume — there is no
+        backing file whose fd could prove anything. Returns (ok, stderr)."""
+        if self._is_regular_file(device):
+            fd = os.open(device, os.O_RDWR)
+            try:
+                ok, _closed, err = self._call_fd_sync(
+                    "CloseVolumeFd", "(h)", fd, (), 60000
+                )
+                return ok, err
+            except GLib.Error as e:
+                if not is_unknown_method(Gio.DBusError.get_remote_error(e)):
+                    raise
+                # Fall through to the polkit-gated close below.
+            finally:
+                os.close(fd)
+        result = self.proxy.call_sync(
+            "CloseVolume",
+            GLib.Variant("(s)", (name,)),
+            Gio.DBusCallFlags.NONE, 60000, None,
+        )
+        return result.unpack()  # (bool, str)
 
     def enroll_fido2(self, device, passphrase, pin, fido2_device,
                      unlock_method="passphrase", unlock_pin=""):
@@ -548,6 +602,35 @@ def detect_tpm2_device():
         return "TPM2 detected"
 
 
+def derive_mapper_name(device, uuid):
+    """dm-crypt mapper name for OpenVolume. Prefer the LUKS2 UUID
+    (systemd-cryptsetup's /dev/mapper/luks-<UUID> convention); fall back to the
+    device basename so the Open button still works when the service reports no
+    UUID (e.g. an older service build). Constrained to the charset the
+    service's valid_mapper_name accepts."""
+    base = uuid or os.path.basename(device) or "volume"
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in base)
+    return "luks-" + (safe or "volume")
+
+
+def mount_references(proc_mounts, mapper, dm_node):
+    """True if any mount source in /proc/mounts text is the mapper symlink or
+    the dm node it resolves to — i.e. the mapping has a mounted filesystem.
+    The service refuses to close such a mapping; this is only a UI hint."""
+    for line in proc_mounts.splitlines():
+        src = line.split(" ", 1)[0] if line else ""
+        if src and (src == mapper or (dm_node and src == dm_node)):
+            return True
+    return False
+
+
+def is_unknown_method(remote_error):
+    """True when a D-Bus remote error name means the installed service
+    predates the called method — the signal to fall back to an older code
+    path instead of surfacing an error (service/client version skew)."""
+    return remote_error == "org.freedesktop.DBus.Error.UnknownMethod"
+
+
 # TPM2 PCR descriptions, used by the TPM2 enrollment page.
 TPM2_PCRS = {
     0: "Core system firmware (BIOS/UEFI)",
@@ -757,6 +840,20 @@ class DeviceListPage(Adw.NavigationPage):
             parts.append(f"{count} {label}")
         return ", ".join(parts)
 
+    def _is_reformattable(self, path, summary):
+        """True for a removable partition or image file that is encrypted,
+        has zero enrolled keyslots, and whose volume key is no longer
+        cached — it can never be unlocked, so offering a reformat (rather
+        than the normal detail view) is the only way back in (issue #88).
+        Internal volumes are deliberately excluded: this only applies to
+        removable media and container files."""
+        if summary != "No keyslots":
+            return False
+        try:
+            return not self.svc.is_volume_key_cached(path)
+        except GLib.Error:
+            return False
+
     def _populate(self):
         """Kick off background device detection, then update UI."""
         if not self.svc:
@@ -764,7 +861,13 @@ class DeviceListPage(Adw.NavigationPage):
             return
 
         def fetch_data():
-            data = {"error": None, "devices": [], "removable": [], "summaries": {}}
+            data = {
+                "error": None,
+                "devices": [],
+                "removable": [],
+                "summaries": {},
+                "reformattable": set(),
+            }
             try:
                 data["devices"] = self.svc.detect_devices()
             except GLib.Error as e:
@@ -783,12 +886,17 @@ class DeviceListPage(Adw.NavigationPage):
             for rdev in data["removable"]:
                 for part in rdev.get("partitions", []):
                     if part.get("encrypted"):
-                        data["summaries"][part["device"]] = self._build_summary(
-                            part["device"]
-                        )
+                        path = part["device"]
+                        summary = self._build_summary(path)
+                        data["summaries"][path] = summary
+                        if self._is_reformattable(path, summary):
+                            data["reformattable"].add(path)
             for img_path in self._image_files:
                 if os.path.isfile(img_path):
-                    data["summaries"][img_path] = self._build_summary(img_path)
+                    summary = self._build_summary(img_path)
+                    data["summaries"][img_path] = summary
+                    if self._is_reformattable(img_path, summary):
+                        data["reformattable"].add(img_path)
 
             GLib.idle_add(self._apply_populate, data)
 
@@ -807,6 +915,7 @@ class DeviceListPage(Adw.NavigationPage):
 
         removable_devs = data["removable"]
         summaries = data["summaries"]
+        reformattable = data["reformattable"]
 
         # Collect paths to exclude from internal volumes list
         exclude = {os.path.realpath(p) for p in self._image_files if os.path.exists(p)}
@@ -863,9 +972,24 @@ class DeviceListPage(Adw.NavigationPage):
                             subtitle = f"{part_label} — {subtitle}"
                         subtitle += f" — {summary}"
                         row = Adw.ActionRow(title=part_path, subtitle=subtitle)
-                        row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-                        row.set_activatable(True)
-                        row.connect("activated", self._on_row_activated, part_path)
+                        if part_path in reformattable:
+                            # Zero keyslots and no cached volume key: this
+                            # partition can never be unlocked again, so offer
+                            # the same reformat path as an unencrypted device
+                            # instead of a dead-end detail view (issue #88).
+                            encrypt_btn = Gtk.Button(label="Encrypt")
+                            encrypt_btn.set_valign(Gtk.Align.CENTER)
+                            encrypt_btn.add_css_class("suggested-action")
+                            encrypt_btn.connect(
+                                "clicked", self._on_encrypt_clicked, part_path, part_size
+                            )
+                            row.add_suffix(encrypt_btn)
+                        else:
+                            row.add_suffix(
+                                Gtk.Image.new_from_icon_name("go-next-symbolic")
+                            )
+                            row.set_activatable(True)
+                            row.connect("activated", self._on_row_activated, part_path)
                         self._apply_lock_state(row, part_path)
                         self._add_row(self.removable_group, row, f"rem:{part_path}")
                     else:
@@ -883,6 +1007,18 @@ class DeviceListPage(Adw.NavigationPage):
                         row.add_suffix(encrypt_btn)
                         self._apply_lock_state(row, part_path)
                         self._add_row(self.removable_group, row, f"rem:{part_path}")
+            elif rdev.get("size_bytes") == 0:
+                # Empty reader (e.g. an SD/TF card slot with no card
+                # inserted): zero-size and no partitions, so there's
+                # nothing to encrypt yet.
+                row = Adw.ActionRow(
+                    title=dev_path,
+                    subtitle="Empty — insert a memory card to encrypt",
+                )
+                row.add_css_class("dim-label")
+                row.set_activatable(False)
+                row.set_sensitive(False)
+                self._add_row(self.removable_group, row, f"rem:{dev_path}")
             else:
                 subtitle = f"{dev_size}"
                 if dev_label:
@@ -907,9 +1043,21 @@ class DeviceListPage(Adw.NavigationPage):
             summary = summaries.get(img_path, "")
             name = os.path.basename(img_path)
             row = Adw.ActionRow(title=name, subtitle=f"{img_path} — {summary}")
-            row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-            row.set_activatable(True)
-            row.connect("activated", self._on_row_activated, img_path)
+            if img_path in reformattable:
+                # Zero keyslots and no cached volume key: this container can
+                # never be unlocked again, so offer to recreate it rather
+                # than a dead-end detail view (issue #88).
+                reformat_btn = Gtk.Button(label="Reformat")
+                reformat_btn.set_valign(Gtk.Align.CENTER)
+                reformat_btn.add_css_class("suggested-action")
+                reformat_btn.connect(
+                    "clicked", self._on_reformat_image_clicked, img_path
+                )
+                row.add_suffix(reformat_btn)
+            else:
+                row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+                row.set_activatable(True)
+                row.connect("activated", self._on_row_activated, img_path)
             close_btn = Gtk.Button(icon_name="window-close-symbolic")
             close_btn.set_valign(Gtk.Align.CENTER)
             close_btn.set_tooltip_text("Remove from list")
@@ -935,18 +1083,20 @@ class DeviceListPage(Adw.NavigationPage):
             nav.push(detail)
 
     def _on_encrypt_clicked(self, _btn, device, size_str):
-        """Push the encrypt page for an unencrypted device."""
-        nav = self.get_ancestor(Adw.NavigationView)
-        if nav:
-            page = EncryptDevicePage(self.svc, device, size_str, self)
-            nav.push(page)
+        """Present the encrypt dialog for an unencrypted device."""
+        dialog = EncryptDevicePage(self.svc, device, size_str, self)
+        dialog.present(self)
+
+    def _on_reformat_image_clicked(self, _btn, img_path):
+        """Present the reformat dialog for a stuck (zero-keyslot,
+        VK-not-cached) encrypted image file."""
+        dialog = ReformatImagePage(self.svc, img_path, self)
+        dialog.present(self)
 
     def _on_create_image(self, _row):
-        """Push the create image page onto the navigation view."""
-        nav = self.get_ancestor(Adw.NavigationView)
-        if nav:
-            page = CreateImagePage(self.svc, self)
-            nav.push(page)
+        """Present the create-image dialog."""
+        dialog = CreateImagePage(self.svc, self)
+        dialog.present(self)
 
     def _on_open_image(self, _row):
         """Open a file chooser to select an existing encrypted image file."""
@@ -995,14 +1145,38 @@ class DeviceListPage(Adw.NavigationPage):
             self._populate()
 
 
-class EncryptDevicePage(Adw.NavigationPage):
-    """Page for encrypting an unencrypted removable device."""
+class FormatDialogBase(Adw.Dialog):
+    """Shared chrome for the one-shot format dialogs (encrypt a device,
+    create an image file): header/toolbar, status spinner + label + submit
+    button row, and the common success/failure tail. Each is used exactly
+    once per device/file, so it's a modal dialog rather than a pushed nav
+    page — closing it always returns to the device list, never to a stale
+    format page (issue #86).
 
-    def __init__(self, svc, device, size_str, list_page):
-        super().__init__(title="Encrypt Device")
+    Subclasses supply the target-specific input widgets (``build_target_
+    groups``) and the submit handler that makes the actual D-Bus call
+    (``_on_submit_clicked``), then report the outcome via
+    ``_on_format_success``/``_on_format_failure``. The two targets format
+    differently under the hood — a block device is a sync call that polls
+    for a new partition node, an image file is an async fd-based call with
+    no polling (see issue #86's investigation comment) — so that dispatch
+    stays in the subclasses; only the chrome and hand-off are shared.
+    """
+
+    def __init__(
+        self, svc, list_page, *, title, submit_label, submit_css_class, success_text
+    ):
+        super().__init__(title=title)
+        # Adw.Dialog shrinks to its content's natural size by default, which
+        # for a PreferencesPage-based form ends up far smaller than the old
+        # full-page layout (issue #86 review: rendered as ~a quarter of the
+        # main window). Pin a size closer to what the pushed pages used to
+        # occupy; the inner ScrolledWindow still scrolls if content grows.
+        self.set_content_width(480)
+        self.set_content_height(560)
         self.svc = svc
-        self.device = device
         self.list_page = list_page
+        self._success_text = success_text
 
         toolbar_view = Adw.ToolbarView()
         self.set_child(toolbar_view)
@@ -1015,108 +1189,150 @@ class EncryptDevicePage(Adw.NavigationPage):
         prefs = Adw.PreferencesPage()
         scroll.set_child(prefs)
 
+        self.build_target_groups(prefs)
+
+        action_group = Adw.PreferencesGroup()
+        prefs.add(action_group)
+
+        self._status_label = Gtk.Label(label="", xalign=0, wrap=True)
+        self._status_label.set_margin_start(16)
+        self._status_label.set_margin_end(16)
+
+        self._spinner = Gtk.Spinner()
+        self._spinner.set_margin_start(16)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_margin_start(16)
+        btn_box.set_margin_end(16)
+        btn_box.set_margin_top(8)
+        btn_box.set_margin_bottom(16)
+        btn_box.append(self._spinner)
+        btn_box.append(self._status_label)
+
+        self._submit_btn = Gtk.Button(label=submit_label)
+        self._submit_btn.add_css_class(submit_css_class)
+        self._submit_btn.set_halign(Gtk.Align.END)
+        self._submit_btn.set_hexpand(True)
+        self._submit_btn.connect("clicked", self._on_submit_clicked)
+        btn_box.append(self._submit_btn)
+
+        status_row = Adw.ActionRow()
+        status_row.set_child(btn_box)
+        action_group.add(status_row)
+
+    def build_target_groups(self, prefs):
+        """Subclasses add their target-specific PreferencesGroups here."""
+        raise NotImplementedError
+
+    def _on_submit_clicked(self, _btn):
+        """Subclasses validate input and kick off the D-Bus call."""
+        raise NotImplementedError
+
+    def _begin_submit(self, busy_text):
+        self._status_label.set_text(busy_text)
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+        self._spinner.start()
+        self._submit_btn.set_sensitive(False)
+
+    def refresh_list(self):
+        """Refresh the device list after a successful format. Overridden by
+        subclasses whose target isn't already tracked (e.g. a brand-new
+        image file needs to be added, not just re-scanned)."""
+        self.list_page._populate()
+
+    def _on_format_success(self, target):
+        self._spinner.stop()
+        self._submit_btn.set_sensitive(True)
+        self._status_label.set_text(self._success_text)
+        self._status_label.remove_css_class("error")
+        self._status_label.add_css_class("success")
+        self.refresh_list()
+        self.close()
+        # Open the new volume's detail page, pre-unlocked via the cached
+        # volume key (no passphrase was set on create).
+        nav = self.list_page.get_ancestor(Adw.NavigationView)
+        if nav:
+            detail = DeviceDetailPage(self.svc, target, volume_key_cached=True)
+            nav.push(detail)
+
+    def _on_format_failure(self, error):
+        self._spinner.stop()
+        self._submit_btn.set_sensitive(True)
+        self._status_label.set_text(f"Failed: {error}")
+        self._status_label.add_css_class("error")
+        self._status_label.remove_css_class("success")
+
+
+class EncryptDevicePage(FormatDialogBase):
+    """Dialog for encrypting an unencrypted removable device."""
+
+    def __init__(self, svc, device, size_str, list_page):
+        self.device = device
+        self.size_str = size_str
+        super().__init__(
+            svc,
+            list_page,
+            title="Encrypt Device",
+            submit_label="Encrypt",
+            submit_css_class="destructive-action",
+            success_text="Encrypted successfully.",
+        )
+
+    def build_target_groups(self, prefs):
         warning_group = Adw.PreferencesGroup(
             title="Encrypt Device",
             description=(
-                f"This will erase ALL data on {device} ({size_str}) "
+                f"This will erase ALL data on {self.device} ({self.size_str}) "
                 "and create an encrypted LUKS2 partition.\n\n"
                 "This action cannot be undone."
             ),
         )
         prefs.add(warning_group)
 
-        pw_group = Adw.PreferencesGroup(title="Passphrase")
-        prefs.add(pw_group)
+        # No passphrase here: the partition is formatted with a cached volume
+        # key and you enroll a real method (FIDO2/TPM2/recovery, or a
+        # passphrase if you want one) on the detail page that opens next. This
+        # avoids a throwaway passphrase whose only job was to wrap a volume
+        # key we already know (issue #82, matching #58's image-file path).
+        info_group = Adw.PreferencesGroup()
+        prefs.add(info_group)
+        info_group.add(
+            Adw.ActionRow(
+                title="No passphrase needed",
+                subtitle="Pick how to unlock it on the next screen.",
+            )
+        )
 
-        self._pw_row = Adw.PasswordEntryRow(title="Passphrase")
-        pw_group.add(self._pw_row)
-
-        self._pw_confirm_row = Adw.PasswordEntryRow(title="Confirm Passphrase")
-        self._pw_confirm_row.connect("entry-activated", lambda _: self._do_encrypt())
-        pw_group.add(self._pw_confirm_row)
-
-        btn_row = Adw.ActionRow()
-        self._encrypt_btn = Gtk.Button(label="Encrypt")
-        self._encrypt_btn.add_css_class("destructive-action")
-        self._encrypt_btn.set_valign(Gtk.Align.CENTER)
-        self._encrypt_btn.connect("clicked", lambda _: self._do_encrypt())
-        btn_row.add_suffix(self._encrypt_btn)
-        pw_group.add(btn_row)
-
-        # Status
-        status_group = Adw.PreferencesGroup()
-        prefs.add(status_group)
-        self._spinner = Gtk.Spinner()
-        self._status_label = Gtk.Label(label="", wrap=True, xalign=0, selectable=True)
-        status_row = Adw.ActionRow()
-        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        status_box.append(self._spinner)
-        status_box.append(self._status_label)
-        status_row.add_suffix(status_box)
-        status_group.add(status_row)
-
-    def _do_encrypt(self):
-        pw = self._pw_row.get_text()
-        confirm = self._pw_confirm_row.get_text()
-        if not pw:
-            self._status_label.set_text("Passphrase cannot be empty.")
-            self._status_label.add_css_class("error")
-            return
-        if pw != confirm:
-            self._status_label.set_text("Passphrases do not match.")
-            self._status_label.add_css_class("error")
-            return
-
-        self._status_label.set_text("Encrypting…")
-        self._status_label.remove_css_class("error")
-        self._status_label.remove_css_class("success")
-        self._spinner.start()
-        self._encrypt_btn.set_sensitive(False)
-        self._pending_pw = pw
-
+    def _on_submit_clicked(self, _btn):
+        self._begin_submit("Encrypting…")
+        # Empty passphrase: the service formats a keyslot-less partition and
+        # caches its volume key for the first enrollment (issue #82).
         run_async(
-            lambda: self.svc.format_partition(self.device, pw), self._on_format_done
+            lambda: self.svc.format_partition(self.device, ""), self._on_format_done
         )
 
     def _on_format_done(self, ok, partition, stderr):
-        self._spinner.stop()
-        self._encrypt_btn.set_sensitive(True)
         if ok:
-            self._status_label.set_text("Encrypted successfully.")
-            self._status_label.remove_css_class("error")
-            self._status_label.add_css_class("success")
-            self.list_page._populate()
-            # Navigate to the new encrypted partition's detail page
-            target = partition or self.device
-            nav = self.get_ancestor(Adw.NavigationView)
-            if nav:
-                detail = DeviceDetailPage(self.svc, target, passphrase=self._pending_pw)
-                nav.push(detail)
+            self._on_format_success(partition or self.device)
         else:
-            self._status_label.set_text(f"Failed: {stderr}")
-            self._status_label.add_css_class("error")
-            self._status_label.remove_css_class("success")
+            self._on_format_failure(stderr)
 
 
-class CreateImagePage(Adw.NavigationPage):
-    """Page for creating a new LUKS-encrypted image file."""
+class CreateImagePage(FormatDialogBase):
+    """Dialog for creating a new LUKS-encrypted image file."""
 
     def __init__(self, svc, list_page):
-        super().__init__(title="Create Encrypted File")
-        self.svc = svc
-        self.list_page = list_page
+        super().__init__(
+            svc,
+            list_page,
+            title="Create Encrypted File",
+            submit_label="Create",
+            submit_css_class="suggested-action",
+            success_text="Created successfully.",
+        )
 
-        toolbar_view = Adw.ToolbarView()
-        self.set_child(toolbar_view)
-        toolbar_view.add_top_bar(Adw.HeaderBar())
-
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        toolbar_view.set_content(scroll)
-
-        prefs = Adw.PreferencesPage()
-        scroll.set_child(prefs)
-
+    def build_target_groups(self, prefs):
         # File location group
         loc_group = Adw.PreferencesGroup(
             title="File Location",
@@ -1161,36 +1377,6 @@ class CreateImagePage(Adw.NavigationPage):
             )
         )
 
-        # Status + action
-        action_group = Adw.PreferencesGroup()
-        prefs.add(action_group)
-
-        self._status_label = Gtk.Label(label="", xalign=0, wrap=True)
-        self._status_label.set_margin_start(16)
-        self._status_label.set_margin_end(16)
-
-        self._spinner = Gtk.Spinner()
-        self._spinner.set_margin_start(16)
-
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        btn_box.set_margin_start(16)
-        btn_box.set_margin_end(16)
-        btn_box.set_margin_top(8)
-        btn_box.set_margin_bottom(16)
-        btn_box.append(self._spinner)
-        btn_box.append(self._status_label)
-
-        self._create_btn = Gtk.Button(label="Create")
-        self._create_btn.add_css_class("suggested-action")
-        self._create_btn.set_halign(Gtk.Align.END)
-        self._create_btn.set_hexpand(True)
-        self._create_btn.connect("clicked", self._on_create)
-        btn_box.append(self._create_btn)
-
-        status_row = Adw.ActionRow()
-        status_row.set_child(btn_box)
-        action_group.add(status_row)
-
     def _on_browse(self, _row):
         """Open a save-file dialog for choosing image location."""
         win = self.get_root()
@@ -1209,7 +1395,7 @@ class CreateImagePage(Adw.NavigationPage):
         if path:
             self._path_row.set_text(path)
 
-    def _on_create(self, _btn):
+    def _on_submit_clicked(self, _btn):
         path = self._path_row.get_text().strip()
         size_mb = int(self._size_spin.get_value())
 
@@ -1218,43 +1404,99 @@ class CreateImagePage(Adw.NavigationPage):
             self._status_label.add_css_class("error")
             return
 
-        self._status_label.set_text("Creating…")
-        self._status_label.remove_css_class("error")
-        self._status_label.remove_css_class("success")
-        self._spinner.start()
-        self._create_btn.set_sensitive(False)
+        self._begin_submit("Creating…")
         self._pending_path = path
 
         # Empty passphrase: the service formats a keyslot-less container and
         # caches its volume key for the first enrollment (issue #58).
         self.svc.create_encrypted_image_async(path, size_mb, "", self._on_create_finish)
 
+    def refresh_list(self):
+        self.list_page.add_image_file(self._pending_path)
+
     def _on_create_finish(self, proxy, result):
         """Async callback — runs on main thread after D-Bus call completes."""
-        path = self._pending_path
         try:
             res = self.svc.finish_async(proxy, result)
             ok, _keyslot, error = res.unpack()
         except GLib.Error as e:
             ok, error = False, f"D-Bus error: {e.message}"
 
-        self._spinner.stop()
-        self._create_btn.set_sensitive(True)
         if ok:
-            self._status_label.set_text("Created successfully.")
-            self._status_label.remove_css_class("error")
-            self._status_label.add_css_class("success")
-            self.list_page.add_image_file(path)
-            # Replace this page with the device detail page, pre-unlocked via
-            # the cached volume key (no passphrase was set on create).
-            nav = self.get_ancestor(Adw.NavigationView)
-            if nav:
-                detail = DeviceDetailPage(self.svc, path, volume_key_cached=True)
-                nav.push(detail)
+            self._on_format_success(self._pending_path)
         else:
-            self._status_label.set_text(f"Failed: {error}")
-            self._status_label.add_css_class("error")
-            self._status_label.remove_css_class("success")
+            self._on_format_failure(error)
+
+
+class ReformatImagePage(FormatDialogBase):
+    """Dialog for recreating an encrypted image file that has zero enrolled
+    keyslots and an uncached volume key — it can never be unlocked, so this
+    is the recovery path matching EncryptDevicePage's for block devices
+    (issue #88). The container is removed and recreated at the same path
+    and size."""
+
+    def __init__(self, svc, path, list_page):
+        self.path = path
+        try:
+            self.size_mb = max(1, os.path.getsize(path) // (1024 * 1024))
+        except OSError:
+            self.size_mb = 1
+        super().__init__(
+            svc,
+            list_page,
+            title="Reformat Encrypted File",
+            submit_label="Reformat",
+            submit_css_class="destructive-action",
+            success_text="Reformatted successfully.",
+        )
+
+    def build_target_groups(self, prefs):
+        warning_group = Adw.PreferencesGroup(
+            title="Reformat Encrypted File",
+            description=(
+                f"{self.path} has no enrolled unlock methods, and its volume "
+                "key is no longer cached — it can never be unlocked. This "
+                "will erase it and create a fresh encrypted container of "
+                "the same size.\n\n"
+                "This action cannot be undone."
+            ),
+        )
+        prefs.add(warning_group)
+
+        # No passphrase here: matches CreateImagePage's keyless format so
+        # the first enrollment wraps the freshly cached volume key (#58).
+        info_group = Adw.PreferencesGroup()
+        prefs.add(info_group)
+        info_group.add(
+            Adw.ActionRow(
+                title="No passphrase needed",
+                subtitle="Pick how to unlock it on the next screen.",
+            )
+        )
+
+    def _on_submit_clicked(self, _btn):
+        self._begin_submit("Reformatting…")
+        try:
+            os.remove(self.path)
+        except OSError as e:
+            self._on_format_failure(f"Could not remove '{self.path}': {e.strerror}")
+            return
+        self.svc.create_encrypted_image_async(
+            self.path, self.size_mb, "", self._on_create_finish
+        )
+
+    def _on_create_finish(self, proxy, result):
+        """Async callback — runs on main thread after D-Bus call completes."""
+        try:
+            res = self.svc.finish_async(proxy, result)
+            ok, _keyslot, error = res.unpack()
+        except GLib.Error as e:
+            ok, error = False, f"D-Bus error: {e.message}"
+
+        if ok:
+            self._on_format_success(self.path)
+        else:
+            self._on_format_failure(error)
 
 
 class DeviceDetailPage(Adw.NavigationPage):
@@ -1410,6 +1652,33 @@ class DeviceDetailPage(Adw.NavigationPage):
             open_row.add_suffix(open_btn)
             open_row.set_activatable_widget(open_btn)
             self._info_group.add(open_row)
+
+        # --- Volume mapping group (Open/Close, hidden until unlocked) ---
+        # Lets the user actively map the volume (crypt_activate_by_volume_key)
+        # so the host can mount the filesystem inside — useful on distros that
+        # only offer passphrase unlock at boot (issue #69).
+        self._mapper_name = None
+        # An in-flight open/close suppresses the mount poll so it can't reset
+        # the spinner/button mid-operation; the poll keeps the mounted hint
+        # live when the filesystem is (un)mounted outside this app.
+        self._mapping_busy = False
+        self._mapping_poll_id = None
+        self.connect("destroy", lambda _: self._stop_mapping_poll())
+        self._mapping_group = Adw.PreferencesGroup(
+            title="Volume Mapping",
+            description="Map the volume so the filesystem inside can be mounted.",
+        )
+        self._mapping_group.set_visible(False)
+        self._mapping_row = Adw.ActionRow(title="Mapping")
+        self._mapping_btn = Gtk.Button()
+        self._mapping_btn.set_valign(Gtk.Align.CENTER)
+        self._mapping_btn.connect("clicked", lambda _: self._on_mapping_clicked())
+        self._mapping_spinner = Gtk.Spinner()
+        self._mapping_spinner.set_valign(Gtk.Align.CENTER)
+        self._mapping_row.add_suffix(self._mapping_spinner)
+        self._mapping_row.add_suffix(self._mapping_btn)
+        self._mapping_group.add(self._mapping_row)
+        self._prefs_page.add(self._mapping_group)
 
         # --- Enrollments group (hidden until unlocked) ---
         self._enrollments_group = Adw.PreferencesGroup(title="Current Enrollments")
@@ -1748,6 +2017,125 @@ class DeviceDetailPage(Adw.NavigationPage):
             row_fs = Adw.ActionRow(title="Filesystem", subtitle=info["filesystem"])
             self._add_row(self._info_group, row_fs, "info:fs")
 
+        # Choose the dm-crypt mapper name. Prefer the LUKS2 UUID, matching
+        # systemd-cryptsetup's /dev/mapper/luks-<UUID> convention; fall back to
+        # a name derived from the device path so the Open button still works
+        # when the service doesn't report a UUID (e.g. an older service build).
+        self._mapper_name = derive_mapper_name(self.device, info.get("uuid") or "")
+        self._refresh_mapping_state()
+
+    def _mapper_path(self):
+        return "/dev/mapper/" + self._mapper_name if self._mapper_name else None
+
+    def _mapping_is_mounted(self):
+        """Whether the open mapping has a mounted filesystem. UI hint only —
+        the service is the authority and refuses to close a mounted mapping."""
+        mapper = self._mapper_path()
+        if not mapper:
+            return False
+        try:
+            dm_node = os.path.realpath(mapper)
+        except OSError:
+            dm_node = None
+        try:
+            with open("/proc/mounts") as f:
+                mounts = f.read()
+        except OSError:
+            return False
+        return mount_references(mounts, mapper, dm_node)
+
+    def _start_mapping_poll(self):
+        """Poll mapping/mount state every 2 s so the open/closed and mounted
+        indicators stay live when the volume is mapped or its filesystem is
+        (un)mounted from another app (e.g. Files/Disks)."""
+        if self._mapping_poll_id is None:
+            self._mapping_poll_id = GLib.timeout_add_seconds(
+                2, self._poll_mapping_state
+            )
+
+    def _stop_mapping_poll(self):
+        if self._mapping_poll_id is not None:
+            GLib.source_remove(self._mapping_poll_id)
+            self._mapping_poll_id = None
+
+    def _poll_mapping_state(self):
+        # Skip while an open/close is in flight (don't fight its spinner).
+        if not self._mapping_busy:
+            self._refresh_mapping_state()
+        return GLib.SOURCE_CONTINUE
+
+    def _refresh_mapping_state(self):
+        """Show the mapping group and set the button to Open or Close based on
+        whether /dev/mapper/<name> is currently present, and reflect whether
+        its filesystem is mounted."""
+        name = self._mapper_name
+        if not name:
+            self._mapping_group.set_visible(False)
+            self._stop_mapping_poll()
+            return
+        self._mapping_spinner.stop()
+        self._mapping_btn.set_sensitive(True)
+        is_open = os.path.exists(self._mapper_path())
+        if is_open:
+            if self._mapping_is_mounted():
+                self._mapping_row.set_subtitle("Mounted — unmount before closing")
+            else:
+                self._mapping_row.set_subtitle(f"Open at /dev/mapper/{name}")
+            self._mapping_btn.set_label("Close")
+            self._mapping_btn.remove_css_class("suggested-action")
+            self._mapping_btn.add_css_class("destructive-action")
+        else:
+            self._mapping_row.set_subtitle("Closed")
+            self._mapping_btn.set_label("Open")
+            self._mapping_btn.remove_css_class("destructive-action")
+            self._mapping_btn.add_css_class("suggested-action")
+        self._start_mapping_poll()
+        self._mapping_group.set_visible(True)
+
+    def _on_mapping_clicked(self):
+        """Open or close the dm-crypt mapping, depending on current state."""
+        name = self._mapper_name
+        if not name:
+            return
+        is_open = os.path.exists(self._mapper_path())
+        self._mapping_busy = True
+        self._mapping_btn.set_sensitive(False)
+        self._mapping_spinner.start()
+
+        def work():
+            ok = False
+            err = ""
+            try:
+                if is_open:
+                    ok, err = self.svc.close_volume(self.device, name)
+                else:
+                    ok, _mapper, err = self.svc.open_volume(
+                        self.device, name, self.passphrase or "",
+                        self.unlock_method, self.unlock_pin,
+                    )
+            except GLib.Error as e:
+                ok, err = False, e.message
+            except OSError as e:
+                # The fd dispatch opens the container file itself; a raced
+                # delete or permission change must fail the dialog, not
+                # strand the button on a worker-thread traceback.
+                ok, err = False, str(e)
+            GLib.idle_add(self._on_mapping_done, ok, err)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_mapping_done(self, ok, err):
+        self._mapping_busy = False
+        self._mapping_spinner.stop()
+        if not ok:
+            win = self.get_root()
+            dialog = Adw.AlertDialog(
+                heading="Mapping Failed",
+                body=err or "The volume mapping operation failed.",
+            )
+            dialog.add_response("ok", "OK")
+            dialog.present(win)
+        self._refresh_mapping_state()
 
     def _apply_enrollments(self, tokens, pw_slots):
         """List all current enrollments from pre-fetched data."""

@@ -99,7 +99,9 @@ jobs:
 
   # The Rust checks fan out into two parallel jobs that share a build cache:
   #   rust-build — fmt + clippy + build + `cargo test --workspace`
-  #   swtpm      — the #[ignore]d TPM2 seal/unseal roundtrips against swtpm
+  #   swtpm      — the #[ignore]d privileged roundtrips: TPM2 seal/unseal
+  #                against swtpm, and the root dm-crypt open/close tests
+  #                (loop + device-mapper) from service/tests/luks_image.rs
   # The required status check stays named `rust`: it's a tiny aggregator (below)
   # that passes only if BOTH finish green, so TPM failures keep gating merges
   # with no branch-protection change. Splitting swtpm off moves its install +
@@ -169,6 +171,17 @@ jobs:
             --flags not-need-init,startup-clear --tpmstate dir=/tmp/swtpm-state --daemon
           TCTI="swtpm:host=127.0.0.1,port=2321" \
             cargo test -p luks-enroll-service tpm2 -- --ignored
+
+      # The dm-crypt roundtrips (activate/deactivate against a real LUKS2
+      # image, and the CloseVolumeFd loop-backing discovery) are #[ignore]d
+      # because they need root for loop devices + device-mapper. Run them
+      # here, where sudo is available and the cache is already warm. sudo
+      # resets PATH (secure_path), so the runner's cargo is re-injected; -E
+      # keeps HOME so rustup finds the toolchain.
+      - name: dm-crypt open/close roundtrips (root, loop + device-mapper)
+        run: |
+          sudo -E env "PATH=$PATH" \
+            cargo test -p luks-enroll-service --test luks_image -- --ignored
 
   # Aggregator: the single required `rust` status check. `if: always()` makes it
   # run even when an upstream job fails, so it FAILS the check (a plain `needs`

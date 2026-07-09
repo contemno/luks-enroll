@@ -34,6 +34,14 @@ and recovery keys into LUKS2 volumes.
   **minor** bump (breaking changes → **major**); only pure fixes/chores stay a patch. If a bump
   is needed, land a `VERSION` bump on `dev` first (via its own PR), then the promotion publishes
   that version. Note the intended release version in the promotion PR body.
+- **Merge `dev → main` promotion PRs with "Create a merge commit" — never rebase or squash.**
+  Rebase/squash rewrites the promoted commits on `main`, so `main` stops being a descendant of
+  `dev` and the *next* promotion PR conflicts on every file both sides touched (the v0.4.0 →
+  v0.5.0 #95/#96 incident). A merge commit keeps `main` a descendant of `dev`, so promotions
+  stay conflict-free. If the histories have already diverged, reconcile with a sync-back PR
+  into `dev` (merge `main` with `-s ours` — safe only after verifying `main` has no unique
+  content, e.g. `git diff <dev-tip-at-last-release> origin/main` is empty), merged the same
+  way: as a merge commit.
 
 ## Work loop
 
@@ -116,8 +124,9 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
   docs (lint/test/rust skip); `rust/**` → Rust jobs; `*.py` / `tests/**` → Python jobs;
   anything else → both. Keep diffs scoped so the right checks run.
 - The Rust check fans out into two **parallel, cached** jobs — `rust-build`
-  (fmt/clippy/build/`cargo test --workspace`) and `swtpm` (the TPM2 seal/unseal roundtrips
-  against `swtpm`) — aggregated by the required `rust` check, which passes only if both do, so
+  (fmt/clippy/build/`cargo test --workspace`) and `swtpm` (the privileged roundtrips: TPM2
+  seal/unseal against `swtpm`, plus the root dm-crypt open/close tests from
+  `rust/service/tests/luks_image.rs`) — aggregated by the required `rust` check, which passes only if both do, so
   TPM failures still gate merges with no branch-protection change. Both share a
   `Swatinem/rust-cache` workspace (cargo registry + `rust/target`, keyed on `rust/Cargo.lock`).
   `swtpm` runs on every `rust/**` change (not path-gated): it's the only real-TPM coverage and
@@ -135,8 +144,10 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
   to get an installable `.deb` of that PR's HEAD for manual testing **before** it merges to
   `dev`. It runs on `pull_request_target`, gates on the labeler having write access (the PR HEAD
   is attacker-controllable on fork PRs, and the token is privileged), tags HEAD as
-  `vX.Y.Z-prN.<date>.<sha>` (the tag only pins/versions the build; its `-pr<N>.` suffix keeps
-  `next-version.sh` from counting it, so previews never bump the release floor), and calls
+  `vX.Y.Z-<date>.prN.<sha>` (the tag only pins/versions the build; its non-plain suffix keeps
+  `next-version.sh` from counting it, so previews never bump the release floor; the timestamp
+  precedes `prN` so a newer build always outranks an older one in dpkg's version comparison,
+  regardless of PR number), and calls
   `build-release.yml` with **`publish: false`** — **no Releases-page entry**; the `.deb` is
   uploaded as a **workflow-run artifact** (login required to download, default 90-day retention)
   and a PR comment links to it (posted on build failure too). The label is auto-removed after

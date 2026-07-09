@@ -519,6 +519,61 @@ pub fn op_wipe_slot(
     })
 }
 
+/// Activate `device` as `/dev/mapper/<name>` using the volume key reached
+/// through `unlock_method` (any enrolled method, via the VK cache). On success
+/// the mapper name is returned in the stdout slot so the GUI can address the
+/// new mapping. Activation is additive — it adds no keyslot and removes
+/// nothing — so it cannot lock the user out.
+/// Unlike the keyslot-mutating ops (which mask failures behind a generic
+/// "Operation failed" so header internals never leak), activation failures are
+/// environmental — device-mapper access, a busy device, a sandbox denial — and
+/// carry no secret, so the real libcryptsetup error is returned to the client.
+/// Without it an activation failure is opaque on both the client and in logs.
+pub fn op_open_volume(
+    device: &str,
+    name: &str,
+    passphrase: &str,
+    unlock_method: &str,
+    unlock_pin: &str,
+) -> Triple {
+    match luks::activate_volume(device, name, unlock_method, passphrase, unlock_pin) {
+        Ok(()) => (true, name.to_string(), String::new()),
+        Err(e) => {
+            eprintln!("OpenVolume failed: {e}");
+            (false, String::new(), e.0)
+        }
+    }
+}
+
+/// Tear down the dm-crypt mapping `/dev/mapper/<name>`. Returns (ok, stderr);
+/// closing an already-closed mapping is a success (idempotent). Surfaces the
+/// real error for the same reason as `op_open_volume`.
+pub fn op_close_volume(name: &str) -> (bool, String) {
+    match luks::deactivate_volume(name) {
+        Ok(()) => (true, String::new()),
+        Err(e) => {
+            eprintln!("CloseVolume failed: {e}");
+            (false, e.0)
+        }
+    }
+}
+
+/// Tear down every dm-crypt mapping whose loop device is backed by the file
+/// identified by `(dev, ino)` — the fd-only close path for client-owned
+/// container files. The mapping set is discovered from the kernel's loop
+/// attach records, never from a caller-supplied name. Zero matches is an
+/// idempotent success with an empty `closed` slot. Surfaces the real error
+/// for the same reason as `op_open_volume`.
+pub fn op_close_volume_fd(dev: u64, ino: u64) -> Triple {
+    match luks::deactivate_volumes_backed_by(dev, ino) {
+        Ok(names) => (true, names.join(" "), String::new()),
+        Err(e) => {
+            eprintln!("CloseVolumeFd failed: {e}");
+            (false, String::new(), e.0)
+        }
+    }
+}
+
 pub fn op_create_encrypted_image(
     real_path: &str,
     size_mb: i32,
@@ -578,11 +633,13 @@ pub fn op_create_image_fd(path: &str, passphrase: &str) -> (bool, i32, String) {
 /// of seeding a password keyslot. Returns the first keyslot, or -1 when none
 /// was created.
 fn format_container(path: &str, passphrase: &str) -> crate::error::Result<i32> {
+    // Image files keep libcryptsetup's default keyslots area; only the
+    // removable-media path opts into the compact one (see format.rs / #84).
     if passphrase.is_empty() {
-        luks::format_luks2_keyless(path)?;
+        luks::format_luks2_keyless(path, luks::KeyslotsArea::Default)?;
         Ok(-1)
     } else {
-        luks::format_luks2(path, passphrase)
+        luks::format_luks2(path, passphrase, luks::KeyslotsArea::Default)
     }
 }
 
@@ -750,6 +807,23 @@ impl LuksEnrollService {
         Ok(luks::password_keyslots(&device))
     }
 
+    // Lets the client offer a reformat action for a volume with zero
+    // enrolled keyslots (issue #88): such a volume is only recoverable while
+    // its VK is cached, so once this returns false it can never be unlocked
+    // and reformatting it destroys nothing reachable.
+    #[zbus(name = "IsVolumeKeyCached")]
+    async fn is_volume_key_cached(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
+        device: String,
+    ) -> Result<bool, SvcError> {
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Read, &device, &[])
+            .await?;
+        Ok(luks::is_volume_key_cached(&device))
+    }
+
     #[zbus(name = "VerifyPassphrase")]
     async fn verify_passphrase(
         &self,
@@ -798,6 +872,45 @@ impl LuksEnrollService {
             },
         )
         .await
+    }
+
+    #[zbus(name = "OpenVolume")]
+    #[allow(clippy::too_many_arguments)]
+    async fn open_volume(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
+        device: String,
+        name: String,
+        passphrase: String,
+        unlock_method: String,
+        unlock_pin: String,
+    ) -> Result<Triple, SvcError> {
+        let device = self
+            .gate_device(
+                conn,
+                &hdr,
+                AuthKind::Manage,
+                &device,
+                &[&name, &passphrase, &unlock_method, &unlock_pin],
+            )
+            .await?;
+        blocking(move || op_open_volume(&device, &name, &passphrase, &unlock_method, &unlock_pin))
+            .await
+    }
+
+    #[zbus(name = "CloseVolume")]
+    async fn close_volume(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+    ) -> Result<(bool, String), SvcError> {
+        // No device path: closing a mapping is gated by the manage polkit
+        // action (there is no file to fall back on for the ownership skip).
+        self.gate(conn, &hdr, AuthKind::Manage, None, false).await?;
+        Self::check_lens(&[&name])?;
+        blocking(move || op_close_volume(&name)).await
     }
 
     #[zbus(name = "EnrollFido2")]
@@ -986,9 +1099,14 @@ impl LuksEnrollService {
         device: String,
         passphrase: String,
     ) -> Result<Triple, SvcError> {
-        let device = self
-            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
-            .await?;
+        // Timed alongside format_removable_partition's per-stage timers
+        // (#84, LUKS_ENROLL_TIMING gated): delay in the polkit gate would
+        // be invisible to those.
+        let device = {
+            let _t = crate::luks::Timer::new("FormatPartition: polkit/device gate");
+            self.gate_device(conn, &hdr, AuthKind::Manage, &device, &[&passphrase])
+                .await?
+        };
         blocking(move || op_format_partition(&device, &passphrase)).await
     }
 
@@ -1127,6 +1245,13 @@ impl LuksEnrollService {
         blocking(move || luks::password_keyslots(&fd_path(&fd))).await
     }
 
+    #[zbus(name = "IsVolumeKeyCachedFd")]
+    async fn is_volume_key_cached_fd(&self, fd: OwnedFd) -> Result<bool, SvcError> {
+        Self::check_fd(&fd, false, false)?;
+        self.touch_idle();
+        blocking(move || luks::is_volume_key_cached(&fd_path(&fd))).await
+    }
+
     #[zbus(name = "GetDeviceInfoFd")]
     async fn get_device_info_fd(&self, fd: OwnedFd) -> Result<String, SvcError> {
         Self::check_fd(&fd, false, false)?;
@@ -1188,6 +1313,51 @@ impl LuksEnrollService {
             },
         )
         .await
+    }
+
+    #[zbus(name = "OpenVolumeFd")]
+    async fn open_volume_fd(
+        &self,
+        fd: OwnedFd,
+        name: String,
+        passphrase: String,
+        unlock_method: String,
+        unlock_pin: String,
+    ) -> Result<Triple, SvcError> {
+        // A read-write descriptor: a dm-crypt mapping over the container is
+        // writable, so the host can mount and write through it.
+        Self::check_fd(&fd, true, false)?;
+        Self::check_lens(&[&name, &passphrase, &unlock_method, &unlock_pin])?;
+        self.touch_idle();
+        blocking(move || {
+            op_open_volume(
+                &fd_path(&fd),
+                &name,
+                &passphrase,
+                &unlock_method,
+                &unlock_pin,
+            )
+        })
+        .await
+    }
+
+    /// Close every dm-crypt mapping backed by the container file `fd`.
+    /// Possession of a writable descriptor is the authorization (no polkit),
+    /// mirroring `OpenVolumeFd`: write access to the backing file already
+    /// grants arbitrary corruption of the volume, so tearing its mappings
+    /// down is strictly less power. The mapping set is discovered from the
+    /// kernel's loop attach records by inode — never from a caller-supplied
+    /// name — so there is nothing to validate or forge.
+    #[zbus(name = "CloseVolumeFd")]
+    async fn close_volume_fd(&self, fd: OwnedFd) -> Result<Triple, SvcError> {
+        // Read-write and regular-only: read access to a shared container
+        // must not grant teardown, and block devices keep the polkit-gated
+        // CloseVolume (there is no loop backing file to compare against).
+        Self::check_fd(&fd, true, true)?;
+        self.touch_idle();
+        let st = nix::sys::stat::fstat(&fd)
+            .map_err(|_| SvcError::InvalidArgs("Invalid file descriptor".into()))?;
+        blocking(move || op_close_volume_fd(st.st_dev, st.st_ino)).await
     }
 
     #[zbus(name = "EnrollFido2Fd")]

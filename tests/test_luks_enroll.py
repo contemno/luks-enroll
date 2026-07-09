@@ -12,6 +12,7 @@ Run: python3 -m pytest test_luks_enroll.py -v
 import ast
 import glob  # noqa: F401  pre-import so sys.modules patching doesn't evict it
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -186,9 +187,10 @@ class TestAppVersion(unittest.TestCase):
 
 
 class TestKeylessImageCreation(unittest.TestCase):
-    """Issue #58: creating an encrypted container needs no passphrase. The
-    service formats it with a cached volume key and the detail page opens
-    already unlocked, so the first enrollment wraps that key directly.
+    """Issue #58 (image files) and #82 (block devices): creating/encrypting a
+    container needs no passphrase. The service formats it with a cached
+    volume key and the detail page opens already unlocked, so the first
+    enrollment wraps that key directly.
 
     The GUI page classes subclass mocked GTK bases (so they're MagicMocks at
     import), hence these assert on the parsed source of each class body."""
@@ -219,14 +221,212 @@ class TestKeylessImageCreation(unittest.TestCase):
         create = self.classes["CreateImagePage"]
         # Create with an empty passphrase (keyless format) ...
         self.assertIn('create_encrypted_image_async(path, size_mb, "", ', create)
-        # ... then hand off to the detail page as already-unlocked.
-        self.assertIn("volume_key_cached=True", create)
+        # ... then hand off to the shared success tail (FormatDialogBase),
+        # which does the volume_key_cached=True detail-page push.
+        self.assertIn("self._on_format_success(self._pending_path)", create)
 
-    def test_block_device_flow_still_uses_a_passphrase(self):
-        # Scope guard: this change is image-files-only. The block-device
-        # encrypt flow keeps its passphrase hand-off (its keyless/deferred
-        # variant is tracked separately).
-        self.assertIn("passphrase=self._pending_pw", self.classes["EncryptDevicePage"])
+    def test_encrypt_device_page_drops_passphrase_fields(self):
+        # Issue #82: extends the keyless format to the block-device path.
+        # The passphrase entry rows and their validation are gone — the user
+        # is never asked for a throwaway passphrase on encrypt.
+        encrypt = self.classes["EncryptDevicePage"]
+        self.assertNotIn("PasswordEntryRow", encrypt)
+        self.assertNotIn("Passphrases do not match", encrypt)
+        self.assertNotIn("Passphrase cannot be empty", encrypt)
+
+    def test_encrypt_device_uses_empty_passphrase_and_cached_handoff(self):
+        encrypt = self.classes["EncryptDevicePage"]
+        # Encrypt with an empty passphrase (keyless format) ...
+        self.assertIn('self.svc.format_partition(self.device, "")', encrypt)
+        # ... then hand off to the shared success tail (FormatDialogBase),
+        # which does the volume_key_cached=True detail-page push.
+        self.assertIn("self._on_format_success(partition or self.device)", encrypt)
+
+
+class TestFormatDialogConsolidation(unittest.TestCase):
+    """Issue #86: EncryptDevicePage/CreateImagePage became Adw.Dialogs (not
+    pushed Adw.NavigationPages), so the back button from the detail page that
+    opens after a successful format lands on the device list, never on a now-
+    stale format page. The two share a FormatDialogBase for their chrome and
+    the success/failure hand-off; only the target-specific input widgets and
+    the D-Bus dispatch stay in the subclasses.
+
+    Same source-based approach as TestKeylessImageCreation: the page classes
+    subclass mocked GTK bases, so real instantiation isn't meaningful here."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        cls.classes = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+        cls.bases = {
+            node.name: [ast.unparse(b) for b in node.bases]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+
+    def test_format_dialogs_subclass_shared_base_not_nav_page(self):
+        self.assertEqual(self.bases["FormatDialogBase"], ["Adw.Dialog"])
+        self.assertEqual(self.bases["EncryptDevicePage"], ["FormatDialogBase"])
+        self.assertEqual(self.bases["CreateImagePage"], ["FormatDialogBase"])
+
+    def test_format_dialog_base_pins_a_non_tiny_content_size(self):
+        # Adw.Dialog defaults to its content's natural size, which for a
+        # PreferencesPage-based form rendered as ~a quarter of the main
+        # window (PR #87 review feedback). Pin an explicit size instead.
+        base = self.classes["FormatDialogBase"]
+        self.assertIn("self.set_content_width(", base)
+        self.assertIn("self.set_content_height(", base)
+
+    def test_list_page_presents_dialogs_instead_of_pushing(self):
+        list_page = self.classes["DeviceListPage"]
+        self.assertIn("EncryptDevicePage(self.svc, device, size_str, self)", list_page)
+        self.assertIn("CreateImagePage(self.svc, self)", list_page)
+        self.assertIn("dialog.present(self)", list_page)
+        # No more pushing these onto the nav stack.
+        self.assertNotIn("nav.push(page)", list_page)
+
+    def test_shared_success_and_failure_tail_lives_in_base_only(self):
+        base = self.classes["FormatDialogBase"]
+        self.assertIn("self.close()", base)
+        self.assertIn("volume_key_cached=True", base)
+        self.assertIn("nav.push(detail)", base)
+        # Subclasses delegate rather than duplicating the close/push tail.
+        for name in ("EncryptDevicePage", "CreateImagePage"):
+            cls_src = self.classes[name]
+            self.assertNotIn("self.close()", cls_src)
+            self.assertNotIn("volume_key_cached=True", cls_src)
+            self.assertIn("_on_format_success", cls_src)
+            self.assertIn("_on_format_failure", cls_src)
+
+
+class TestEmptyRemovableReaderRendering(unittest.TestCase):
+    """A removable device with size_bytes == 0 and no partitions (e.g. an
+    empty SD/TF card reader) must render as a dimmed, non-activatable row
+    with no Encrypt button (#89), distinct from a real zero-partition
+    device that just hasn't been formatted yet.
+
+    Same AST source-based approach as TestFormatDialogConsolidation: the
+    page classes subclass mocked GTK bases, so real instantiation isn't
+    meaningful here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        cls.classes = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+
+    def test_empty_reader_branch_is_dimmed_and_not_activatable(self):
+        list_page = self.classes["DeviceListPage"]
+        self.assertIn('rdev.get("size_bytes") == 0', list_page)
+        self.assertIn("Empty — insert a memory card to encrypt", list_page)
+
+    def test_empty_reader_branch_precedes_the_no_partitions_fallback(self):
+        # The zero-size check must be an elif ahead of the generic
+        # no-partitions branch, or every unformatted device (not just
+        # empty readers) would lose its Encrypt button.
+        list_page = self.classes["DeviceListPage"]
+        empty_idx = list_page.index('rdev.get("size_bytes") == 0')
+        fallback_idx = list_page.index('subtitle += " — No partitions"')
+        self.assertLess(empty_idx, fallback_idx)
+
+
+class TestReformatStuckVolumes(unittest.TestCase):
+    """Issue #88: a removable partition or image file with zero enrolled
+    keyslots and no cached volume key can never be unlocked again, so the
+    list page offers a reformat/recreate action instead of a dead-end detail
+    view. GTK page classes subclass mocked bases (MagicMocks at import, per
+    TestKeylessImageCreation's docstring), so this asserts on source."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        cls.classes = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+        cls.bases = {
+            node.name: [ast.unparse(b) for b in node.bases]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+
+    def test_is_reformattable_requires_zero_keyslots_and_uncached_vk(self):
+        list_page = self.classes["DeviceListPage"]
+        self.assertIn('summary != "No keyslots"', list_page)
+        self.assertIn("self.svc.is_volume_key_cached(path)", list_page)
+
+    def test_removable_and_image_rows_gate_on_reformattable_set(self):
+        list_page = self.classes["DeviceListPage"]
+        self.assertIn("if part_path in reformattable:", list_page)
+        self.assertIn("if img_path in reformattable:", list_page)
+        # Internal (non-removable) volumes are deliberately never offered a
+        # reformat: this is a recovery path for removable media and
+        # containers, not a way to nuke an in-use system volume.
+        internal_render_loop = list_page.split("for dev in devices:")[1].split(
+            "for rdev in removable_devs:"
+        )[0]
+        self.assertNotIn("reformattable", internal_render_loop)
+
+    def test_reformat_image_page_subclasses_shared_base(self):
+        self.assertEqual(self.bases["ReformatImagePage"], ["FormatDialogBase"])
+
+    def test_reformat_image_page_drops_passphrase_fields(self):
+        reformat = self.classes["ReformatImagePage"]
+        self.assertNotIn("PasswordEntryRow", reformat)
+        self.assertNotIn("Passphrases do not match", reformat)
+        self.assertNotIn("Passphrase cannot be empty", reformat)
+
+    def test_reformat_image_page_removes_then_recreates_keylessly(self):
+        reformat = self.classes["ReformatImagePage"]
+        self.assertIn("os.remove(self.path)", reformat)
+        self.assertIn('self.path, self.size_mb, "", self._on_create_finish', reformat)
+        # ... then hand off to the shared success tail (FormatDialogBase),
+        # which does the volume_key_cached=True detail-page push.
+        self.assertIn("self._on_format_success(self.path)", reformat)
+
+    def test_proxy_is_volume_key_cached_dispatches_by_path_or_fd(self):
+        proxy = gui.LuksEnrollProxy.__new__(gui.LuksEnrollProxy)
+        proxy.proxy = mock.MagicMock()
+        proxy.proxy.call_sync.return_value.unpack.return_value = (True,)
+        captured = {}
+
+        def fake_dispatch(
+            path_call, method_fd, fd_sig, device, extra_args, timeout, read_only=False
+        ):
+            captured.update(
+                method_fd=method_fd,
+                fd_sig=fd_sig,
+                device=device,
+                read_only=read_only,
+            )
+            return path_call().unpack()
+
+        proxy._call_path_or_fd_sync = fake_dispatch
+        result = proxy.is_volume_key_cached("/dev/sdx1")
+
+        self.assertTrue(result)
+        self.assertEqual(captured["method_fd"], "IsVolumeKeyCachedFd")
+        self.assertEqual(captured["fd_sig"], "(h)")
+        self.assertEqual(captured["device"], "/dev/sdx1")
+        self.assertTrue(captured["read_only"])
+        proxy.proxy.call_sync.assert_called_once_with(
+            "IsVolumeKeyCached", mock.ANY, gui.Gio.DBusCallFlags.NONE, 30000, None
+        )
 
 
 class TestRunAsync(unittest.TestCase):
@@ -272,6 +472,211 @@ class TestRunAsync(unittest.TestCase):
             cb = object()
             gui.run_async(boom, cb)
         self.assertEqual(captured, [(cb, False, "", "D-Bus error: nope")])
+
+
+class TestVolumeMappingProxy(unittest.TestCase):
+    """OpenVolume/CloseVolume proxy wrappers (issue #69): correct D-Bus method
+    names, signatures, and path-vs-fd dispatch."""
+
+    @staticmethod
+    def _proxy():
+        # Build a proxy instance without running __init__ (which would try to
+        # connect to the bus); the wrappers only touch .proxy / helpers.
+        return gui.LuksEnrollProxy.__new__(gui.LuksEnrollProxy)
+
+    def test_open_volume_uses_fd_variant_and_signature(self):
+        proxy = self._proxy()
+        captured = {}
+
+        def fake_dispatch(path_call, method_fd, fd_sig, device, extra_args, timeout):
+            captured.update(
+                method_fd=method_fd, fd_sig=fd_sig, device=device, extra_args=extra_args
+            )
+            return (True, "luks-uuid", "")
+
+        proxy._call_path_or_fd_sync = fake_dispatch
+        ok, mapper, err = proxy.open_volume(
+            "/dev/sdb1", "luks-uuid", "pw", "systemd-fido2", "1234"
+        )
+        self.assertEqual((ok, mapper, err), (True, "luks-uuid", ""))
+        self.assertEqual(captured["method_fd"], "OpenVolumeFd")
+        # fd path: index + name + passphrase + unlock_method + unlock_pin.
+        self.assertEqual(captured["fd_sig"], "(hssss)")
+        self.assertEqual(captured["device"], "/dev/sdb1")
+        self.assertEqual(
+            captured["extra_args"], ("luks-uuid", "pw", "systemd-fido2", "1234")
+        )
+
+    def test_close_volume_block_device_uses_polkit_gated_close(self):
+        proxy = self._proxy()
+
+        class FakeResult:
+            def unpack(self):
+                return (True, "")
+
+        class FakeProxy:
+            def __init__(self):
+                self.calls = []
+
+            def call_sync(self, method, *args, **kwargs):
+                self.calls.append(method)
+                return FakeResult()
+
+        proxy.proxy = FakeProxy()
+        # A block device is not a regular file, so the fd path is skipped.
+        self.assertEqual(proxy.close_volume("/dev/sdb1", "luks-uuid"), (True, ""))
+        self.assertEqual(proxy.proxy.calls, ["CloseVolume"])
+
+    def test_close_volume_container_file_uses_fd_discovery(self):
+        # A container file routes to CloseVolumeFd: fd-only signature, no
+        # mapper name crosses the boundary, and the (ok, closed, stderr)
+        # triple collapses to the (ok, stderr) pair callers expect.
+        proxy = self._proxy()
+        captured = {}
+
+        def fake_fd_sync(method_fd, signature, fd, extra_args, timeout):
+            os.fstat(fd)  # the fd must be open and valid at call time
+            captured.update(
+                method_fd=method_fd, signature=signature, fd=fd, extra_args=extra_args
+            )
+            return (True, "luks-uuid", "")
+
+        proxy._call_fd_sync = fake_fd_sync
+        with tempfile.NamedTemporaryFile() as img:
+            self.assertEqual(proxy.close_volume(img.name, "luks-uuid"), (True, ""))
+            # close_volume owns the fd lifecycle (_call_fd_sync must not
+            # close it): after returning, the fd is closed exactly once.
+            with self.assertRaises(OSError):
+                os.fstat(captured["fd"])
+        self.assertEqual(captured["method_fd"], "CloseVolumeFd")
+        self.assertEqual(captured["signature"], "(h)")
+        self.assertEqual(captured["extra_args"], ())
+
+    def test_close_volume_falls_back_when_service_lacks_the_method(self):
+        # An installed service older than CloseVolumeFd raises UnknownMethod;
+        # the client must fall back to the polkit-gated CloseVolume rather
+        # than surface an error (service/client version skew).
+        proxy = self._proxy()
+
+        class FakeGError(Exception):
+            pass
+
+        class FakeResult:
+            def unpack(self):
+                return (True, "")
+
+        class FakeProxy:
+            def __init__(self):
+                self.calls = []
+
+            def call_sync(self, method, *args, **kwargs):
+                self.calls.append(method)
+                return FakeResult()
+
+        def raise_unknown(*args, **kwargs):
+            raise FakeGError("no such method")
+
+        proxy.proxy = FakeProxy()
+        proxy._call_fd_sync = raise_unknown
+        with (
+            mock.patch.object(gui.GLib, "Error", FakeGError),
+            mock.patch.object(
+                gui.Gio.DBusError,
+                "get_remote_error",
+                return_value="org.freedesktop.DBus.Error.UnknownMethod",
+            ),
+            tempfile.NamedTemporaryFile() as img,
+        ):
+            self.assertEqual(proxy.close_volume(img.name, "luks-uuid"), (True, ""))
+        self.assertEqual(proxy.proxy.calls, ["CloseVolume"])
+
+    def test_close_volume_reraises_other_dbus_errors(self):
+        # Only UnknownMethod triggers the fallback; a real failure (denied,
+        # timeout, ...) must propagate, not silently retry with polkit.
+        proxy = self._proxy()
+
+        class FakeGError(Exception):
+            pass
+
+        def raise_failure(*args, **kwargs):
+            raise FakeGError("operation failed")
+
+        proxy._call_fd_sync = raise_failure
+        with (
+            mock.patch.object(gui.GLib, "Error", FakeGError),
+            mock.patch.object(
+                gui.Gio.DBusError,
+                "get_remote_error",
+                return_value="org.freedesktop.DBus.Error.Failed",
+            ),
+            tempfile.NamedTemporaryFile() as img,
+        ):
+            with self.assertRaises(FakeGError):
+                proxy.close_volume(img.name, "luks-uuid")
+
+    def test_is_unknown_method_matches_only_the_dbus_unknown_method_name(self):
+        self.assertTrue(
+            gui.is_unknown_method("org.freedesktop.DBus.Error.UnknownMethod")
+        )
+        self.assertFalse(gui.is_unknown_method("org.freedesktop.DBus.Error.Failed"))
+        self.assertFalse(gui.is_unknown_method(None))
+
+
+class TestMapperNameDerivation(unittest.TestCase):
+    """The Volume Mapping button must appear even when the service reports no
+    UUID (older service build), so the name derivation falls back to the
+    device path instead of disabling the control (PR #70 review)."""
+
+    @staticmethod
+    def _derive(device, uuid):
+        return gui.derive_mapper_name(device, uuid)
+
+    def test_prefers_uuid(self):
+        self.assertEqual(self._derive("/dev/sdb1", "1b6e-2c3d"), "luks-1b6e-2c3d")
+
+    def test_falls_back_to_device_basename_when_no_uuid(self):
+        # No UUID -> still a valid, non-None name so the button shows.
+        self.assertEqual(self._derive("/dev/sdb1", ""), "luks-sdb1")
+
+    def test_fallback_sanitizes_to_dm_name_charset(self):
+        name = self._derive("/home/user/My Secret.img", "")
+        self.assertTrue(name.startswith("luks-"))
+        # Only the dm-crypt charset the service's valid_mapper_name accepts.
+        self.assertTrue(all(c.isalnum() or c in "-_" for c in name))
+
+
+class TestMountReferences(unittest.TestCase):
+    """The client's mounted-state hint mirrors the service's data-loss guard:
+    a mapping with a mounted filesystem must be recognized so it can be flagged
+    (and the service refuses to close it)."""
+
+    MOUNTS = (
+        "proc /proc proc rw 0 0\n"
+        "/dev/sda1 /boot ext4 rw 0 0\n"
+        "/dev/mapper/luks-abc /mnt/secret ext4 rw 0 0\n"
+    )
+
+    def test_matches_mapper_spelling(self):
+        self.assertTrue(
+            gui.mount_references(self.MOUNTS, "/dev/mapper/luks-abc", "/dev/dm-3")
+        )
+
+    def test_matches_resolved_dm_node(self):
+        mounts = "/dev/dm-3 /mnt/secret ext4 rw 0 0\n"
+        self.assertTrue(
+            gui.mount_references(mounts, "/dev/mapper/luks-abc", "/dev/dm-3")
+        )
+
+    def test_no_match_when_not_mounted(self):
+        self.assertFalse(
+            gui.mount_references(self.MOUNTS, "/dev/mapper/luks-other", "/dev/dm-9")
+        )
+
+    def test_substring_device_does_not_false_match(self):
+        mounts = "/dev/mapper/luks-abc-data /mnt/x ext4 rw 0 0\n"
+        self.assertFalse(
+            gui.mount_references(mounts, "/dev/mapper/luks-abc", "/dev/dm-3")
+        )
 
 
 if __name__ == "__main__":
