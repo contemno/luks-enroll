@@ -34,6 +34,14 @@ and recovery keys into LUKS2 volumes.
   **minor** bump (breaking changes → **major**); only pure fixes/chores stay a patch. If a bump
   is needed, land a `VERSION` bump on `dev` first (via its own PR), then the promotion publishes
   that version. Note the intended release version in the promotion PR body.
+- **Merge `dev → main` promotion PRs with "Create a merge commit" — never rebase or squash.**
+  Rebase/squash rewrites the promoted commits on `main`, so `main` stops being a descendant of
+  `dev` and the *next* promotion PR conflicts on every file both sides touched (the v0.4.0 →
+  v0.5.0 #95/#96 incident). A merge commit keeps `main` a descendant of `dev`, so promotions
+  stay conflict-free. If the histories have already diverged, reconcile with a sync-back PR
+  into `dev` (merge `main` with `-s ours` — safe only after verifying `main` has no unique
+  content, e.g. `git diff <dev-tip-at-last-release> origin/main` is empty), merged the same
+  way: as a merge commit.
 
 ## Work loop
 
