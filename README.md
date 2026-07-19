@@ -18,6 +18,7 @@ Designed to run on first login, from a normal desktop session, or inside an inst
 - **Per-enrollment wipe controls** with auth-keyslot protection so you can never lock yourself out
 - **systemd-cryptsetup compatible token format** — the same keyslots work for initramfs unlock
 - **In-process crypto** against libcryptsetup, libfido2, and libtss2 — zero subprocess calls into the cryptsetup CLI
+- **Drop-in takeover of the stock GNOME/udisks2 unlock prompt** for removable LUKS volumes — offers every enrolled method (passphrase, recovery key, FIDO2, TPM2) instead of Ubuntu's passphrase-only dialog; see [Removable-volume unlock takeover](#removable-volume-unlock-takeover)
 
 ## Architecture
 
@@ -27,7 +28,7 @@ The application is split between an unprivileged GTK client (Python) and a privi
 ┌─────────────────────┐  D-Bus system bus   ┌──────────────────────────┐
 │  luks-enroll        │ ──────────────────► │  luks-enroll-service     │
 │  (user, GTK4 GUI)   │  net.contemno       │  (root, bus-activated)   │
-│  Python, ~2,400 LOC │  .LuksEnroll1       │  Rust                    │
+│  Python, ~3,400 LOC │  .LuksEnroll1       │  Rust                    │
 │                     │ ◄────────────────── │                          │
 └─────────────────────┘                     └──────────────────────────┘
                                                        │
@@ -54,6 +55,40 @@ After enrolling a token, regenerate the initramfs (`dracut --force` or `update-i
 crypt-root  UUID=...  none  tpm2-device=auto,fido2-device=auto,luks,discard
 ```
 
+## Removable-volume unlock takeover
+
+Ubuntu's default GNOME/udisks2 unlock prompt only supports passphrases. This package
+replaces it for removable LUKS2 volumes (USB drives, SD/MMC cards) so any enrolled method —
+passphrase, recovery key, FIDO2, TPM2 — can unlock them, the same way this app's own device
+detail view does:
+
+- **`luks-enroll --unlock <device>`** presents just the unlock dialog for one device (no
+  device-list window). On success it maps the volume with the same `OpenVolume` D-Bus call
+  the Volume Mapping group uses, so the filesystem inside becomes mountable.
+- **`luks-enroll --watch`** listens on the system bus for udisks2's `InterfacesAdded` signal
+  and launches the unlock dialog for each newly-appeared `crypto_LUKS` block device. It's
+  started automatically per graphical session by the autostart entry at
+  [`dist/etc/xdg/autostart/net.contemno.luks-enroll-watch.desktop`](dist/etc/xdg/autostart/net.contemno.luks-enroll-watch.desktop)
+  (chosen over a `systemd --user` unit because an XDG autostart `.desktop` file works
+  automatically for any already-existing account with zero extra `systemctl --user enable`
+  step, matching the "ships enabled by default" requirement).
+- The udev rule
+  [`dist/usr/lib/udev/rules.d/71-luks-enroll-suppress-auto-unlock.rules`](dist/usr/lib/udev/rules.d/71-luks-enroll-suppress-auto-unlock.rules)
+  suppresses the stock GNOME/udisks2 auto-unlock prompt by setting `UDISKS_AUTO=0` (which
+  clears the udisks2 `Block:HintAuto` property gnome-settings-daemon's automount plugin checks)
+  for every `crypto_LUKS` block device — **but only when the kernel's own
+  `/sys/block/<disk>/removable` attribute reports `1`**. Internal/root/home volumes are never
+  touched by this rule; breaking boot-time unlock is treated as a hard safety requirement, not
+  a preference. `UDISKS_AUTO=0` (rather than `UDISKS_IGNORE=1`) was chosen deliberately: it
+  suppresses only the automatic unlock/mount behavior, leaving the device fully visible and
+  manually operable via `udisksctl`, GNOME Disks, and Nautilus. The rule ships **enabled by
+  default** — to opt back into the stock GNOME prompt, delete (or mask) that rule file and run
+  `udevadm control --reload-rules`.
+
+Requires a udisks2-based desktop session (GNOME, and most other Linux desktops) for the
+`InterfacesAdded` signal and the `UDISKS_AUTO` hint to apply; the udev rule and `--watch`/
+`--unlock` switches are otherwise inert on a system without udisks2.
+
 ## Project layout
 
 ```
@@ -69,8 +104,10 @@ dist/                              Mirrors the install hierarchy for the non-Rus
   usr/share/dbus-1/                Bus policy + activation
   usr/share/polkit-1/actions/      Polkit policy
   usr/share/applications/          Desktop launcher
+  usr/lib/udev/rules.d/            Udev rule suppressing the stock GNOME auto-unlock prompt
   etc/dracut.conf.d/               Initramfs module config
   etc/luks-enroll.conf             Runtime config (writable)
+  etc/xdg/autostart/               Autostart entry for the `--watch` udisks2 listener
   lib/systemd/system/              Hardened systemd unit
 
 dbus/
@@ -140,6 +177,8 @@ sudo apt install ./target/luks-enroll_*.deb
 
 ```sh
 luks-enroll                 # management view
+luks-enroll --unlock <device>  # just the unlock dialog for one device
+luks-enroll --watch            # udisks2 listener (see Removable-volume unlock takeover)
 ```
 
 ## Development
