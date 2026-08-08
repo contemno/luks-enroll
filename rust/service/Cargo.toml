@@ -14,7 +14,7 @@ name = "luks-enroll-service"
 path = "src/main.rs"
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.0"
 fido2-sys = { version = "0.1.0", path = "../fido2-sys" }
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 getrandom = "0.4.2"
