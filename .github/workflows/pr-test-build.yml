@@ -120,14 +120,16 @@ jobs:
   build:
     needs: tag
     if: needs.tag.outputs.created == 'true'
-    # contents:write here is an ENVELOPE requirement only: GitHub statically
-    # validates every job in a called workflow against this grant — even jobs
-    # skipped by `if:` — and build-release.yml's release job (skipped via
-    # publish: false) requests contents:write. No job that actually runs on
-    # this path gets more than contents:read (build-release.yml's top-level
-    # default).
+    # contents:write/id-token:write/attestations:write here are an ENVELOPE
+    # requirement only: GitHub statically validates every job in a called
+    # workflow against this grant — even jobs skipped by `if:` — and
+    # build-release.yml's release job (skipped via publish: false) requests
+    # all three. No job that actually runs on this path gets more than
+    # contents:read (build-release.yml's top-level default).
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/build-release.yml
     with:
       ref: ${{ needs.tag.outputs.tag }}

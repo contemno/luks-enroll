@@ -106,6 +106,8 @@ jobs:
     if: needs.tag.outputs.created == 'true'
     permissions:
       contents: write
+      id-token: write        # cosign keyless signing + provenance attestation
+      attestations: write
     uses: ./.github/workflows/build-release.yml
     with:
       ref: ${{ needs.tag.outputs.tag }}
