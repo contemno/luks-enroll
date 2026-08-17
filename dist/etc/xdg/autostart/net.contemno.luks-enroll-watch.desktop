@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LUKS Enroll — Unlock Listener
+Comment=Listen for removable LUKS volumes and offer this app's unlock dialog instead of the stock passphrase prompt
+Exec=/usr/bin/luks-enroll --watch
+Icon=security-high-symbolic
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+Categories=System;Security;

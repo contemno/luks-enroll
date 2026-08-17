@@ -679,5 +679,563 @@ class TestMountReferences(unittest.TestCase):
         )
 
 
+# ===========================================================================
+# Issue #98 — drop-in takeover of Ubuntu's passphrase-only unlock flow
+# ===========================================================================
+
+
+class TestFetchEnrolledMethods(unittest.TestCase):
+    """fetch_enrolled_methods (extracted from DeviceDetailPage's in-page
+    unlock prompt so UnlockVolumeDialog can share it, issue #98) aggregates
+    enrolled-method data on a background thread and hands the result dict to
+    on_done via GLib.idle_add. Same sync-thread pattern as TestRunAsync."""
+
+    @staticmethod
+    def _sync_thread(target=None, daemon=None):
+        runner = mock.MagicMock()
+        runner.start = target
+        return runner
+
+    def test_aggregates_all_fields_from_the_service(self):
+        svc = mock.MagicMock()
+        svc.get_tokens_by_type.side_effect = lambda device, t: {
+            gui.TOKEN_FIDO2: [("id1", [1])],
+            gui.TOKEN_TPM2: [],
+            gui.TOKEN_RECOVERY: [("id2", [2])],
+        }[t]
+        svc.find_password_keyslots.return_value = [0]
+        svc.get_systemd_version.return_value = 256
+
+        captured = []
+        with (
+            mock.patch.object(gui.threading, "Thread", side_effect=self._sync_thread),
+            mock.patch.object(
+                gui.GLib, "idle_add", side_effect=lambda *a: captured.append(a)
+            ),
+        ):
+            cb = object()
+            gui.fetch_enrolled_methods(svc, "/dev/sdb1", cb)
+
+        self.assertEqual(len(captured), 1)
+        cb_arg, data = captured[0]
+        self.assertIs(cb_arg, cb)
+        self.assertEqual(data["fido2"], [("id1", [1])])
+        self.assertEqual(data["tpm2"], [])
+        self.assertEqual(data["recovery"], [("id2", [2])])
+        self.assertEqual(data["pw_slots"], [0])
+        self.assertEqual(data["systemd_version"], 256)
+
+    def test_a_glib_error_on_one_field_does_not_lose_the_others(self):
+        class FakeGError(Exception):
+            pass
+
+        def raise_for_fido2(device, t):
+            if t == gui.TOKEN_FIDO2:
+                raise FakeGError("no fido2")
+            return []
+
+        svc = mock.MagicMock()
+        svc.get_tokens_by_type.side_effect = raise_for_fido2
+        svc.find_password_keyslots.return_value = [3]
+        svc.get_systemd_version.return_value = 255
+
+        captured = []
+        with (
+            mock.patch.object(gui.threading, "Thread", side_effect=self._sync_thread),
+            mock.patch.object(gui.GLib, "Error", FakeGError),
+            mock.patch.object(
+                gui.GLib, "idle_add", side_effect=lambda *a: captured.append(a)
+            ),
+        ):
+            gui.fetch_enrolled_methods(svc, "/dev/sdb1", object())
+
+        self.assertEqual(len(captured), 1)
+        _cb, data = captured[0]
+        self.assertEqual(data["fido2"], [])  # swallowed by the except clause
+        self.assertEqual(data["pw_slots"], [3])
+        self.assertEqual(data["systemd_version"], 255)
+
+
+class TestUdisks2PickNewLuksDevice(unittest.TestCase):
+    """udisks2_pick_new_luks_device parses a udisks2 InterfacesAdded signal's
+    (already GVariant-unpacked) interfaces dict to find newly-appeared
+    crypto_LUKS block devices for the --watch listener (issue #98). Pure
+    function, no gi dependency, so it's tested directly."""
+
+    @staticmethod
+    def _interfaces(id_type="crypto_LUKS", device=b"/dev/sdb1\x00"):
+        return {
+            "org.freedesktop.UDisks2.Block": {
+                "IdType": id_type,
+                "Device": device,
+            }
+        }
+
+    def test_picks_up_a_new_luks_block_device(self):
+        self.assertEqual(
+            gui.udisks2_pick_new_luks_device(self._interfaces()), "/dev/sdb1"
+        )
+
+    def test_device_as_list_of_ints_also_decodes(self):
+        # GVariant 'ay' can unpack to a list[int] depending on binding
+        # version; the helper must handle either representation.
+        raw = list(b"/dev/sdc1\x00")
+        self.assertEqual(
+            gui.udisks2_pick_new_luks_device(self._interfaces(device=raw)),
+            "/dev/sdc1",
+        )
+
+    def test_ignores_non_luks_filesystems(self):
+        self.assertIsNone(
+            gui.udisks2_pick_new_luks_device(self._interfaces(id_type="ext4"))
+        )
+
+    def test_ignores_objects_without_a_block_interface(self):
+        self.assertIsNone(
+            gui.udisks2_pick_new_luks_device({"org.freedesktop.UDisks2.Partition": {}})
+        )
+
+    def test_ignores_missing_or_empty_device_path(self):
+        self.assertIsNone(
+            gui.udisks2_pick_new_luks_device(self._interfaces(device=b""))
+        )
+        interfaces = self._interfaces()
+        del interfaces["org.freedesktop.UDisks2.Block"]["Device"]
+        self.assertIsNone(gui.udisks2_pick_new_luks_device(interfaces))
+
+
+class TestUdisks2PendingBlockDevice(unittest.TestCase):
+    """udisks2_pending_block_device feeds --watch's probe-race fallback (the
+    PR #100 "no unlock dialog" report): udisks2 can export a Block object
+    before its filesystem probe finishes, so InterfacesAdded may carry an
+    empty IdType for a volume that is in fact crypto_LUKS — the real type
+    only arrives via a later PropertiesChanged. Pure function, tested
+    directly like udisks2_pick_new_luks_device above."""
+
+    @staticmethod
+    def _interfaces(id_type="", device=b"/dev/sdb1\x00"):
+        return {
+            "org.freedesktop.UDisks2.Block": {
+                "IdType": id_type,
+                "Device": device,
+            }
+        }
+
+    def test_returns_device_when_idtype_is_still_empty(self):
+        self.assertEqual(
+            gui.udisks2_pending_block_device(self._interfaces()), "/dev/sdb1"
+        )
+
+    def test_missing_idtype_key_also_counts_as_unprobed(self):
+        interfaces = self._interfaces()
+        del interfaces["org.freedesktop.UDisks2.Block"]["IdType"]
+        self.assertEqual(gui.udisks2_pending_block_device(interfaces), "/dev/sdb1")
+
+    def test_already_probed_devices_are_never_pending(self):
+        # crypto_LUKS at add time is the immediate-launch path
+        # (udisks2_pick_new_luks_device); any other concrete filesystem was
+        # classified, not raced, and can't become LUKS later.
+        self.assertIsNone(
+            gui.udisks2_pending_block_device(self._interfaces(id_type="crypto_LUKS"))
+        )
+        self.assertIsNone(
+            gui.udisks2_pending_block_device(self._interfaces(id_type="ext4"))
+        )
+
+    def test_ignores_objects_without_a_block_interface_or_device(self):
+        self.assertIsNone(
+            gui.udisks2_pending_block_device({"org.freedesktop.UDisks2.Partition": {}})
+        )
+        self.assertIsNone(
+            gui.udisks2_pending_block_device(self._interfaces(device=b""))
+        )
+
+
+class TestWatchProbeRaceFallback(unittest.TestCase):
+    """Behavioral coverage for the --watch probe-race fallback (PR #100): a
+    LUKS volume whose udisks2 filesystem probe finishes *after* the Block
+    object is exported must still get an unlock dialog when IdType arrives
+    via PropertiesChanged. The decision logic lives in the pure, GTK-free
+    Udisks2LuksWatcher (LuksEnrollApp's GTK bases are import-time mocks, so
+    the app class itself isn't instantiable here — its handlers just unpack
+    the GVariant and delegate)."""
+
+    OBJ = "/org/freedesktop/UDisks2/block_devices/sdb1"
+
+    def _watcher(self, **kwargs):
+        launched = []
+        watcher = gui.Udisks2LuksWatcher(
+            launched.append, log=lambda _msg: None, **kwargs
+        )
+        return watcher, launched
+
+    def _added(self, watcher, obj_path=OBJ, id_type="", device=b"/dev/sdb1\x00"):
+        watcher.interfaces_added(
+            obj_path,
+            {"org.freedesktop.UDisks2.Block": {"IdType": id_type, "Device": device}},
+        )
+
+    def test_late_crypto_luks_probe_launches_the_unlock_dialog(self):
+        watcher, launched = self._watcher()
+        self._added(watcher)  # IdType still empty at InterfacesAdded time
+        self.assertEqual(launched, [])
+        self.assertEqual(watcher._pending, {self.OBJ: "/dev/sdb1"})
+        watcher.block_properties_changed(self.OBJ, {"IdType": "crypto_LUKS"})
+        self.assertEqual(launched, ["/dev/sdb1"])
+        self.assertEqual(watcher._pending, {})
+
+    def test_luks_at_add_time_still_launches_immediately(self):
+        watcher, launched = self._watcher()
+        self._added(watcher, id_type="crypto_LUKS")
+        self.assertEqual(launched, ["/dev/sdb1"])
+        self.assertEqual(watcher._pending, {})
+
+    def test_probe_resolving_to_another_filesystem_forgets_the_device(self):
+        watcher, launched = self._watcher()
+        self._added(watcher)
+        watcher.block_properties_changed(self.OBJ, {"IdType": "ext4"})
+        self.assertEqual(launched, [])
+        self.assertEqual(watcher._pending, {})
+
+    def test_properties_changed_for_unknown_paths_is_ignored(self):
+        watcher, launched = self._watcher()
+        watcher.block_properties_changed(
+            "/org/freedesktop/UDisks2/block_devices/zzz",
+            {"IdType": "crypto_LUKS"},
+        )
+        self.assertEqual(launched, [])
+
+    def test_unrelated_property_changes_keep_the_device_pending(self):
+        watcher, launched = self._watcher()
+        self._added(watcher)
+        watcher.block_properties_changed(self.OBJ, {"Size": 4096})
+        self.assertEqual(launched, [])
+        self.assertEqual(watcher._pending, {self.OBJ: "/dev/sdb1"})
+
+    def test_pending_set_is_capped_and_evicts_oldest_first(self):
+        watcher, _launched = self._watcher(max_pending=4)
+        for i in range(6):
+            self._added(
+                watcher,
+                obj_path=f"/org/freedesktop/UDisks2/block_devices/sd{i}",
+                device=f"/dev/sd{i}\x00".encode(),
+            )
+        self.assertEqual(len(watcher._pending), 4)
+        self.assertNotIn("/org/freedesktop/UDisks2/block_devices/sd0", watcher._pending)
+        self.assertIn("/org/freedesktop/UDisks2/block_devices/sd5", watcher._pending)
+
+    def test_default_cap_and_logger_come_from_the_module(self):
+        watcher = gui.Udisks2LuksWatcher(lambda _d: None)
+        self.assertEqual(watcher._max_pending, gui.WATCH_PENDING_BLOCKS_MAX)
+        self.assertIs(watcher._log, gui.journal_log)
+
+
+class TestUnlockVolumeDialogAndCli(unittest.TestCase):
+    """Issue #98: the enrolled-methods unlock prompt is extracted into a
+    reusable UnlockVolumeDialog, driven by a new --unlock/--watch CLI
+    surface on LuksEnrollApp. GTK page/dialog classes subclass mocked bases
+    (MagicMocks at import, per TestKeylessImageCreation's docstring), so
+    this asserts on parsed source, the same approach as the other
+    structural tests in this file."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        cls.classes = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+        cls.bases = {
+            node.name: [ast.unparse(b) for b in node.bases]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+        cls.methods = {
+            node.name: {
+                n.name: ast.get_source_segment(source, n)
+                for n in node.body
+                if isinstance(n, ast.FunctionDef)
+            }
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+        cls.top_functions = {
+            n.name: ast.get_source_segment(source, n)
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+        }
+
+    # -- UnlockVolumeDialog ------------------------------------------------
+
+    def test_unlock_dialog_subclasses_adw_dialog(self):
+        self.assertEqual(self.bases["UnlockVolumeDialog"], ["Adw.Dialog"])
+
+    def test_unlock_dialog_resizes_to_its_content_instead_of_pinning(self):
+        # PR #100 hardware report: the originally pinned 420x360 content
+        # size forced the rows revealed by the async enrolled-methods fetch
+        # to scroll. The dialog now follows its content's natural size (the
+        # standalone wrapper window is non-resizable, so it re-fits when
+        # _apply_enrolled_methods reveals rows) and keeps only a minimum
+        # width.
+        dialog = self.classes["UnlockVolumeDialog"]
+        self.assertIn("self.set_follows_content_size(True)", dialog)
+        self.assertNotIn("self.set_content_height(", dialog)
+        self.assertNotIn("self.set_content_width(", dialog)
+
+    def test_unlock_dialog_has_no_extra_scrolled_window(self):
+        # An extra Gtk.ScrolledWindow around the PreferencesPage (the
+        # FormatDialogBase layout) reports a near-zero natural height,
+        # which would defeat follows-content-size. Adw.PreferencesPage's
+        # own internal scroller propagates natural height and still
+        # scrolls if the screen is shorter than the content.
+        dialog = self.classes["UnlockVolumeDialog"]
+        self.assertNotIn("Gtk.ScrolledWindow(", dialog)
+        self.assertIn("toolbar_view.set_content(prefs)", dialog)
+
+    def test_unlock_dialog_uses_the_shared_enrolled_methods_fetch(self):
+        dialog = self.classes["UnlockVolumeDialog"]
+        self.assertIn(
+            "fetch_enrolled_methods(self.svc, self.device, "
+            "self._apply_enrolled_methods)",
+            dialog,
+        )
+
+    def test_device_detail_page_delegates_to_the_same_shared_helper(self):
+        # DeviceDetailPage's in-page prompt was refactored to call the same
+        # helper instead of keeping its own duplicate background-fetch
+        # code, so the two authentication flows can't drift apart.
+        detail = self.classes["DeviceDetailPage"]
+        self.assertIn(
+            "fetch_enrolled_methods(self.svc, self.device, "
+            "self._apply_enrolled_methods)",
+            detail,
+        )
+
+    def test_unlock_dialog_maps_the_volume_via_open_volume_on_success(self):
+        dialog = self.classes["UnlockVolumeDialog"]
+        self.assertIn('derive_mapper_name(self.device, info.get("uuid") or "")', dialog)
+        self.assertIn("self.svc.open_volume(", dialog)
+        self.assertIn('self.device, mapper_name, self.passphrase or ""', dialog)
+        self.assertIn("self.unlock_method, self.unlock_pin,", dialog)
+
+    def test_unlock_dialog_reports_mapped_result_and_closes_on_success(self):
+        method = self.methods["UnlockVolumeDialog"]["_on_map_done"]
+        self.assertIn("self._on_mapped(self.device, mapper)", method)
+        self.assertIn("self.close()", method)
+
+    # -- CLI: --unlock / --watch -------------------------------------------
+
+    def test_app_uses_handles_command_line_flag(self):
+        app = self.classes["LuksEnrollApp"]
+        self.assertIn("Gio.ApplicationFlags.HANDLES_COMMAND_LINE", app)
+
+    def test_do_command_line_parses_unlock_and_watch_switches(self):
+        method = self.methods["LuksEnrollApp"]["do_command_line"]
+        self.assertIn('"--unlock"', method)
+        self.assertIn('"--watch"', method)
+        self.assertIn("self._start_watch_mode()", method)
+        self.assertIn("self._present_unlock_dialog(ns.unlock)", method)
+        # A plain launch (neither switch) falls back to the normal GUI.
+        self.assertIn("self.activate()", method)
+
+    def test_present_unlock_dialog_skips_the_management_window(self):
+        method = self.methods["LuksEnrollApp"]["_present_unlock_dialog"]
+        self.assertIn("UnlockVolumeDialog(svc, device", method)
+        # ManagementWindow may be *mentioned* in a docstring/comment
+        # explaining what this path deliberately skips, but must never be
+        # constructed.
+        self.assertNotIn("ManagementWindow(", method)
+
+    def test_present_unlock_dialog_guards_against_a_double_release(self):
+        # on_mapped and the dialog's own "closed" signal can both fire on a
+        # successful unlock; release() must not be called twice (it would
+        # underflow the GApplication hold count).
+        method = self.methods["LuksEnrollApp"]["_present_unlock_dialog"]
+        self.assertIn("released", method)
+        self.assertIn('dialog.connect("closed"', method)
+
+    def test_present_unlock_dialog_hints_modal_for_centered_placement(self):
+        # PR #100: the standalone wrapper window cascade-placed at the top
+        # left. GTK4 clients can't position windows, but flagging the
+        # wrapper's GDK surface modal makes mutter retype it MODAL_DIALOG
+        # and center it on the monitor (Wayland). The hint must go on the
+        # Gdk.Toplevel — Gtk.Window.set_modal() would also gtk_grab_add()
+        # and freeze sibling --watch unlock dialogs in-process.
+        method = self.methods["LuksEnrollApp"]["_present_unlock_dialog"]
+        self.assertIn("dialog.get_root()", method)
+        self.assertIn(".get_surface()", method)
+        self.assertIn("surface.set_modal(True)", method)
+        self.assertNotIn("wrapper.set_modal(", method)
+
+    def test_watch_mode_subscribes_to_udisks2_interfaces_added(self):
+        method = self.methods["LuksEnrollApp"]["_start_watch_mode"]
+        self.assertIn("UDISKS2_BUS_NAME", method)
+        self.assertIn("UDISKS2_OBJECT_MANAGER_PATH", method)
+        self.assertIn('"InterfacesAdded"', method)
+        self.assertIn("signal_subscribe", method)
+
+    def test_watch_mode_is_idempotent_against_a_repeat_invocation(self):
+        method = self.methods["LuksEnrollApp"]["_start_watch_mode"]
+        self.assertIn("if self._watch_subscription is not None:", method)
+
+    def test_interfaces_added_handler_delegates_to_the_pure_watcher(self):
+        # The classification/bookkeeping logic (including the pure
+        # udisks2_pick_new_luks_device picker) lives in Udisks2LuksWatcher
+        # so it stays behaviorally testable; the GTK-side handler only
+        # unpacks the GVariant and delegates.
+        method = self.methods["LuksEnrollApp"]["_on_udisks2_interfaces_added"]
+        self.assertIn("self._watcher.interfaces_added(obj_path, interfaces)", method)
+        watcher = self.classes["Udisks2LuksWatcher"]
+        self.assertIn("udisks2_pick_new_luks_device(interfaces)", watcher)
+
+    def test_watch_mode_also_subscribes_to_block_properties_changed(self):
+        # Probe-race fallback (PR #100): a second subscription catches
+        # IdType arriving after InterfacesAdded, arg0-filtered to the
+        # udisks2 Block interface with no fixed object path (each block
+        # object emits from its own path).
+        method = self.methods["LuksEnrollApp"]["_start_watch_mode"]
+        self.assertIn('"PropertiesChanged"', method)
+        self.assertIn('"org.freedesktop.DBus.Properties"', method)
+        self.assertIn("UDISKS2_BLOCK_IFACE", method)
+        self.assertIn("self._on_udisks2_block_properties_changed", method)
+
+    def test_properties_changed_handler_delegates_to_the_pure_watcher(self):
+        method = self.methods["LuksEnrollApp"]["_on_udisks2_block_properties_changed"]
+        self.assertIn("self._watcher.block_properties_changed(path, changed)", method)
+        watcher = self.classes["Udisks2LuksWatcher"]
+        self.assertIn("udisks2_pending_block_device(interfaces)", watcher)
+
+    def test_watch_mode_creates_the_watcher_wired_to_launch_unlock(self):
+        method = self.methods["LuksEnrollApp"]["_start_watch_mode"]
+        self.assertIn(
+            "self._watcher = Udisks2LuksWatcher(self._launch_unlock_for)", method
+        )
+
+    def test_every_watch_and_unlock_decision_point_logs_to_the_journal(self):
+        # The PR #100 "no unlock dialog" report was undebuggable because
+        # failures only whispered to stderr without a stable prefix. Each
+        # step of the chain must emit a greppable `luks-enroll:` journal
+        # line via journal_log (autostart stderr lands in `journalctl
+        # --user`), so the journal always shows *why* nothing appeared.
+        for name in (
+            "_present_unlock_dialog",
+            "_start_watch_mode",
+            "_launch_unlock_for",
+        ):
+            self.assertIn(
+                "journal_log(",
+                self.methods["LuksEnrollApp"][name],
+                f"{name} must journal_log its outcome",
+            )
+        # The udisks2 signal handlers log through the watcher's injected
+        # logger, which defaults to journal_log (pinned behaviorally by
+        # TestWatchProbeRaceFallback.test_default_cap_and_logger_come_from
+        # _the_module); every decision branch in the watcher logs too.
+        watcher = self.classes["Udisks2LuksWatcher"]
+        self.assertIn("log=journal_log", watcher)
+        self.assertIn(
+            "self._log(", self.methods["Udisks2LuksWatcher"]["interfaces_added"]
+        )
+        self.assertIn(
+            "self._log(",
+            self.methods["Udisks2LuksWatcher"]["block_properties_changed"],
+        )
+
+    def test_journal_log_prefixes_and_flushes(self):
+        src = self.top_functions["journal_log"]
+        self.assertIn('f"luks-enroll: {message}"', src)
+        self.assertIn("file=sys.stderr", src)
+        self.assertIn("flush=True", src)
+
+    def test_launch_unlock_for_spawns_the_unlock_subprocess(self):
+        method = self.methods["LuksEnrollApp"]["_launch_unlock_for"]
+        self.assertIn('["luks-enroll", "--unlock", device]', method)
+
+    def test_main_delegates_argv_parsing_to_do_command_line(self):
+        main_src = self.top_functions["main"]
+        self.assertIn("app.run(sys.argv)", main_src)
+        # Now that HANDLES_COMMAND_LINE routes everything through
+        # do_command_line, main() no longer needs its own argparse pre-parse.
+        self.assertNotIn("parse_known_args()", main_src)
+
+
+class TestDropInUnlockTakeoverAssets(unittest.TestCase):
+    """Issue #98 ships two non-Python assets alongside the CLI/dialog work:
+    a udev rule suppressing the stock GNOME auto-unlock prompt for
+    removable LUKS volumes, and an XDG autostart entry launching the
+    --watch listener. Pinned directly from disk since there's no Python
+    module to import for either."""
+
+    DIST_ROOT = os.path.join(os.path.dirname(GUI_PATH), "..", "..")
+    UDEV_RULE = os.path.join(
+        DIST_ROOT,
+        "usr",
+        "lib",
+        "udev",
+        "rules.d",
+        "71-luks-enroll-suppress-auto-unlock.rules",
+    )
+    AUTOSTART = os.path.join(
+        DIST_ROOT,
+        "etc",
+        "xdg",
+        "autostart",
+        "net.contemno.luks-enroll-watch.desktop",
+    )
+
+    def test_udev_rule_files_exist(self):
+        self.assertTrue(os.path.isfile(self.UDEV_RULE))
+        self.assertTrue(os.path.isfile(self.AUTOSTART))
+
+    def test_udev_rule_targets_crypto_luks_and_sets_udisks_auto(self):
+        with open(self.UDEV_RULE) as f:
+            rule = f.read()
+        self.assertIn('ENV{ID_FS_TYPE}=="crypto_LUKS"', rule)
+        self.assertIn("ENV{UDISKS_AUTO}=", rule)
+        # UDISKS_IGNORE hides the device from udisksctl/Disks/Nautilus
+        # entirely — not what a "suppress just the auto-unlock prompt" rule
+        # should use. UDISKS_IGNORE may appear in the explanatory comment
+        # header (documenting why it was rejected), but the active rule
+        # line itself must not set it.
+        active_lines = [
+            line
+            for line in rule.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertTrue(active_lines)
+        for line in active_lines:
+            self.assertNotIn("UDISKS_IGNORE", line)
+
+    def test_udev_rule_is_gated_to_removable_media_on_every_active_line(self):
+        with open(self.UDEV_RULE) as f:
+            rule = f.read()
+        active_lines = [
+            line
+            for line in rule.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        # Exactly one active rule line, shipped enabled (not commented out —
+        # the maintainer's explicit instruction on issue #98 was to ship it
+        # enabled by default, with no opt-in gate).
+        self.assertEqual(len(active_lines), 1)
+        # The hard safety requirement: every occurrence of the crypto_LUKS
+        # match must be paired with the removable gate on the same line, so
+        # this can never suppress the prompt for an internal root/home
+        # volume, only hot-pluggable media.
+        for line in active_lines:
+            if 'ID_FS_TYPE}=="crypto_LUKS"' in line:
+                self.assertIn('ATTRS{removable}=="1"', line)
+
+    def test_autostart_entry_launches_the_watch_switch_enabled_by_default(self):
+        with open(self.AUTOSTART) as f:
+            entry = f.read()
+        self.assertIn("Exec=/usr/bin/luks-enroll --watch", entry)
+        self.assertIn("X-GNOME-Autostart-enabled=true", entry)
+        self.assertIn("Type=Application", entry)
+
+
 if __name__ == "__main__":
     unittest.main()
