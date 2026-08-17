@@ -973,10 +973,27 @@ class TestUnlockVolumeDialogAndCli(unittest.TestCase):
     def test_unlock_dialog_subclasses_adw_dialog(self):
         self.assertEqual(self.bases["UnlockVolumeDialog"], ["Adw.Dialog"])
 
-    def test_unlock_dialog_pins_a_content_size_like_format_dialog_base(self):
+    def test_unlock_dialog_resizes_to_its_content_instead_of_pinning(self):
+        # PR #100 hardware report: the originally pinned 420x360 content
+        # size forced the rows revealed by the async enrolled-methods fetch
+        # to scroll. The dialog now follows its content's natural size (the
+        # standalone wrapper window is non-resizable, so it re-fits when
+        # _apply_enrolled_methods reveals rows) and keeps only a minimum
+        # width.
         dialog = self.classes["UnlockVolumeDialog"]
-        self.assertIn("self.set_content_width(", dialog)
-        self.assertIn("self.set_content_height(", dialog)
+        self.assertIn("self.set_follows_content_size(True)", dialog)
+        self.assertNotIn("self.set_content_height(", dialog)
+        self.assertNotIn("self.set_content_width(", dialog)
+
+    def test_unlock_dialog_has_no_extra_scrolled_window(self):
+        # An extra Gtk.ScrolledWindow around the PreferencesPage (the
+        # FormatDialogBase layout) reports a near-zero natural height,
+        # which would defeat follows-content-size. Adw.PreferencesPage's
+        # own internal scroller propagates natural height and still
+        # scrolls if the screen is shorter than the content.
+        dialog = self.classes["UnlockVolumeDialog"]
+        self.assertNotIn("Gtk.ScrolledWindow(", dialog)
+        self.assertIn("toolbar_view.set_content(prefs)", dialog)
 
     def test_unlock_dialog_uses_the_shared_enrolled_methods_fetch(self):
         dialog = self.classes["UnlockVolumeDialog"]
@@ -1039,6 +1056,19 @@ class TestUnlockVolumeDialogAndCli(unittest.TestCase):
         method = self.methods["LuksEnrollApp"]["_present_unlock_dialog"]
         self.assertIn("released", method)
         self.assertIn('dialog.connect("closed"', method)
+
+    def test_present_unlock_dialog_hints_modal_for_centered_placement(self):
+        # PR #100: the standalone wrapper window cascade-placed at the top
+        # left. GTK4 clients can't position windows, but flagging the
+        # wrapper's GDK surface modal makes mutter retype it MODAL_DIALOG
+        # and center it on the monitor (Wayland). The hint must go on the
+        # Gdk.Toplevel — Gtk.Window.set_modal() would also gtk_grab_add()
+        # and freeze sibling --watch unlock dialogs in-process.
+        method = self.methods["LuksEnrollApp"]["_present_unlock_dialog"]
+        self.assertIn("dialog.get_root()", method)
+        self.assertIn(".get_surface()", method)
+        self.assertIn("surface.set_modal(True)", method)
+        self.assertNotIn("wrapper.set_modal(", method)
 
     def test_watch_mode_subscribes_to_udisks2_interfaces_added(self):
         method = self.methods["LuksEnrollApp"]["_start_watch_mode"]

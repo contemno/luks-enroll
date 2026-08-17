@@ -2420,15 +2420,28 @@ class UnlockVolumeDialog(Adw.Dialog):
     the extracted helper above) but diverge afterwards — DeviceDetailPage
     goes on to show the enrollment-management UI, while this dialog's job
     ends at mapping the volume. Follows FormatDialogBase's Adw.Dialog
-    conventions: a pinned content size, Adw.ToolbarView + header bar, an
-    Adw.PreferencesPage inside a ScrolledWindow, and a spinner + status
-    label for the async tail.
+    conventions (Adw.ToolbarView + header bar, an Adw.PreferencesPage, a
+    spinner + status label for the async tail) except for sizing: where
+    FormatDialogBase pins a content size because its form is static and
+    known to fit, this dialog's rows appear only after the async
+    enrolled-methods fetch, so it follows its content's natural size
+    instead (see __init__).
     """
 
     def __init__(self, svc, device, *, on_mapped=None):
         super().__init__(title=device)
-        self.set_content_width(420)
-        self.set_content_height(360)
+        # Don't pin a content height à la FormatDialogBase: which rows this
+        # dialog shows is only known after the async enrolled-methods
+        # fetch, so any fixed height either wastes space or forces the
+        # content to scroll (the PR #100 hardware report). follows-content-
+        # size makes the dialog track its content's natural size; the
+        # standalone wrapper window that present(None) creates is
+        # non-resizable, i.e. it re-fits to the natural size each layout,
+        # so the dialog grows in place when _apply_enrolled_methods reveals
+        # rows. Only a minimum width is kept, so ActionRow suffix entries
+        # don't collapse to their minimum.
+        self.set_follows_content_size(True)
+        self.set_size_request(420, -1)
         self.svc = svc
         self.device = device
         self._on_mapped = on_mapped
@@ -2441,12 +2454,14 @@ class UnlockVolumeDialog(Adw.Dialog):
         self.set_child(toolbar_view)
         toolbar_view.add_top_bar(Adw.HeaderBar())
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        toolbar_view.set_content(scroll)
-
+        # No extra Gtk.ScrolledWindow here (unlike FormatDialogBase): a
+        # scrolled window reports a near-zero natural height, which would
+        # defeat follows-content-size above. Adw.PreferencesPage brings its
+        # own scroller with propagate-natural-height=True, so the content's
+        # natural height reaches the dialog while scrolling still kicks in
+        # as the safety valve if the screen is shorter than the content.
         prefs = Adw.PreferencesPage()
-        scroll.set_child(prefs)
+        toolbar_view.set_content(prefs)
 
         # --- Token unlock group (TPM2 / FIDO2) ---
         self._token_unlock_group = Adw.PreferencesGroup(title="Unlock with Token")
@@ -3395,6 +3410,28 @@ class LuksEnrollApp(Adw.Application):
         # track, so the hold() above (until "closed") is what keeps the main
         # loop alive while the dialog is up.
         dialog.present(None)
+        # Center the wrapper window (PR #100: it cascade-placed at the work
+        # area's top left). GTK4 has no gtk_window_move() — clients can't
+        # position windows (Wayland never allowed it) — but they can hint
+        # the window's *nature*: flagging the wrapper's GDK surface modal
+        # travels as gtk_shell1/xdg_dialog_v1 set_modal on Wayland, where
+        # mutter retypes the window MODAL_DIALOG and its placement centers
+        # dialog-typed windows on the active monitor (place.c,
+        # window_place_centered) instead of cascade-placing them. The hint
+        # goes on the Gdk.Toplevel directly, NOT Gtk.Window.set_modal():
+        # that would also gtk_grab_add() in-process and freeze sibling
+        # unlock dialogs (and any open management window) under --watch.
+        # present() has realized the wrapper, so its surface exists; the
+        # hint lands before the first commit maps the surface, which is
+        # when the compositor places it. On X11 mutter centers only
+        # _NET_WM_WINDOW_TYPE_DIALOG windows (GTK4 sets that type only
+        # alongside a transient parent), so Xorg sessions keep the WM's
+        # default placement — centered too if the user enables the
+        # org.gnome.mutter center-new-windows gsetting.
+        wrapper = dialog.get_root()
+        surface = wrapper.get_surface() if wrapper is not None else None
+        if surface is not None:
+            surface.set_modal(True)
 
     def _start_watch_mode(self):
         """`--watch`: listen for new removable crypto_LUKS block devices via
