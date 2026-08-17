@@ -85,6 +85,16 @@ detail view does:
   default** — to opt back into the stock GNOME prompt, delete (or mask) that rule file and run
   `udevadm control --reload-rules`.
 
+> **Log out and back in once after installing (or upgrading into) this feature.** The
+> `--watch` listener is started by the XDG autostart entry, which only runs at session
+> login — but the udev rule suppressing the stock GNOME prompt takes effect immediately
+> (the package's postinst even re-tags already-plugged devices). Until the next login
+> there is a window where *neither* prompt appears: the stock one is already suppressed
+> and the listener isn't running yet. Check with `pgrep -af 'luks-enroll --watch'`; to
+> cover the current session without re-logging, run `luks-enroll --watch &` by hand. The
+> listener logs every device decision to the session journal — when a plugged device
+> produces no dialog, `journalctl --user -b | grep luks-enroll` shows why.
+
 Requires a udisks2-based desktop session (GNOME, and most other Linux desktops) for the
 `InterfacesAdded` signal and the `UDISKS_AUTO` hint to apply; the udev rule and `--watch`/
 `--unlock` switches are otherwise inert on a system without udisks2.

@@ -65,6 +65,21 @@ TOKEN_RECOVERY = "systemd-recovery"
 # dist/usr/lib/udev/rules.d/71-luks-enroll-suppress-auto-unlock.rules).
 UDISKS2_BUS_NAME = "org.freedesktop.UDisks2"
 UDISKS2_OBJECT_MANAGER_PATH = "/org/freedesktop/UDisks2"
+UDISKS2_BLOCK_IFACE = "org.freedesktop.UDisks2.Block"
+# Upper bound on the not-yet-probed block devices the --watch listener
+# remembers while waiting for a late IdType (see _on_udisks2_interfaces_added);
+# oldest entries are evicted first, so the set can never leak.
+WATCH_PENDING_BLOCKS_MAX = 16
+
+
+def journal_log(message):
+    """One-line breadcrumb for the --watch/--unlock chain. Goes to stderr,
+    which the graphical session's systemd instance captures into the journal
+    for the autostart-launched listener — so every decision point and failure
+    is greppable via `journalctl --user -b | grep luks-enroll` when a plugged
+    device doesn't produce a dialog.
+    """
+    print(f"luks-enroll: {message}", file=sys.stderr, flush=True)
 
 
 def run_async(svc_call, on_done):
@@ -134,15 +149,88 @@ def udisks2_pick_new_luks_device(interfaces):
     `ay` D-Bus convention for a filesystem path with the C string's trailing
     NUL kept), so it needs decoding rather than a plain string cast.
     """
-    block = interfaces.get("org.freedesktop.UDisks2.Block")
+    block = interfaces.get(UDISKS2_BLOCK_IFACE)
     if not block:
         return None
     if block.get("IdType") != "crypto_LUKS":
         return None
-    raw = block.get("Device")
+    return _udisks2_decode_device(block.get("Device"))
+
+
+def udisks2_pending_block_device(interfaces):
+    """Companion to udisks2_pick_new_luks_device for the probe-race fallback:
+    return the block device path when the InterfacesAdded object is a Block
+    whose ``IdType`` is still **empty** — udisks2 exported the object before
+    its filesystem probe finished, so a LUKS volume can look typeless at
+    InterfacesAdded time and only gain ``IdType == "crypto_LUKS"`` via a later
+    ``PropertiesChanged`` signal. Objects that already probed as some *other*
+    filesystem (ext4, vfat, …) return None — they were classified, not raced.
+    """
+    block = interfaces.get(UDISKS2_BLOCK_IFACE)
+    if not block or block.get("IdType"):
+        return None
+    return _udisks2_decode_device(block.get("Device"))
+
+
+def _udisks2_decode_device(raw):
     if not raw:
         return None
     return bytes(raw).rstrip(b"\x00").decode("utf-8", "replace") or None
+
+
+class Udisks2LuksWatcher:
+    """Pure bookkeeping for the --watch listener: turns udisks2
+    ``InterfacesAdded`` / Block ``PropertiesChanged`` payloads (already
+    GVariant-unpacked by LuksEnrollApp's signal handlers) into
+    launch-the-unlock-dialog decisions.
+
+    Split out of LuksEnrollApp so the probe-race fallback is directly
+    unit-testable: udisks2 can export a Block object *before* its filesystem
+    probe finishes, in which case InterfacesAdded carries an empty ``IdType``
+    for a volume that is in fact crypto_LUKS and the real type only arrives
+    via a later PropertiesChanged on the object's own path. Such typeless
+    devices are remembered (insertion-ordered, capped at *max_pending* with
+    oldest-first eviction, so the set can never leak) until their probe
+    settles.
+    """
+
+    def __init__(self, on_luks_device, log=journal_log, max_pending=None):
+        self._on_luks_device = on_luks_device
+        self._log = log
+        self._max_pending = max_pending or WATCH_PENDING_BLOCKS_MAX
+        self._pending = {}
+
+    def interfaces_added(self, obj_path, interfaces):
+        device = udisks2_pick_new_luks_device(interfaces)
+        if device:
+            self._log(f"new LUKS block device {device}; launching unlock dialog")
+            self._on_luks_device(device)
+            return
+        pending = udisks2_pending_block_device(interfaces)
+        if pending:
+            self._log(
+                f"block device {pending} appeared without a filesystem type "
+                "yet; waiting for udisks2 probe results"
+            )
+            while len(self._pending) >= self._max_pending:
+                del self._pending[next(iter(self._pending))]
+            self._pending[obj_path] = pending
+
+    def block_properties_changed(self, obj_path, changed):
+        device = self._pending.get(obj_path)
+        if not device:
+            return
+        id_type = changed.get("IdType")
+        if id_type == "crypto_LUKS":
+            del self._pending[obj_path]
+            self._log(
+                f"device {device} probed as crypto_LUKS after it appeared; "
+                "launching unlock dialog"
+            )
+            self._on_luks_device(device)
+        elif id_type:
+            # Probe finished as some other filesystem — classified, not ours.
+            del self._pending[obj_path]
 
 
 # ---------------------------------------------------------------------------
@@ -3217,7 +3305,12 @@ class LuksEnrollApp(Adw.Application):
             flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
         )
         self._watch_subscription = None
+        self._props_subscription = None
         self._system_bus = None
+        # Watch-mode decision logic (probe-race bookkeeping included) lives
+        # in the pure, unit-tested Udisks2LuksWatcher; created on demand by
+        # _start_watch_mode.
+        self._watcher = None
 
     def do_command_line(self, command_line):
         args = command_line.get_arguments()
@@ -3261,6 +3354,7 @@ class LuksEnrollApp(Adw.Application):
     def _present_unlock_dialog(self, device):
         """`--unlock <device>`: present just UnlockVolumeDialog, without
         constructing the full ManagementWindow device list (issue #98)."""
+        journal_log(f"presenting unlock dialog for {device}")
         # hold()/release() keep the process alive while the standalone
         # dialog is up — it isn't a GtkApplicationWindow the app otherwise
         # tracks, so without this the process would exit right after
@@ -3269,9 +3363,9 @@ class LuksEnrollApp(Adw.Application):
         try:
             svc = LuksEnrollProxy()
         except GLib.Error as e:
-            print(
-                f"Warning: could not connect to D-Bus service: {e.message}",
-                file=sys.stderr,
+            journal_log(
+                "could not present the unlock dialog for "
+                f"{device}: D-Bus service unreachable: {e.message}"
             )
             self.release()
             return
@@ -3288,13 +3382,18 @@ class LuksEnrollApp(Adw.Application):
 
         dialog = UnlockVolumeDialog(svc, device, on_mapped=lambda *_a: release_once())
         dialog.connect("closed", lambda _d: release_once())
-        # No parent widget: per adw_dialog_present()'s contract, a dialog
-        # presented without a dialog-hosting ancestor shows as a standalone
-        # window instead — exactly the "lightweight window" issue #98 asks
-        # for, with no separate host-window class needed.
-        # NEEDS REAL-HARDWARE VALIDATION: this relies on that fallback
-        # behavior, which hasn't been exercised in a real GTK4/libadwaita
-        # session as part of this change.
+        # No parent widget: adw_dialog_present(dialog, NULL) finds no dialog
+        # host and takes its present_as_window() path, wrapping the dialog in
+        # a fresh standalone GtkWindow (hidden titlebar, .dialog-window
+        # styling, Esc-to-close) and gtk_window_present()ing it. Verified
+        # against the libadwaita sources on both the stable libadwaita-1-5
+        # branch (what Ubuntu 24.04 ships) and main: `parent` is documented
+        # (nullable) and the standalone-window path has existed since
+        # AdwDialog landed in 1.5 — exactly the "lightweight window" issue
+        # #98 asks for, with no separate host-window class needed. The
+        # wrapper window is a plain GtkWindow that GtkApplication does NOT
+        # track, so the hold() above (until "closed") is what keeps the main
+        # loop alive while the dialog is up.
         dialog.present(None)
 
     def _start_watch_mode(self):
@@ -3311,13 +3410,13 @@ class LuksEnrollApp(Adw.Application):
         try:
             self._system_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
         except GLib.Error as e:
-            print(
-                "Warning: could not connect to the system bus for the "
-                f"udisks2 listener: {e.message}",
-                file=sys.stderr,
+            journal_log(
+                "could not connect to the system bus for the "
+                f"udisks2 listener: {e.message}"
             )
             self.release()
             return
+        self._watcher = Udisks2LuksWatcher(self._launch_unlock_for)
         self._watch_subscription = self._system_bus.signal_subscribe(
             UDISKS2_BUS_NAME,
             "org.freedesktop.DBus.ObjectManager",
@@ -3327,17 +3426,42 @@ class LuksEnrollApp(Adw.Application):
             Gio.DBusSignalFlags.NONE,
             self._on_udisks2_interfaces_added,
         )
+        # Probe-race fallback: udisks2 can export a Block object *before* its
+        # filesystem probe finishes, so InterfacesAdded may carry an empty
+        # IdType for a volume that is in fact crypto_LUKS — the type then
+        # arrives via org.freedesktop.DBus.Properties.PropertiesChanged
+        # (arg0 = the Block interface) on the object's own path. Subscribe
+        # with a None object path (udisks2 emits from each block object's
+        # path, not the ObjectManager root); the watcher matches it against
+        # the small pending set it recorded at InterfacesAdded time.
+        self._props_subscription = self._system_bus.signal_subscribe(
+            UDISKS2_BUS_NAME,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            None,
+            UDISKS2_BLOCK_IFACE,
+            Gio.DBusSignalFlags.NONE,
+            self._on_udisks2_block_properties_changed,
+        )
+        journal_log("watch mode active: listening for new LUKS block devices")
 
     def _on_udisks2_interfaces_added(
         self, _connection, _sender, _path, _iface, _signal, params
     ):
         try:
-            _obj_path, interfaces = params.unpack()
+            obj_path, interfaces = params.unpack()
         except (TypeError, ValueError):
             return
-        device = udisks2_pick_new_luks_device(interfaces)
-        if device:
-            self._launch_unlock_for(device)
+        self._watcher.interfaces_added(obj_path, interfaces)
+
+    def _on_udisks2_block_properties_changed(
+        self, _connection, _sender, path, _iface, _signal, params
+    ):
+        try:
+            _prop_iface, changed, _invalidated = params.unpack()
+        except (TypeError, ValueError):
+            return
+        self._watcher.block_properties_changed(path, changed)
 
     def _launch_unlock_for(self, device):
         """Launch `luks-enroll --unlock <device>` for a newly-appeared LUKS
@@ -3353,10 +3477,8 @@ class LuksEnrollApp(Adw.Application):
                 ["luks-enroll", "--unlock", device], Gio.SubprocessFlags.NONE
             )
         except GLib.Error as e:
-            print(
-                f"Warning: could not launch the unlock dialog for {device}: "
-                f"{e.message}",
-                file=sys.stderr,
+            journal_log(
+                f"could not launch the unlock dialog for {device}: {e.message}"
             )
 
 
