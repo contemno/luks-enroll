@@ -160,6 +160,18 @@ These are public wiki pages, not files in the repo, so a fresh session must fetc
   (and manifest-touching-PR) advisory scan — `cargo audit` (RustSec) + `pip-audit` (PyPI/OSV) —
   that is **intentionally non-gating**: a finding turns the job red but it's not a required
   check, since daily advisory-DB churn shouldn't block PRs unrelated to the flagged dep.
+  `security.yml` complements it with a weekly (and self-touching-PR) **secret/SAST/filesystem**
+  scan — `gitleaks` (committed secrets), CodeQL (Python + Rust, `build-mode: none`), and
+  Trivy `fs` scan — also **intentionally non-gating**, same rationale as `audit.yml`.
+- **Release artifact provenance**: `build-release.yml`'s `release` job (only reached when
+  `publish: true`, i.e. real releases — not `pr-test-build.yml`) attaches a CycloneDX SBOM, a
+  keyless `cosign sign-blob --bundle` signature, and a GitHub `attest-build-provenance`
+  attestation to every published `.deb`. Keyless signing/attestation uses this job's OIDC
+  identity (`id-token: write` + `attestations: write`) — no stored signing key. Because GitHub
+  validates a reusable workflow's job permissions statically (even for jobs skipped by `if:`),
+  every caller of `build-release.yml` (`release.yml`, `autotag.yml`, and `pr-test-build.yml`)
+  must grant `id-token: write` + `attestations: write` alongside `contents: write`, the same
+  envelope-requirement pattern already in place for `contents: write`.
 
 ## Don't
 
