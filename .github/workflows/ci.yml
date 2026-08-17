@@ -147,6 +147,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write  # post a PR comment on failure (see below)
     defaults:
       run:
         working-directory: rust
@@ -163,14 +166,18 @@ jobs:
           workspaces: rust
           shared-key: rust-ci
 
+      # `shell: bash` (rather than the runner default) turns on pipefail, so
+      # `tee`'s always-zero exit doesn't swallow cargo test's failure -- the
+      # step still fails/short-circuits exactly as it did without the tee.
       - name: TPM2 seal/unseal roundtrips against swtpm
+        shell: bash
         run: |
           sudo apt-get install -y --no-install-recommends swtpm
           mkdir -p /tmp/swtpm-state
           swtpm socket --tpm2 --server port=2321 --ctrl type=tcp,port=2322 \
             --flags not-need-init,startup-clear --tpmstate dir=/tmp/swtpm-state --daemon
           TCTI="swtpm:host=127.0.0.1,port=2321" \
-            cargo test -p luks-enroll-service tpm2 -- --ignored
+            cargo test -p luks-enroll-service tpm2 -- --ignored 2>&1 | tee /tmp/swtpm-tpm2.log
 
       # The dm-crypt roundtrips (activate/deactivate against a real LUKS2
       # image, and the CloseVolumeFd loop-backing discovery) are #[ignore]d
@@ -179,9 +186,29 @@ jobs:
       # resets PATH (secure_path), so the runner's cargo is re-injected; -E
       # keeps HOME so rustup finds the toolchain.
       - name: dm-crypt open/close roundtrips (root, loop + device-mapper)
+        shell: bash
         run: |
           sudo -E env "PATH=$PATH" \
-            cargo test -p luks-enroll-service --test luks_image -- --ignored
+            cargo test -p luks-enroll-service --test luks_image -- --ignored 2>&1 | tee /tmp/swtpm-luks-image.log
+
+      # This job runs privileged (root, real TPM2/dm-crypt); a failure is
+      # otherwise visible only in the Actions log, so a reviewer has to leave
+      # the PR to see why this required check is red. Post the tail of
+      # whichever log(s) exist straight to the PR instead.
+      - name: Post failure summary to the PR
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body="### swtpm job failed"$'\n\n'"Run: ${RUN_URL}"$'\n'
+          for log in /tmp/swtpm-tpm2.log /tmp/swtpm-luks-image.log; do
+            [ -s "$log" ] || continue
+            body+=$'\n<details><summary>'"$(basename "$log")"$'</summary>\n\n```\n'"$(tail -n 100 "$log")"$'\n```\n\n</details>\n'
+          done
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="${body}"
 
   # Aggregator: the single required `rust` status check. `if: always()` makes it
   # run even when an upstream job fails, so it FAILS the check (a plain `needs`
