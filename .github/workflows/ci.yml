@@ -126,7 +126,7 @@ jobs:
       # rustc. `shared-key` (instead of the default per-job key) lets the swtpm
       # job restore the same warm cache; the manifest lives under rust/.
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: rust
           shared-key: rust-ci
@@ -161,7 +161,7 @@ jobs:
       # Same shared-key as rust-build: both restore one warm cache (rust-cache
       # caches dependencies, which are identical across the two jobs).
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: rust
           shared-key: rust-ci
