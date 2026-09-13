@@ -1,0 +1,51 @@
+# Suppress GNOME/udisks2's automatic unlock-prompt + auto-mount behavior for
+# removable LUKS2 volumes, so luks-enroll's own udisks2 listener (`luks-enroll
+# --watch`, launched via the autostart entry at
+# /etc/xdg/autostart/net.contemno.luks-enroll-watch.desktop) can present its
+# "unlock via any enrolled method" dialog instead of the stock passphrase-only
+# GNOME prompt (issue #98: take over Ubuntu's passphrase-only unlock flow).
+#
+# --- Property choice: UDISKS_AUTO vs UDISKS_IGNORE -------------------------
+#
+# udisks2 exposes several udev-property-derived "hints" on its Block D-Bus
+# objects. Two are relevant here:
+#
+#   UDISKS_IGNORE=1  -> Block:HintIgnore=true. udisks2 skips the device
+#                        entirely: no D-Bus object is exported at all, so it
+#                        disappears from `udisksctl`, GNOME Disks, and the
+#                        Nautilus/Files sidebar too. That's far more than we
+#                        want to suppress — this app and the stock tools both
+#                        need to keep seeing the device.
+#
+#   UDISKS_AUTO=0    -> Block:HintAuto=false. HintAuto is exactly the flag
+#                        gnome-settings-daemon's automount plugin and GVfs'
+#                        udisks2 volume monitor check before automatically
+#                        unlocking/mounting a newly-inserted encrypted
+#                        volume. Setting it to false suppresses only the
+#                        automatic unlock-prompt-and-mount behavior; the
+#                        device stays fully visible and can still be opened
+#                        manually via udisksctl, Disks, Nautilus, or (the
+#                        intended replacement) this app's own OpenVolume
+#                        call.
+#
+# UDISKS_AUTO=0 is therefore the correct choice: it takes over only the
+# behavior we're replacing, without hiding the device from anything else.
+#
+# NEEDS REAL-HARDWARE VALIDATION: this reasoning follows the documented
+# udisks2 Hints-interface semantics (HintAuto / HintIgnore), but has not been
+# exercised against a real GNOME session / udisks2 build as part of this
+# change — see the PR description.
+#
+# --- Safety: removable media only -------------------------------------------
+#
+# Gated on ATTRS{removable}=="1" — the kernel's own
+# /sys/block/<disk>/removable attribute (walked up from a partition device to
+# its parent disk by udev's ATTRS{} ancestor match, so this also matches
+# e.g. /dev/sdb1, not just whole-disk /dev/sdb). Internal SATA/NVMe/virtio
+# system disks report removable=0; USB mass storage, SD/MMC cards, etc.
+# report removable=1. This is a hard safety requirement, not a convenience:
+# suppressing the passphrase prompt for an internal root/home LUKS volume
+# would break boot-time/login unlock, which must never happen. Do not widen
+# this match to cover non-removable devices.
+
+SUBSYSTEM=="block", ENV{ID_FS_TYPE}=="crypto_LUKS", ATTRS{removable}=="1", ENV{UDISKS_AUTO}="0"
