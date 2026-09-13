@@ -74,6 +74,13 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
+    # A `container:` job's default step shell is `sh -e {0}`, not bash — even
+    # on a stock image with /bin/bash present — and that isn't inherited from
+    # the runner OS, so it must be set explicitly to get real bash semantics
+    # (e.g. `set -o pipefail`) for any `run:` step added here later.
+    defaults:
+      run:
+        shell: bash
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       artifact_url: ${{ steps.upload.outputs.artifact-url }}
