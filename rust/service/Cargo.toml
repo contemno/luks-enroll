@@ -14,7 +14,7 @@ name = "luks-enroll-service"
 path = "src/main.rs"
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.0"
 fido2-sys = { version = "0.1.0", path = "../fido2-sys" }
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
 getrandom = "0.4.2"
@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 tss-esapi = "7.7.0"
 udev = "0.9.3"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-zbus_polkit = "5.0.0"
+zbus_polkit = "5.1.0"
 zeroize = "1.9.0"
 
 [dev-dependencies]

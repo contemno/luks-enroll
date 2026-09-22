@@ -59,6 +59,28 @@ TOKEN_FIDO2 = "systemd-fido2"
 TOKEN_TPM2 = "systemd-tpm2"
 TOKEN_RECOVERY = "systemd-recovery"
 
+# udisks2's ObjectManager, watched by --watch (issue #98) for InterfacesAdded
+# so removable crypto_LUKS volumes get this app's unlock dialog instead of
+# the stock GNOME/udisks2 passphrase prompt (suppressed by the udev rule at
+# dist/usr/lib/udev/rules.d/71-luks-enroll-suppress-auto-unlock.rules).
+UDISKS2_BUS_NAME = "org.freedesktop.UDisks2"
+UDISKS2_OBJECT_MANAGER_PATH = "/org/freedesktop/UDisks2"
+UDISKS2_BLOCK_IFACE = "org.freedesktop.UDisks2.Block"
+# Upper bound on the not-yet-probed block devices the --watch listener
+# remembers while waiting for a late IdType (see _on_udisks2_interfaces_added);
+# oldest entries are evicted first, so the set can never leak.
+WATCH_PENDING_BLOCKS_MAX = 16
+
+
+def journal_log(message):
+    """One-line breadcrumb for the --watch/--unlock chain. Goes to stderr,
+    which the graphical session's systemd instance captures into the journal
+    for the autostart-launched listener — so every decision point and failure
+    is greppable via `journalctl --user -b | grep luks-enroll` when a plugged
+    device doesn't produce a dialog.
+    """
+    print(f"luks-enroll: {message}", file=sys.stderr, flush=True)
+
 
 def run_async(svc_call, on_done):
     """Run svc_call() on a daemon thread and hand its (ok, stdout, stderr)
@@ -75,6 +97,140 @@ def run_async(svc_call, on_done):
         GLib.idle_add(on_done, *result)
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def fetch_enrolled_methods(svc, device, on_done):
+    """Fetch a device's enrolled-method summary (FIDO2/TPM2/recovery tokens,
+    password keyslots, systemd version) on a background thread and hand the
+    result dict to on_done(data) on the GTK main loop.
+
+    Shared by DeviceDetailPage's in-page unlock prompt and UnlockVolumeDialog
+    (issue #98) so both authenticate from one identical view of what's
+    enrolled, rather than two copies that could drift.
+    """
+
+    def fetch():
+        data = {
+            "fido2": [], "tpm2": [], "recovery": [], "pw_slots": [],
+            "systemd_version": 0,
+        }
+        try:
+            data["fido2"] = svc.get_tokens_by_type(device, TOKEN_FIDO2)
+        except GLib.Error:
+            pass
+        try:
+            data["tpm2"] = svc.get_tokens_by_type(device, TOKEN_TPM2)
+        except GLib.Error:
+            pass
+        try:
+            data["recovery"] = svc.get_tokens_by_type(device, TOKEN_RECOVERY)
+        except GLib.Error:
+            pass
+        try:
+            data["pw_slots"] = svc.find_password_keyslots(device)
+        except GLib.Error:
+            pass
+        try:
+            data["systemd_version"] = svc.get_systemd_version()
+        except GLib.Error:
+            pass
+        GLib.idle_add(on_done, data)
+
+    threading.Thread(target=fetch, daemon=True).start()
+
+
+def udisks2_pick_new_luks_device(interfaces):
+    """Given the ``interfaces_and_properties`` dict from a udisks2
+    InterfacesAdded signal (already GVariant-unpacked: {interface_name:
+    {property: value}}), return the block device path if this object is a
+    newly-added crypto_LUKS block device, else None.
+
+    udisks2 represents `Block:Device` as a NUL-terminated byte array (the
+    `ay` D-Bus convention for a filesystem path with the C string's trailing
+    NUL kept), so it needs decoding rather than a plain string cast.
+    """
+    block = interfaces.get(UDISKS2_BLOCK_IFACE)
+    if not block:
+        return None
+    if block.get("IdType") != "crypto_LUKS":
+        return None
+    return _udisks2_decode_device(block.get("Device"))
+
+
+def udisks2_pending_block_device(interfaces):
+    """Companion to udisks2_pick_new_luks_device for the probe-race fallback:
+    return the block device path when the InterfacesAdded object is a Block
+    whose ``IdType`` is still **empty** — udisks2 exported the object before
+    its filesystem probe finished, so a LUKS volume can look typeless at
+    InterfacesAdded time and only gain ``IdType == "crypto_LUKS"`` via a later
+    ``PropertiesChanged`` signal. Objects that already probed as some *other*
+    filesystem (ext4, vfat, …) return None — they were classified, not raced.
+    """
+    block = interfaces.get(UDISKS2_BLOCK_IFACE)
+    if not block or block.get("IdType"):
+        return None
+    return _udisks2_decode_device(block.get("Device"))
+
+
+def _udisks2_decode_device(raw):
+    if not raw:
+        return None
+    return bytes(raw).rstrip(b"\x00").decode("utf-8", "replace") or None
+
+
+class Udisks2LuksWatcher:
+    """Pure bookkeeping for the --watch listener: turns udisks2
+    ``InterfacesAdded`` / Block ``PropertiesChanged`` payloads (already
+    GVariant-unpacked by LuksEnrollApp's signal handlers) into
+    launch-the-unlock-dialog decisions.
+
+    Split out of LuksEnrollApp so the probe-race fallback is directly
+    unit-testable: udisks2 can export a Block object *before* its filesystem
+    probe finishes, in which case InterfacesAdded carries an empty ``IdType``
+    for a volume that is in fact crypto_LUKS and the real type only arrives
+    via a later PropertiesChanged on the object's own path. Such typeless
+    devices are remembered (insertion-ordered, capped at *max_pending* with
+    oldest-first eviction, so the set can never leak) until their probe
+    settles.
+    """
+
+    def __init__(self, on_luks_device, log=journal_log, max_pending=None):
+        self._on_luks_device = on_luks_device
+        self._log = log
+        self._max_pending = max_pending or WATCH_PENDING_BLOCKS_MAX
+        self._pending = {}
+
+    def interfaces_added(self, obj_path, interfaces):
+        device = udisks2_pick_new_luks_device(interfaces)
+        if device:
+            self._log(f"new LUKS block device {device}; launching unlock dialog")
+            self._on_luks_device(device)
+            return
+        pending = udisks2_pending_block_device(interfaces)
+        if pending:
+            self._log(
+                f"block device {pending} appeared without a filesystem type "
+                "yet; waiting for udisks2 probe results"
+            )
+            while len(self._pending) >= self._max_pending:
+                del self._pending[next(iter(self._pending))]
+            self._pending[obj_path] = pending
+
+    def block_properties_changed(self, obj_path, changed):
+        device = self._pending.get(obj_path)
+        if not device:
+            return
+        id_type = changed.get("IdType")
+        if id_type == "crypto_LUKS":
+            del self._pending[obj_path]
+            self._log(
+                f"device {device} probed as crypto_LUKS after it appeared; "
+                "launching unlock dialog"
+            )
+            self._on_luks_device(device)
+        elif id_type:
+            # Probe finished as some other filesystem — classified, not ours.
+            del self._pending[obj_path]
 
 
 # ---------------------------------------------------------------------------
@@ -1740,32 +1896,7 @@ class DeviceDetailPage(Adw.NavigationPage):
 
     def _fetch_enrolled_methods(self):
         """Fetch enrolled token/keyslot info in background (no unlock needed)."""
-        def fetch():
-            data = {"fido2": [], "tpm2": [], "recovery": [], "pw_slots": [],
-                    "systemd_version": 0}
-            try:
-                data["fido2"] = self.svc.get_tokens_by_type(self.device, TOKEN_FIDO2)
-            except GLib.Error:
-                pass
-            try:
-                data["tpm2"] = self.svc.get_tokens_by_type(self.device, TOKEN_TPM2)
-            except GLib.Error:
-                pass
-            try:
-                data["recovery"] = self.svc.get_tokens_by_type(self.device, TOKEN_RECOVERY)
-            except GLib.Error:
-                pass
-            try:
-                data["pw_slots"] = self.svc.find_password_keyslots(self.device)
-            except GLib.Error:
-                pass
-            try:
-                data["systemd_version"] = self.svc.get_systemd_version()
-            except GLib.Error:
-                pass
-            GLib.idle_add(self._apply_enrolled_methods, data)
-
-        threading.Thread(target=fetch, daemon=True).start()
+        fetch_enrolled_methods(self.svc, self.device, self._apply_enrolled_methods)
 
     def _apply_enrolled_methods(self, data):
         """Show enrolled methods and configure unlock fields accordingly."""
@@ -2264,6 +2395,288 @@ class DeviceDetailPage(Adw.NavigationPage):
         """Called by enrollment pages after successful enrollment."""
         if self._unlocked:
             self._fetch_detail_data()
+
+
+# ---------------------------------------------------------------------------
+# Unlock dialog — reusable "authenticate + map" flow (issue #98)
+# ---------------------------------------------------------------------------
+
+
+class UnlockVolumeDialog(Adw.Dialog):
+    """Reusable "unlock via any enrolled method" dialog (issue #98).
+
+    Extracted from DeviceDetailPage's in-page unlock prompt so it can be
+    presented standalone — by the ``--unlock <device>`` CLI switch and by
+    the udisks2 auto-unlock-takeover listener (``--watch``) — without
+    constructing the full ManagementWindow device list. Authenticates via
+    any of the device's enrolled methods (passphrase, recovery key, FIDO2,
+    TPM2 — the same enrolled-methods data DeviceDetailPage shows, fetched
+    through the shared ``fetch_enrolled_methods`` helper) and, on success,
+    maps the volume via the same OpenVolume call the Volume Mapping group
+    (``_on_mapping_clicked``) uses.
+
+    DeviceDetailPage deliberately keeps its own in-page unlock prompt rather
+    than delegating to this dialog: the two share authentication logic (via
+    the extracted helper above) but diverge afterwards — DeviceDetailPage
+    goes on to show the enrollment-management UI, while this dialog's job
+    ends at mapping the volume. Follows FormatDialogBase's Adw.Dialog
+    conventions (Adw.ToolbarView + header bar, an Adw.PreferencesPage, a
+    spinner + status label for the async tail) except for sizing: where
+    FormatDialogBase pins a content size because its form is static and
+    known to fit, this dialog's rows appear only after the async
+    enrolled-methods fetch, so it follows its content's natural size
+    instead (see __init__).
+    """
+
+    def __init__(self, svc, device, *, on_mapped=None):
+        super().__init__(title=device)
+        # Don't pin a content height à la FormatDialogBase: which rows this
+        # dialog shows is only known after the async enrolled-methods
+        # fetch, so any fixed height either wastes space or forces the
+        # content to scroll (the PR #100 hardware report). follows-content-
+        # size makes the dialog track its content's natural size; the
+        # standalone wrapper window that present(None) creates is
+        # non-resizable, i.e. it re-fits to the natural size each layout,
+        # so the dialog grows in place when _apply_enrolled_methods reveals
+        # rows. Only a minimum width is kept, so ActionRow suffix entries
+        # don't collapse to their minimum.
+        self.set_follows_content_size(True)
+        self.set_size_request(420, -1)
+        self.svc = svc
+        self.device = device
+        self._on_mapped = on_mapped
+        self.passphrase = None
+        self.auth_keyslot = None
+        self.unlock_method = "passphrase"
+        self.unlock_pin = ""
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+
+        # No extra Gtk.ScrolledWindow here (unlike FormatDialogBase): a
+        # scrolled window reports a near-zero natural height, which would
+        # defeat follows-content-size above. Adw.PreferencesPage brings its
+        # own scroller with propagate-natural-height=True, so the content's
+        # natural height reaches the dialog while scrolling still kicks in
+        # as the safety valve if the screen is shorter than the content.
+        prefs = Adw.PreferencesPage()
+        toolbar_view.set_content(prefs)
+
+        # --- Token unlock group (TPM2 / FIDO2) ---
+        self._token_unlock_group = Adw.PreferencesGroup(title="Unlock with Token")
+        self._token_unlock_group.set_visible(False)
+        prefs.add(self._token_unlock_group)
+
+        self._tpm2_row = Adw.ActionRow(
+            title="Unlock with TPM2",
+            subtitle="Use the TPM2 chip to unlock",
+        )
+        self._tpm2_row.add_prefix(Gtk.Image.new_from_icon_name("computer-symbolic"))
+        self._tpm2_pin_entry = Gtk.PasswordEntry()
+        self._tpm2_pin_entry.set_show_peek_icon(True)
+        self._tpm2_pin_entry.set_valign(Gtk.Align.CENTER)
+        self._tpm2_pin_entry.set_hexpand(True)
+        self._tpm2_pin_entry.set_property("placeholder-text", "PIN (if required)")
+        self._tpm2_pin_entry.connect("activate", lambda _: self._do_token_unlock(TOKEN_TPM2))
+        self._tpm2_row.add_suffix(self._tpm2_pin_entry)
+        tpm2_btn = Gtk.Button(icon_name="go-next-symbolic")
+        tpm2_btn.set_valign(Gtk.Align.CENTER)
+        tpm2_btn.add_css_class("flat")
+        tpm2_btn.connect("clicked", lambda _: self._do_token_unlock(TOKEN_TPM2))
+        self._tpm2_row.add_suffix(tpm2_btn)
+        self._tpm2_row.set_visible(False)
+        self._token_unlock_group.add(self._tpm2_row)
+
+        self._fido2_row = Adw.ActionRow(
+            title="Unlock with FIDO2",
+            subtitle="Touch your security key to unlock",
+        )
+        self._fido2_row.add_prefix(Gtk.Image.new_from_icon_name("media-removable-symbolic"))
+        self._fido2_pin_entry = Gtk.PasswordEntry()
+        self._fido2_pin_entry.set_show_peek_icon(True)
+        self._fido2_pin_entry.set_valign(Gtk.Align.CENTER)
+        self._fido2_pin_entry.set_hexpand(True)
+        self._fido2_pin_entry.set_property("placeholder-text", "PIN")
+        self._fido2_pin_entry.connect("activate", lambda _: self._do_token_unlock(TOKEN_FIDO2))
+        self._fido2_row.add_suffix(self._fido2_pin_entry)
+        fido2_btn = Gtk.Button(icon_name="go-next-symbolic")
+        fido2_btn.set_valign(Gtk.Align.CENTER)
+        fido2_btn.add_css_class("flat")
+        fido2_btn.connect("clicked", lambda _: self._do_token_unlock(TOKEN_FIDO2))
+        self._fido2_row.add_suffix(fido2_btn)
+        self._fido2_row.set_visible(False)
+        self._token_unlock_group.add(self._fido2_row)
+
+        # --- Passphrase / recovery key unlock group ---
+        self._unlock_group = Adw.PreferencesGroup(title="Unlock Device")
+
+        self._pw_row = Adw.ActionRow(title="Passphrase")
+        self._pw_entry = Gtk.PasswordEntry()
+        self._pw_entry.set_show_peek_icon(True)
+        self._pw_entry.set_valign(Gtk.Align.CENTER)
+        self._pw_entry.set_hexpand(True)
+        self._pw_entry.connect("activate", lambda _: self._do_unlock())
+        self._pw_row.add_suffix(self._pw_entry)
+        self._pw_row.set_visible(False)
+        self._unlock_group.add(self._pw_row)
+
+        self._rk_row = Adw.ActionRow(title="Recovery Key")
+        self._rk_entry = Gtk.PasswordEntry()
+        self._rk_entry.set_show_peek_icon(True)
+        self._rk_entry.set_valign(Gtk.Align.CENTER)
+        self._rk_entry.set_hexpand(True)
+        self._rk_entry.connect("activate", lambda _: self._do_unlock())
+        self._rk_row.add_suffix(self._rk_entry)
+        self._rk_row.set_visible(False)
+        self._unlock_group.add(self._rk_row)
+
+        unlock_btn_row = Adw.ActionRow()
+        self._unlock_btn = Gtk.Button(label="Unlock")
+        self._unlock_btn.add_css_class("suggested-action")
+        self._unlock_btn.set_valign(Gtk.Align.CENTER)
+        self._unlock_btn.connect("clicked", lambda _: self._do_unlock())
+        unlock_btn_row.add_suffix(self._unlock_btn)
+        self._unlock_group.add(unlock_btn_row)
+
+        self._spinner = Gtk.Spinner()
+        self._status_label = Gtk.Label(label="", xalign=0, wrap=True)
+        status_row = Adw.ActionRow()
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        status_box.append(self._spinner)
+        status_box.append(self._status_label)
+        status_row.add_suffix(status_box)
+        self._unlock_group.add(status_row)
+
+        prefs.add(self._unlock_group)
+
+        fetch_enrolled_methods(self.svc, self.device, self._apply_enrolled_methods)
+
+    def _apply_enrolled_methods(self, data):
+        """Show/hide unlock fields based on what's enrolled — same policy as
+        DeviceDetailPage._apply_enrolled_methods, applied to this dialog's
+        trimmed-down (unlock-only) set of rows."""
+        has_password = bool(data["pw_slots"])
+        has_recovery = bool(data["recovery"])
+        has_tpm2 = bool(data["tpm2"])
+        has_fido2 = bool(data["fido2"])
+
+        # TPM2 token unlock requires systemd >= 256 for --unlock-tpm2-device.
+        tpm2_unlock_ok = has_tpm2 and data.get("systemd_version", 0) >= 256
+        self._tpm2_row.set_visible(tpm2_unlock_ok)
+        self._fido2_row.set_visible(has_fido2)
+        self._token_unlock_group.set_visible(tpm2_unlock_ok or has_fido2)
+
+        self._pw_row.set_visible(has_password)
+        self._rk_row.set_visible(has_recovery)
+        # Always show at least the passphrase field as a fallback.
+        if not has_password and not has_recovery:
+            self._pw_row.set_visible(True)
+
+    def _do_unlock(self):
+        pw = self._pw_entry.get_text() or self._rk_entry.get_text()
+        if not pw:
+            self._set_status("Enter a passphrase or recovery key.", "error")
+            return
+        self._set_status("", None)
+        self._spinner.start()
+        self._unlock_btn.set_sensitive(False)
+        self._pending_pw = pw
+        self.svc.verify_passphrase_async(self.device, pw, self._on_unlock_finish)
+
+    def _on_unlock_finish(self, proxy, result):
+        self._unlock_btn.set_sensitive(True)
+        try:
+            res = self.svc.finish_async(proxy, result)
+            ok, keyslot = res.unpack()
+        except GLib.Error:
+            ok, keyslot = False, -1
+        if ok:
+            self.passphrase = self._pending_pw
+            self.auth_keyslot = keyslot
+            self._map_volume()
+        else:
+            self._spinner.stop()
+            self._set_status("Incorrect passphrase or recovery key.", "error")
+
+    def _do_token_unlock(self, token_type):
+        """Attempt to unlock using a LUKS2 token (TPM2 or FIDO2)."""
+        if token_type == TOKEN_TPM2:
+            pin = self._tpm2_pin_entry.get_text()
+        else:
+            pin = self._fido2_pin_entry.get_text()
+        self._set_status("", None)
+        self._spinner.start()
+        self._pending_token_type = token_type
+        self._pending_token_pin = pin
+        self.svc.unlock_with_token_async(
+            self.device, token_type, pin, self._on_token_unlock_finish
+        )
+
+    def _on_token_unlock_finish(self, proxy, result):
+        try:
+            res = self.svc.finish_async(proxy, result)
+            ok, keyslot = res.unpack()
+        except GLib.Error as e:
+            self._spinner.stop()
+            self._set_status(f"Token error: {e.message}", "error")
+            return
+        if ok:
+            # Token unlock doesn't give us a passphrase, but we record the
+            # keyslot and unlock method so OpenVolume can use the same
+            # method (mirrors DeviceDetailPage._on_token_unlock_finish).
+            self.passphrase = None
+            self.auth_keyslot = keyslot
+            self.unlock_method = self._pending_token_type
+            self.unlock_pin = self._pending_token_pin
+            self._map_volume()
+        else:
+            self._spinner.stop()
+            token_name = "TPM2" if "tpm2" in self._pending_token_type else "FIDO2"
+            self._set_status(
+                f"{token_name} unlock failed. Check PIN or try another method.",
+                "error",
+            )
+
+    def _map_volume(self):
+        """Authenticated — activate the dm-crypt mapping via the same
+        OpenVolume path the Volume Mapping group's _on_mapping_clicked uses,
+        then report success/failure and hand off."""
+        self._set_status("Mapping volume…", None)
+
+        def work():
+            try:
+                info = self.svc.get_device_info(self.device)
+            except GLib.Error:
+                info = {}
+            mapper_name = derive_mapper_name(self.device, info.get("uuid") or "")
+            try:
+                ok, mapper, err = self.svc.open_volume(
+                    self.device, mapper_name, self.passphrase or "",
+                    self.unlock_method, self.unlock_pin,
+                )
+            except GLib.Error as e:
+                ok, mapper, err = False, "", e.message
+            GLib.idle_add(self._on_map_done, ok, mapper, err)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_map_done(self, ok, mapper, err):
+        self._spinner.stop()
+        if ok:
+            self._set_status(f"Unlocked — mapped at /dev/mapper/{mapper}", "success")
+            if self._on_mapped:
+                self._on_mapped(self.device, mapper)
+            self.close()
+        else:
+            self._set_status(f"Mapping failed: {err}" if err else "Mapping failed.", "error")
+
+    def _set_status(self, text, css_class):
+        self._status_label.set_text(text)
+        self._status_label.remove_css_class("error")
+        self._status_label.remove_css_class("success")
+        if css_class:
+            self._status_label.add_css_class(css_class)
 
 
 # ---------------------------------------------------------------------------
@@ -2889,11 +3302,54 @@ CSS = b"""
 
 
 class LuksEnrollApp(Adw.Application):
+    """The application registers as a single instance under
+    net.contemno.luks-enroll (GApplication's default D-Bus-activation
+    uniqueness — no NON_UNIQUE flag). do_command_line (rather than the
+    default local handling) is required so a plain launch, `--unlock
+    <device>`, and `--watch` can all be told apart, including when they
+    arrive as a *remote* invocation routed to an already-running primary
+    instance (issue #98's "or present the dialog directly if already
+    running": a `--watch` instance that's already the registered primary
+    receives a later `--unlock` invocation this way, with no new process
+    surviving).
+    """
+
     def __init__(self):
         super().__init__(
             application_id="net.contemno.luks-enroll",
-            flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
         )
+        self._watch_subscription = None
+        self._props_subscription = None
+        self._system_bus = None
+        # Watch-mode decision logic (probe-race bookkeeping included) lives
+        # in the pure, unit-tested Udisks2LuksWatcher; created on demand by
+        # _start_watch_mode.
+        self._watcher = None
+
+    def do_command_line(self, command_line):
+        args = command_line.get_arguments()
+        parser = argparse.ArgumentParser(
+            description="LUKS Disk Encryption Manager", add_help=False
+        )
+        parser.add_argument(
+            "--unlock", metavar="DEVICE", default=None,
+            help="Present just the unlock dialog for DEVICE, without the "
+                 "device list window",
+        )
+        parser.add_argument(
+            "--watch", action="store_true",
+            help="Listen for new removable LUKS volumes via udisks2 and "
+                 "present the unlock dialog for each (issue #98)",
+        )
+        ns, _unused = parser.parse_known_args(args[1:])
+        if ns.watch:
+            self._start_watch_mode()
+        elif ns.unlock:
+            self._present_unlock_dialog(ns.unlock)
+        else:
+            self.activate()
+        return 0
 
     def do_activate(self):
         css = Gtk.CssProvider()
@@ -2910,12 +3366,162 @@ class LuksEnrollApp(Adw.Application):
         win = ManagementWindow(self)
         win.present()
 
+    def _present_unlock_dialog(self, device):
+        """`--unlock <device>`: present just UnlockVolumeDialog, without
+        constructing the full ManagementWindow device list (issue #98)."""
+        journal_log(f"presenting unlock dialog for {device}")
+        # hold()/release() keep the process alive while the standalone
+        # dialog is up — it isn't a GtkApplicationWindow the app otherwise
+        # tracks, so without this the process would exit right after
+        # do_command_line returns.
+        self.hold()
+        try:
+            svc = LuksEnrollProxy()
+        except GLib.Error as e:
+            journal_log(
+                "could not present the unlock dialog for "
+                f"{device}: D-Bus service unreachable: {e.message}"
+            )
+            self.release()
+            return
+
+        released = {"done": False}
+
+        def release_once():
+            # Both a successful map (on_mapped) and the dialog's own
+            # "closed" signal fire on success, so guard against a double
+            # release() (which would underflow the hold count).
+            if not released["done"]:
+                released["done"] = True
+                self.release()
+
+        dialog = UnlockVolumeDialog(svc, device, on_mapped=lambda *_a: release_once())
+        dialog.connect("closed", lambda _d: release_once())
+        # No parent widget: adw_dialog_present(dialog, NULL) finds no dialog
+        # host and takes its present_as_window() path, wrapping the dialog in
+        # a fresh standalone GtkWindow (hidden titlebar, .dialog-window
+        # styling, Esc-to-close) and gtk_window_present()ing it. Verified
+        # against the libadwaita sources on both the stable libadwaita-1-5
+        # branch (what Ubuntu 24.04 ships) and main: `parent` is documented
+        # (nullable) and the standalone-window path has existed since
+        # AdwDialog landed in 1.5 — exactly the "lightweight window" issue
+        # #98 asks for, with no separate host-window class needed. The
+        # wrapper window is a plain GtkWindow that GtkApplication does NOT
+        # track, so the hold() above (until "closed") is what keeps the main
+        # loop alive while the dialog is up.
+        dialog.present(None)
+        # Center the wrapper window (PR #100: it cascade-placed at the work
+        # area's top left). GTK4 has no gtk_window_move() — clients can't
+        # position windows (Wayland never allowed it) — but they can hint
+        # the window's *nature*: flagging the wrapper's GDK surface modal
+        # travels as gtk_shell1/xdg_dialog_v1 set_modal on Wayland, where
+        # mutter retypes the window MODAL_DIALOG and its placement centers
+        # dialog-typed windows on the active monitor (place.c,
+        # window_place_centered) instead of cascade-placing them. The hint
+        # goes on the Gdk.Toplevel directly, NOT Gtk.Window.set_modal():
+        # that would also gtk_grab_add() in-process and freeze sibling
+        # unlock dialogs (and any open management window) under --watch.
+        # present() has realized the wrapper, so its surface exists; the
+        # hint lands before the first commit maps the surface, which is
+        # when the compositor places it. On X11 mutter centers only
+        # _NET_WM_WINDOW_TYPE_DIALOG windows (GTK4 sets that type only
+        # alongside a transient parent), so Xorg sessions keep the WM's
+        # default placement — centered too if the user enables the
+        # org.gnome.mutter center-new-windows gsetting.
+        wrapper = dialog.get_root()
+        surface = wrapper.get_surface() if wrapper is not None else None
+        if surface is not None:
+            surface.set_modal(True)
+
+    def _start_watch_mode(self):
+        """`--watch`: listen for new removable crypto_LUKS block devices via
+        udisks2's InterfacesAdded signal (system bus) and present the unlock
+        dialog for each (issue #98). Runs indefinitely — this is the process
+        the autostart entry at
+        dist/etc/xdg/autostart/net.contemno.luks-enroll-watch.desktop
+        launches once per graphical session.
+        """
+        if self._watch_subscription is not None:
+            return  # already watching — a redundant --watch is a no-op
+        self.hold()
+        try:
+            self._system_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        except GLib.Error as e:
+            journal_log(
+                "could not connect to the system bus for the "
+                f"udisks2 listener: {e.message}"
+            )
+            self.release()
+            return
+        self._watcher = Udisks2LuksWatcher(self._launch_unlock_for)
+        self._watch_subscription = self._system_bus.signal_subscribe(
+            UDISKS2_BUS_NAME,
+            "org.freedesktop.DBus.ObjectManager",
+            "InterfacesAdded",
+            UDISKS2_OBJECT_MANAGER_PATH,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_udisks2_interfaces_added,
+        )
+        # Probe-race fallback: udisks2 can export a Block object *before* its
+        # filesystem probe finishes, so InterfacesAdded may carry an empty
+        # IdType for a volume that is in fact crypto_LUKS — the type then
+        # arrives via org.freedesktop.DBus.Properties.PropertiesChanged
+        # (arg0 = the Block interface) on the object's own path. Subscribe
+        # with a None object path (udisks2 emits from each block object's
+        # path, not the ObjectManager root); the watcher matches it against
+        # the small pending set it recorded at InterfacesAdded time.
+        self._props_subscription = self._system_bus.signal_subscribe(
+            UDISKS2_BUS_NAME,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            None,
+            UDISKS2_BLOCK_IFACE,
+            Gio.DBusSignalFlags.NONE,
+            self._on_udisks2_block_properties_changed,
+        )
+        journal_log("watch mode active: listening for new LUKS block devices")
+
+    def _on_udisks2_interfaces_added(
+        self, _connection, _sender, _path, _iface, _signal, params
+    ):
+        try:
+            obj_path, interfaces = params.unpack()
+        except (TypeError, ValueError):
+            return
+        self._watcher.interfaces_added(obj_path, interfaces)
+
+    def _on_udisks2_block_properties_changed(
+        self, _connection, _sender, path, _iface, _signal, params
+    ):
+        try:
+            _prop_iface, changed, _invalidated = params.unpack()
+        except (TypeError, ValueError):
+            return
+        self._watcher.block_properties_changed(path, changed)
+
+    def _launch_unlock_for(self, device):
+        """Launch `luks-enroll --unlock <device>` for a newly-appeared LUKS
+        device. Spawning a subprocess (rather than presenting the dialog
+        in-process here) lets both this --watch listener and a manually-run
+        `--unlock` invocation funnel through the exact same
+        do_command_line/UnlockVolumeDialog path; GApplication's
+        single-instance D-Bus activation (see the class docstring) turns
+        this into a cheap remote call with no process surviving when this
+        --watch instance is already the registered primary."""
+        try:
+            Gio.Subprocess.new(
+                ["luks-enroll", "--unlock", device], Gio.SubprocessFlags.NONE
+            )
+        except GLib.Error as e:
+            journal_log(
+                f"could not launch the unlock dialog for {device}: {e.message}"
+            )
+
 
 def main():
-    parser = argparse.ArgumentParser(description="LUKS Disk Encryption Manager")
-    _, gtk_args = parser.parse_known_args()
     app = LuksEnrollApp()
-    app.run([sys.argv[0]] + gtk_args)
+    app.run(sys.argv)
 
 
 if __name__ == "__main__":

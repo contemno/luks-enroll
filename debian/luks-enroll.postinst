@@ -6,4 +6,14 @@ if [ -d /run/dbus ]; then
     systemctl reload dbus 2>/dev/null || true
 fi
 
+# Reload udev rules and re-tag already-plugged block devices so the new/
+# updated auto-unlock-suppression rule (issue #98,
+# /usr/lib/udev/rules.d/71-luks-enroll-suppress-auto-unlock.rules) applies
+# without a reboot or replug. Best-effort: udevadm may be unavailable in a
+# chroot/container build environment.
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=block 2>/dev/null || true
+fi
+
 #DEBHELPER#

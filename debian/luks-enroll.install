@@ -1,6 +1,7 @@
 dist/etc/ /
 dist/lib/ /
 dist/usr/bin/ /usr/
+dist/usr/lib/ /usr/
 dist/usr/share/ /usr/
 # The privileged service is the compiled Rust binary built from rust/.
 rust/target/release/luks-enroll-service /usr/sbin/
