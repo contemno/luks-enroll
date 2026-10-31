@@ -189,10 +189,13 @@ jobs:
       # HOME; sudo-rs (the default sudo on Ubuntu 25.10+, so on ubuntu-latest
       # since the 26.04 image) ignores -E with a warning, and rustup then
       # failed with "could not choose a version of cargo to run".
+      # CARGO_INCREMENTAL=0 (rust-cache's setting for the job) is passed on
+      # too: otherwise root's build leaves incremental lock files the runner
+      # user cannot read, and the post-job cache save fails with a warning.
       - name: dm-crypt open/close roundtrips (root, loop + device-mapper)
         shell: bash
         run: |
-          sudo env "PATH=$PATH" \
+          sudo env "PATH=$PATH" "CARGO_INCREMENTAL=0" \
             "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             cargo test -p luks-enroll-service --test luks_image -- --ignored 2>&1 | tee /tmp/swtpm-luks-image.log
