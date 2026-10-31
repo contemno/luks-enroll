@@ -97,6 +97,16 @@ impl LuksEnrollService {
         dbus.get_connection_unix_user(sender.into()).await.ok()
     }
 
+    /// The caller's (uid, primary gid), for ownership of what a method
+    /// creates on its behalf. None when either lookup fails.
+    async fn caller_owner(conn: &Connection, hdr: &Header<'_>) -> Option<(u32, u32)> {
+        let uid = Self::caller_uid(conn, hdr).await?;
+        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .map(|u| (uid, u.gid.as_raw()))
+    }
+
     /// Authorization gate. `owned_path` is the first parameter for methods
     /// operating on a device/file (polkit is skipped when the caller owns
     /// the file); `create_image` switches the ownership test to the parent
@@ -659,9 +669,36 @@ pub fn create_fd_is_empty<Fd: std::os::fd::AsFd>(fd: Fd) -> bool {
 pub fn op_format_partition(device: &str, passphrase: &str) -> Triple {
     match format::format_removable_partition(device, passphrase) {
         Ok(partition) => (true, partition, String::new()),
+        // The one refusal the user can act on (unmount, then retry) is
+        // relayed verbatim: it names mount points, never secrets. Everything
+        // else stays the logged, generic failure of the parity contract.
+        Err(e @ format::FormatError::InUse { .. }) => {
+            eprintln!("FormatPartition refused: {e}");
+            (false, String::new(), e.to_string())
+        }
         Err(e) => {
             eprintln!("FormatPartition failed: {e}");
             (false, String::new(), "Operation failed".to_string())
+        }
+    }
+}
+
+/// Create a filesystem on the mapping of a freshly encrypted removable
+/// volume (`MakeFilesystem`). The real error is returned, as for
+/// `op_open_volume`: the policy refusals and mke2fs's output carry no
+/// secret, and a bare "Operation failed" would leave the client unable to
+/// tell the user what to do.
+pub fn op_make_filesystem(
+    device: &str,
+    name: &str,
+    fstype: &str,
+    owner: Option<(u32, u32)>,
+) -> (bool, String) {
+    match format::make_filesystem(device, name, fstype, owner) {
+        Ok(()) => (true, String::new()),
+        Err(e) => {
+            eprintln!("MakeFilesystem failed: {e}");
+            (false, e.0)
         }
     }
 }
@@ -1050,13 +1087,7 @@ impl LuksEnrollService {
         let real_path = Self::realpath(&path);
         Self::check_lens(&[&real_path, &passphrase])?;
         // Caller uid/gid so the image ends up owned by the requester.
-        let owner = match Self::caller_uid(conn, &hdr).await {
-            Some(uid) => nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-                .ok()
-                .flatten()
-                .map(|u| (uid, u.gid.as_raw())),
-            None => None,
-        };
+        let owner = Self::caller_owner(conn, &hdr).await;
         blocking(move || {
             if owner.is_none() {
                 // Parity: a failed uid/gid lookup fails the operation.
@@ -1108,6 +1139,34 @@ impl LuksEnrollService {
                 .await?
         };
         blocking(move || op_format_partition(&device, &passphrase)).await
+    }
+
+    #[zbus(name = "MakeFilesystem")]
+    async fn make_filesystem(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
+        device: String,
+        name: String,
+        fstype: String,
+    ) -> Result<(bool, String), SvcError> {
+        let device = self
+            .gate_device(conn, &hdr, AuthKind::Manage, &device, &[&name, &fstype])
+            .await?;
+        // The caller owns the new filesystem's root directory (mke2fs
+        // root_owner), so the mounted volume is writable without a chown.
+        let owner = Self::caller_owner(conn, &hdr).await;
+        blocking(move || {
+            if owner.is_none() {
+                // As for CreateEncryptedImage: a root-owned root directory
+                // would leave the user unable to write to their own volume,
+                // so fail clearly rather than degrade silently.
+                eprintln!("MakeFilesystem failed: cannot resolve caller uid/gid");
+                return (false, "Operation failed".to_string());
+            }
+            op_make_filesystem(&device, &name, &fstype, owner)
+        })
+        .await
     }
 
     #[zbus(name = "EnrollPassphrase")]

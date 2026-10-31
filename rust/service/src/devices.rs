@@ -177,6 +177,75 @@ pub fn get_device_info(device: &str) -> Value {
     })
 }
 
+/// `(source, mount_point)` for every /proc/mounts entry whose source is
+/// `device` itself or a partition of it: a whole disk counts as mounted when
+/// any partition on it is, since either keeps the disk exclusively claimed.
+/// Mount points are unescaped (`\040` -> space, ...). Pure, for tests; the
+/// `format` module feeds it the live table.
+pub fn device_mounts(proc_mounts: &str, device: &str) -> Vec<(String, String)> {
+    proc_mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let src = fields.next()?;
+            let mount_point = fields.next()?;
+            (src == device || is_partition_of(device, src))
+                .then(|| (src.to_string(), unescape_mounts_field(mount_point)))
+        })
+        .collect()
+}
+
+/// Whether `source` names a partition of the whole-disk node `device`, by
+/// the kernel's naming rule: `sdb` -> `sdb1`, but a disk whose name ends in
+/// a digit gets a `p` separator (`mmcblk0p1`, `nvme0n1p2`). A partition node
+/// has no sub-partitions, so `/dev/sdb10` is never taken for one of
+/// `/dev/sdb1`'s.
+pub fn is_partition_of(device: &str, source: &str) -> bool {
+    let Some(rest) = source.strip_prefix(device) else {
+        return false;
+    };
+    let digits = if device.ends_with(|c: char| c.is_ascii_digit()) {
+        match rest.strip_prefix('p') {
+            Some(d) => d,
+            None => return false,
+        }
+    } else {
+        rest
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Undo /proc/mounts' octal escapes (`\040` space, `\011` tab, `\012`
+/// newline, `\134` backslash) so a mount point reads as the user sees it.
+fn unescape_mounts_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // A backslash followed by exactly three octal digits is an escape.
+        let escaped = bytes
+            .get(i + 1..i + 4)
+            .filter(|_| bytes[i] == b'\\')
+            .filter(|esc| esc.iter().all(|b| (b'0'..=b'7').contains(b)))
+            .map(|esc| {
+                esc.iter()
+                    .fold(0u32, |acc, b| acc * 8 + u32::from(b - b'0'))
+            })
+            .and_then(|code| u8::try_from(code).ok());
+        match escaped {
+            Some(c) => {
+                out.push(c);
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Whether the device (or its parent disk) is removable per sysfs.
 pub fn is_removable(device: &str) -> bool {
     let parent = parent_device_name(device);
@@ -293,7 +362,7 @@ fn crypttab_devices(crypttab: &Path, by_uuid_dir: &Path) -> Vec<String> {
 
 /// Like Python's os.path.realpath: canonicalize, falling back to the
 /// input path when resolution fails.
-fn canonicalize_lossy(path: &Path) -> String {
+pub(crate) fn canonicalize_lossy(path: &Path) -> String {
     fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string_lossy().into_owned())
@@ -430,6 +499,54 @@ mod tests {
 
         let encrypted = partition_json("/dev/sda1", 32_000_000_000, "", true);
         assert_eq!(encrypted["luks_device"], json!("/dev/sda1"));
+    }
+
+    #[test]
+    fn device_mounts_covers_the_disk_and_its_partitions() {
+        let mounts = "proc /proc proc rw 0 0\n\
+                      /dev/sda1 /boot ext4 rw 0 0\n\
+                      /dev/sdb1 /media/josh/USB\\040STICK vfat rw 0 0\n\
+                      /dev/sdb10 /mnt/ten ext4 rw 0 0\n\
+                      /dev/mmcblk0p1 /media/josh/CARD exfat rw 0 0\n";
+        // A whole disk collects every partition mounted from it.
+        assert_eq!(
+            device_mounts(mounts, "/dev/sdb"),
+            vec![
+                ("/dev/sdb1".to_string(), "/media/josh/USB STICK".to_string()),
+                ("/dev/sdb10".to_string(), "/mnt/ten".to_string()),
+            ]
+        );
+        // A partition matches only itself: /dev/sdb10 is its sibling.
+        assert_eq!(
+            device_mounts(mounts, "/dev/sdb1"),
+            vec![("/dev/sdb1".to_string(), "/media/josh/USB STICK".to_string())]
+        );
+        // Digit-ending disk names take the `p` separator.
+        assert_eq!(
+            device_mounts(mounts, "/dev/mmcblk0"),
+            vec![("/dev/mmcblk0p1".to_string(), "/media/josh/CARD".to_string())]
+        );
+        assert!(device_mounts(mounts, "/dev/sdc").is_empty());
+    }
+
+    #[test]
+    fn is_partition_of_follows_kernel_naming() {
+        assert!(is_partition_of("/dev/sdb", "/dev/sdb1"));
+        assert!(is_partition_of("/dev/sdb", "/dev/sdb10"));
+        assert!(is_partition_of("/dev/nvme0n1", "/dev/nvme0n1p2"));
+        assert!(is_partition_of("/dev/mmcblk0", "/dev/mmcblk0p1"));
+        assert!(!is_partition_of("/dev/nvme0n1", "/dev/nvme0n12"));
+        assert!(!is_partition_of("/dev/sdb1", "/dev/sdb10"));
+        assert!(!is_partition_of("/dev/sda", "/dev/sdab"));
+        assert!(!is_partition_of("/dev/sda", "/dev/sda"));
+    }
+
+    #[test]
+    fn mounts_field_octal_escapes_are_decoded() {
+        assert_eq!(unescape_mounts_field("a\\040b\\011c\\134d"), "a b\tc\\d");
+        // Not an escape: too short, or non-octal digits.
+        assert_eq!(unescape_mounts_field("x\\04"), "x\\04");
+        assert_eq!(unescape_mounts_field("x\\089"), "x\\089");
     }
 
     #[test]

@@ -40,6 +40,8 @@ Depends: python3,
          libtss2-esys-3.0.2-0 | libtss2-esys0,
          libtss2-mu-4.0.1-0 | libtss2-mu0,
          polkitd | policykit-1,
+# MakeFilesystem runs mkfs.ext4 on a freshly encrypted removable volume.
+         e2fsprogs,
          ${shlibs:Depends},
          ${misc:Depends}
 Suggests: dracut

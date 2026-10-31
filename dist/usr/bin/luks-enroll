@@ -10,13 +10,16 @@ import gi
 import glob
 import json
 import os
+import re
 import sys
 import threading
+import time
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("GUdev", "1.0")
-from gi.repository import Adw, Gio, GLib, GUdev, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, GUdev, Gtk  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +69,13 @@ TOKEN_RECOVERY = "systemd-recovery"
 UDISKS2_BUS_NAME = "org.freedesktop.UDisks2"
 UDISKS2_OBJECT_MANAGER_PATH = "/org/freedesktop/UDisks2"
 UDISKS2_BLOCK_IFACE = "org.freedesktop.UDisks2.Block"
+# The mount side of a volume's life (Udisks2Client): resolving a device node
+# to its udisks2 object, and mounting/unmounting the filesystem on it.
+UDISKS2_MANAGER_PATH = "/org/freedesktop/UDisks2/Manager"
+UDISKS2_MANAGER_IFACE = "org.freedesktop.UDisks2.Manager"
+UDISKS2_FILESYSTEM_IFACE = "org.freedesktop.UDisks2.Filesystem"
+UDISKS2_ERROR_ALREADY_MOUNTED = "org.freedesktop.UDisks2.Error.AlreadyMounted"
+DBUS_PROPERTIES_IFACE = "org.freedesktop.DBus.Properties"
 # Upper bound on the not-yet-probed block devices the --watch listener
 # remembers while waiting for a late IdType (see _on_udisks2_interfaces_added);
 # oldest entries are evicted first, so the set can never leak.
@@ -231,6 +241,139 @@ class Udisks2LuksWatcher:
         elif id_type:
             # Probe finished as some other filesystem — classified, not ours.
             del self._pending[obj_path]
+
+
+def copy_text_to_clipboard(widget, text):
+    """Put `text` on the session clipboard (the one Ctrl+V reads) through the
+    widget's display. GTK4 clipboards take a content provider, not a string."""
+    provider = Gdk.ContentProvider.new_for_value(
+        GObject.Value(GObject.TYPE_STRING, text)
+    )
+    widget.get_clipboard().set_content(provider)
+
+
+def error_message(exc):
+    """Human-readable text for a GLib.Error (``.message``) or any other
+    exception (``str``), for status labels built on a worker thread."""
+    return getattr(exc, "message", None) or str(exc)
+
+
+class Udisks2Error(Exception):
+    """udisks2 could not do what the mount-side flow needed: the device is
+    not one it manages, or a fresh filesystem never showed up on it."""
+
+
+class Udisks2Client:
+    """The mount side of a volume's life, through udisks2: unmount a
+    filesystem before its device is encrypted, and mount the one created on
+    a freshly encrypted volume.
+
+    This lives in the client on purpose, not in the privileged service. The
+    service runs under ProtectSystem/ProtectHome, which gives it a private
+    mount namespace with slave propagation: a mount it performed would be
+    invisible to the user's session, and an unmount would not even release
+    the device, because the host's mount keeps it exclusively claimed.
+    udisks2 is the desktop's mount broker and already owns the user's
+    mounts, so it is the one actor that can change them. Every method here
+    is synchronous and meant for a worker thread (see run_async).
+    """
+
+    POLL_INTERVAL = 0.25
+
+    def __init__(self, bus=None, sleep=time.sleep, clock=time.monotonic):
+        self._bus = bus
+        self._sleep = sleep
+        self._clock = clock
+
+    def _call(self, object_path, interface, method, signature, args,
+              reply_signature, timeout_ms=30000):
+        """One synchronous udisks2 method call; returns the unpacked reply."""
+        if self._bus is None:
+            self._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        reply = self._bus.call_sync(
+            UDISKS2_BUS_NAME, object_path, interface, method,
+            GLib.Variant(signature, args),
+            GLib.VariantType.new(reply_signature),
+            Gio.DBusCallFlags.NONE, timeout_ms, None,
+        )
+        return reply.unpack()
+
+    def resolve_block(self, device):
+        """udisks2 object path for a device node, or None while udisks2 has
+        not exported it. A symlink such as /dev/mapper/<name> is resolved to
+        the node it points at first (udisks2 matches ResolveDevice's path
+        against the node and its symlinks; the node is the sure match)."""
+        node = os.path.realpath(device)
+        (paths,) = self._call(
+            UDISKS2_MANAGER_PATH, UDISKS2_MANAGER_IFACE, "ResolveDevice",
+            "(a{sv}a{sv})", ({"path": GLib.Variant("s", node)}, {}), "(ao)",
+        )
+        return paths[0] if paths else None
+
+    def _property(self, object_path, interface, name):
+        (value,) = self._call(
+            object_path, DBUS_PROPERTIES_IFACE, "Get", "(ss)", (interface, name), "(v)"
+        )
+        return value
+
+    def unmount(self, device):
+        """Unmount the filesystem on `device`. udisks2 applies its own polkit
+        policy: the active user's own removable-media mounts go through
+        without a prompt; anything else raises the GLib.Error it reports."""
+        object_path = self.resolve_block(device)
+        if object_path is None:
+            raise Udisks2Error(f"{device} is not managed by udisks2")
+        self._call(
+            object_path, UDISKS2_FILESYSTEM_IFACE, "Unmount", "(a{sv})", ({},), "()",
+            timeout_ms=120000,
+        )
+
+    def mount(self, device, fstype="ext4", timeout=15.0):
+        """Mount the `fstype` filesystem on `device` and return its mount
+        point. Waits up to `timeout` seconds for udisks2 to export the device
+        and to have probed the fresh filesystem on it: both lag the kernel
+        events that create them, and a Rescan nudges the probe along. A
+        filesystem something else (the desktop's automount) mounted first
+        counts as success and reports that mount point."""
+        deadline = self._clock() + timeout
+        object_path = None
+        while True:
+            if object_path is None:
+                object_path = self.resolve_block(device)
+                if object_path is not None:
+                    self._rescan(object_path)
+            if object_path is not None:
+                if self._property(object_path, UDISKS2_BLOCK_IFACE, "IdType") == fstype:
+                    break
+            if self._clock() >= deadline:
+                raise Udisks2Error(
+                    f"udisks2 did not detect the {fstype} filesystem on {device}"
+                )
+            self._sleep(self.POLL_INTERVAL)
+        try:
+            (mount_point,) = self._call(
+                object_path, UDISKS2_FILESYSTEM_IFACE, "Mount", "(a{sv})", ({},), "(s)",
+                timeout_ms=120000,
+            )
+            return mount_point
+        except GLib.Error as e:
+            if Gio.DBusError.get_remote_error(e) != UDISKS2_ERROR_ALREADY_MOUNTED:
+                raise
+        mount_points = self._property(
+            object_path, UDISKS2_FILESYSTEM_IFACE, "MountPoints"
+        )
+        return next(filter(None, map(_udisks2_decode_device, mount_points)), "")
+
+    def _rescan(self, object_path):
+        """Ask udisks2 to re-probe a block device. Best effort: the method is
+        missing on old udisks2, where the udev change event mkfs triggers is
+        what updates the probe."""
+        try:
+            self._call(
+                object_path, UDISKS2_BLOCK_IFACE, "Rescan", "(a{sv})", ({},), "()"
+            )
+        except GLib.Error:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +783,21 @@ class LuksEnrollProxy:
         )
         return result.unpack()  # (bool, str, str)
 
+    def make_filesystem(self, device, name, fstype="ext4"):
+        """Create `fstype` inside the open mapping /dev/mapper/<name> of the
+        freshly encrypted removable `device`. The service only accepts a
+        volume with no enrolled keyslots yet, so this can never reformat a
+        volume that has been in use. Returns (ok, stderr). mke2fs on slow
+        flash can take a while, hence the generous timeout."""
+        result = self.proxy.call_sync(
+            "MakeFilesystem",
+            GLib.Variant("(sss)", (device, name, fstype)),
+            Gio.DBusCallFlags.NONE,
+            600000,
+            None,
+        )
+        return result.unpack()  # (bool, str)
+
     def enroll_passphrase(self, device, existing_passphrase, new_passphrase,
                           unlock_method="passphrase", unlock_pin=""):
         return self._call_path_or_fd_sync(
@@ -778,6 +936,97 @@ def mount_references(proc_mounts, mapper, dm_node):
         if src and (src == mapper or (dm_node and src == dm_node)):
             return True
     return False
+
+
+def is_partition_of(device, source):
+    """True if `source` names a partition of the whole-disk node `device`,
+    by the kernel's naming rule: sdb -> sdb1, but a disk whose name ends in a
+    digit gets a "p" separator (mmcblk0 -> mmcblk0p1, nvme0n1 -> nvme0n1p2).
+    A partition node has no sub-partitions, so /dev/sdb10 is never taken for
+    one of /dev/sdb1's."""
+    if not source.startswith(device) or source == device:
+        return False
+    rest = source[len(device):]
+    if device[-1:].isdigit():
+        return rest[:1] == "p" and rest[1:].isdigit()
+    return rest.isdigit()
+
+
+def decode_proc_mounts_field(field):
+    """Undo /proc/mounts' octal escapes (space is ``\\040``, tab ``\\011``,
+    newline ``\\012``, backslash ``\\134``) so a mount point reads the way
+    the user sees it in Files."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def device_mounts(proc_mounts, device):
+    """[(source, mount_point)] for every /proc/mounts entry whose source is
+    `device` itself or a partition of it: a whole disk counts as mounted
+    when any partition on it is, since either keeps the disk exclusively
+    claimed and the service refuses to format it."""
+    found = []
+    for line in proc_mounts.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        src, mount_point = fields[0], fields[1]
+        if src == device or is_partition_of(device, src):
+            found.append((src, decode_proc_mounts_field(mount_point)))
+    return found
+
+
+def read_proc_mounts():
+    """The current mount table, or "" when it cannot be read."""
+    try:
+        with open("/proc/mounts") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def unmount_sources(udisks, sources):
+    """Worker for EncryptDevicePage: unmount each of `sources` via udisks2,
+    stopping at the first one that refuses. Returns run_async's
+    (ok, stdout, stderr) triple."""
+    for src in sources:
+        try:
+            udisks.unmount(src)
+        except (GLib.Error, Udisks2Error) as e:
+            return (False, "", f"Could not unmount {src}: {error_message(e)}")
+    return (True, "", "")
+
+
+def prepare_new_volume(svc, udisks, target):
+    """Worker for EncryptDevicePage: make the freshly encrypted `target`
+    usable without a trip through another tool. Open it from the cached
+    volume key (the same OpenVolume the Volume Mapping group uses), have the
+    service create an ext4 filesystem inside (MakeFilesystem), then mount it
+    through udisks2. Returns (ok, mount_point, error); a GLib.Error from the
+    service propagates to run_async, which turns it into a failure triple."""
+    info = svc.get_device_info(target)
+    name = derive_mapper_name(target, info.get("uuid") or "")
+    ok, _mapper, err = svc.open_volume(target, name, "", "passphrase", "")
+    if not ok:
+        return (False, "", f"the volume could not be opened: {err}")
+    ok, err = svc.make_filesystem(target, name, "ext4")
+    if not ok:
+        return (False, "", f"the filesystem could not be created: {err}")
+    try:
+        mount_point = udisks.mount("/dev/mapper/" + name, "ext4")
+    except (GLib.Error, Udisks2Error) as e:
+        msg = error_message(e)
+        return (False, "", f"the new filesystem could not be mounted: {msg}")
+    return (True, mount_point, "")
+
+
+def parse_recovery_key(stdout):
+    """The recovery key line from EnrollRecoveryKey's stdout: the first
+    non-blank line shaped like a modhex key (long, dash-grouped), or ""."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line and len(line) > 20 and "-" in line:
+            return line
+    return ""
 
 
 def is_unknown_method(remote_error):
@@ -1421,7 +1670,15 @@ class FormatDialogBase(Adw.Dialog):
 
 
 class EncryptDevicePage(FormatDialogBase):
-    """Dialog for encrypting an unencrypted removable device."""
+    """Dialog for encrypting an unencrypted removable device.
+
+    Submit runs a short pipeline rather than one call. A mounted device is
+    offered an unmount first (udisks2), because a live mount keeps the device
+    exclusively claimed and the service refuses to format it. After the LUKS
+    format, the new volume is opened from its cached volume key, given an
+    ext4 filesystem by the service (MakeFilesystem), and mounted through
+    udisks2, so it is ready to use the moment its detail page opens.
+    """
 
     def __init__(self, svc, device, size_str, list_page):
         self.device = device
@@ -1434,6 +1691,7 @@ class EncryptDevicePage(FormatDialogBase):
             submit_css_class="destructive-action",
             success_text="Encrypted successfully.",
         )
+        self._udisks = Udisks2Client()
 
     def build_target_groups(self, prefs):
         warning_group = Adw.PreferencesGroup(
@@ -1459,8 +1717,58 @@ class EncryptDevicePage(FormatDialogBase):
                 subtitle="Pick how to unlock it on the next screen.",
             )
         )
+        info_group.add(
+            Adw.ActionRow(
+                title="Ready to use when done",
+                subtitle="An ext4 filesystem is created inside and mounted for you.",
+            )
+        )
 
     def _on_submit_clicked(self, _btn):
+        mounts = device_mounts(read_proc_mounts(), self.device)
+        if mounts:
+            self._confirm_unmount(mounts)
+        else:
+            self._start_encrypt()
+
+    def _confirm_unmount(self, mounts):
+        """A mounted filesystem keeps the device exclusively claimed, so the
+        service refuses to touch it (rightly: the mount is live data). Offer
+        to unmount through udisks2 and carry on, instead of letting the user
+        run into that refusal as a bare failure."""
+        listed = "\n".join(f"{src} is mounted at {mp}" for src, mp in mounts)
+        dialog = Adw.AlertDialog(
+            heading="Device Is Mounted",
+            body=(
+                f"{listed}\n\n"
+                f"Encrypting {self.device} erases everything on it, so it has "
+                "to be unmounted first. Unmount it now and continue?"
+            ),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("unmount", "Unmount and Encrypt")
+        dialog.set_response_appearance("unmount", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self._on_unmount_response, mounts)
+        dialog.present(self)
+
+    def _on_unmount_response(self, _dialog, response, mounts):
+        if response != "unmount":
+            return
+        self._begin_submit("Unmounting…")
+        sources = [src for src, _mp in mounts]
+        run_async(
+            lambda: unmount_sources(self._udisks, sources), self._on_unmount_done
+        )
+
+    def _on_unmount_done(self, ok, _stdout, stderr):
+        if ok:
+            self._start_encrypt()
+        else:
+            self._on_format_failure(stderr)
+
+    def _start_encrypt(self):
         self._begin_submit("Encrypting…")
         # Empty passphrase: the service formats a keyslot-less partition and
         # caches its volume key for the first enrollment (issue #82).
@@ -1469,10 +1777,35 @@ class EncryptDevicePage(FormatDialogBase):
         )
 
     def _on_format_done(self, ok, partition, stderr):
-        if ok:
-            self._on_format_success(partition or self.device)
-        else:
+        if not ok:
             self._on_format_failure(stderr)
+            return
+        target = partition or self.device
+        self._begin_submit("Creating filesystem…")
+        run_async(
+            lambda: prepare_new_volume(self.svc, self._udisks, target),
+            lambda ok, mount_point, err: self._on_prepare_done(
+                target, ok, mount_point, err
+            ),
+        )
+
+    def _on_prepare_done(self, target, ok, mount_point, err):
+        # The volume is encrypted either way, so land on its page where an
+        # unlock method gets enrolled. A failed open/format/mount is reported
+        # on top of it rather than as a failed encryption.
+        self._on_format_success(target)
+        if ok:
+            return
+        dialog = Adw.AlertDialog(
+            heading="Encrypted, but Not Mounted",
+            body=(
+                f"{target} is now encrypted, but {err}.\n\n"
+                "You can open it from the Volume Mapping section of its page, "
+                "and format or mount it with the Disks utility."
+            ),
+        )
+        dialog.add_response("ok", "OK")
+        dialog.present(self.list_page.get_root())
 
 
 class CreateImagePage(FormatDialogBase):
@@ -2800,16 +3133,49 @@ class EnrollPage(Adw.NavigationPage):
         self._content_box.append(status_box)
 
         if spec.show_recovery_key:
+            self._recovery_key = ""
+            key_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            key_box.set_margin_start(16)
+            key_box.set_margin_end(16)
+            key_box.set_margin_bottom(16)
             self._key_label = Gtk.Label(label="", selectable=True, wrap=True,
                                         xalign=0)
             self._key_label.add_css_class("title-3")
             self._key_label.add_css_class("monospace")
-            self._key_label.set_margin_start(16)
-            self._key_label.set_margin_end(16)
-            self._key_label.set_margin_bottom(16)
-            self._content_box.append(self._key_label)
+            self._key_label.set_hexpand(True)
+            key_box.append(self._key_label)
+            # The key is shown exactly once (see RECOVERY_SPEC), so getting it
+            # out of this window is one click, not a drag-select of 71
+            # monospace characters.
+            self._copy_key_btn = Gtk.Button()
+            self._copy_key_btn.set_child(
+                Adw.ButtonContent(icon_name="edit-copy-symbolic", label="Copy")
+            )
+            self._copy_key_btn.set_tooltip_text(
+                "Copy the recovery key to the clipboard"
+            )
+            self._copy_key_btn.set_valign(Gtk.Align.START)
+            self._copy_key_btn.set_visible(False)
+            self._copy_key_btn.connect("clicked", lambda _: self._copy_recovery_key())
+            key_box.append(self._copy_key_btn)
+            self._content_box.append(key_box)
 
         spec.post_init(self)
+
+    def _copy_recovery_key(self):
+        if not self._recovery_key:
+            return
+        copy_text_to_clipboard(self, self._recovery_key)
+        self._copy_key_btn.set_child(
+            Adw.ButtonContent(icon_name="object-select-symbolic", label="Copied")
+        )
+        GLib.timeout_add_seconds(2, self._reset_copy_button)
+
+    def _reset_copy_button(self):
+        self._copy_key_btn.set_child(
+            Adw.ButtonContent(icon_name="edit-copy-symbolic", label="Copy")
+        )
+        return GLib.SOURCE_REMOVE
 
     def _set_status(self, text, css=None):
         self._status_label.set_text(text)
@@ -2829,7 +3195,9 @@ class EnrollPage(Adw.NavigationPage):
         self._spinner.start()
         self._set_status(self.spec.enrolling_label)
         if self.spec.show_recovery_key:
+            self._recovery_key = ""
             self._key_label.set_text("")
+            self._copy_key_btn.set_visible(False)
 
         method = getattr(self.svc, self.spec.service_method)
         args = (self.device, self.passphrase or "", *extra_args,
@@ -2843,12 +3211,10 @@ class EnrollPage(Adw.NavigationPage):
         self.spec.on_enroll_done(self, ok)
         if ok:
             self._set_status(self.spec.success_label, "success")
-            if self.spec.show_recovery_key and stdout:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line and len(line) > 20 and "-" in line:
-                        self._key_label.set_text(line)
-                        break
+            if self.spec.show_recovery_key:
+                self._recovery_key = parse_recovery_key(stdout or "")
+                self._key_label.set_text(self._recovery_key)
+                self._copy_key_btn.set_visible(bool(self._recovery_key))
             self.detail_page.refresh_after_enroll()
         else:
             self._set_status(stderr or self.spec.failure_default, "error")
@@ -3160,11 +3526,14 @@ RECOVERY_SPEC = EnrollSpec(
     group_title="Recovery Key",
     group_description=(
         "Generate a recovery key. You MUST write it down and store it safely.\n"
-        "This is your last resort if all other unlock methods are unavailable."
+        "This is your last resort if all other unlock methods are unavailable.\n\n"
+        "The key is shown once, right after it is generated. This tool cannot "
+        "display it again later, so copy it to a password manager or write it "
+        "down before you leave this page."
     ),
     button_label="Generate Recovery Key",
     enrolling_label="Generating recovery key...",
-    success_label="Recovery key generated. Write it down!",
+    success_label="Recovery key generated. Copy it now; it will not be shown again.",
     failure_default="Failed to generate recovery key.",
     service_method="enroll_recovery_key",
     show_recovery_key=True,

@@ -12,6 +12,7 @@ Run: python3 -m pytest test_luks_enroll.py -v
 import ast
 import glob  # noqa: F401  pre-import so sys.modules patching doesn't evict it
 import os
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -239,8 +240,10 @@ class TestKeylessImageCreation(unittest.TestCase):
         # Encrypt with an empty passphrase (keyless format) ...
         self.assertIn('self.svc.format_partition(self.device, "")', encrypt)
         # ... then hand off to the shared success tail (FormatDialogBase),
-        # which does the volume_key_cached=True detail-page push.
-        self.assertIn("self._on_format_success(partition or self.device)", encrypt)
+        # which does the volume_key_cached=True detail-page push. The hand-off
+        # now follows the open/mkfs/mount step, on the same target.
+        self.assertIn("target = partition or self.device", encrypt)
+        self.assertIn("self._on_format_success(target)", encrypt)
 
 
 class TestFormatDialogConsolidation(unittest.TestCase):
@@ -1235,6 +1238,518 @@ class TestDropInUnlockTakeoverAssets(unittest.TestCase):
         self.assertIn("Exec=/usr/bin/luks-enroll --watch", entry)
         self.assertIn("X-GNOME-Autostart-enabled=true", entry)
         self.assertIn("Type=Application", entry)
+
+
+# ===========================================================================
+# Recovery key: copy to clipboard, shown-once disclaimer
+# ===========================================================================
+
+
+class TestRecoveryKeyCopyAndDisclaimer(unittest.TestCase):
+    """The recovery key is displayed exactly once, right after generation,
+    and this tool has no way to show it again (it is a keyslot passphrase,
+    not stored anywhere readable). The page therefore says so up front and
+    offers a one-click copy instead of a drag-select of 71 characters."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        cls.classes = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+
+    def test_recovery_spec_says_the_key_is_never_shown_again(self):
+        spec = gui.RECOVERY_SPEC
+        self.assertIn("shown once", spec.group_description)
+        self.assertIn("cannot display it again", spec.group_description)
+        self.assertIn("copy it", spec.group_description)
+        self.assertIn("will not be shown again", spec.success_label)
+
+    def test_parse_recovery_key_picks_the_dash_grouped_line(self):
+        key = "cccc-dddd-eeee-ffff-gggg-hhhh-iiii-jjjj"
+        self.assertEqual(gui.parse_recovery_key(f"Recovery key:\n  {key}\n"), key)
+        self.assertEqual(gui.parse_recovery_key(""), "")
+        # A short dashed line (a stray "---" separator) is not a key.
+        self.assertEqual(gui.parse_recovery_key("---\nnot-a-key\n"), "")
+
+    def test_enroll_page_offers_a_copy_button_for_the_key(self):
+        page = self.classes["EnrollPage"]
+        self.assertIn('icon_name="edit-copy-symbolic"', page)
+        self.assertIn("copy_text_to_clipboard(self, self._recovery_key)", page)
+        # The button only appears once a key exists, and is reset per attempt.
+        self.assertIn("self._copy_key_btn.set_visible(bool(self._recovery_key))", page)
+        self.assertIn("self._copy_key_btn.set_visible(False)", page)
+        self.assertIn("parse_recovery_key(stdout", page)
+
+    def test_copy_text_to_clipboard_sets_a_string_content_provider(self):
+        widget = mock.MagicMock()
+        with (
+            mock.patch.object(
+                gui.Gdk.ContentProvider, "new_for_value"
+            ) as new_for_value,
+            mock.patch.object(gui.GObject, "Value") as value,
+        ):
+            gui.copy_text_to_clipboard(widget, "cccc-dddd")
+        value.assert_called_once_with(gui.GObject.TYPE_STRING, "cccc-dddd")
+        new_for_value.assert_called_once_with(value.return_value)
+        widget.get_clipboard.return_value.set_content.assert_called_once_with(
+            new_for_value.return_value
+        )
+
+
+# ===========================================================================
+# Encrypting a mounted device: offer to unmount (udisks2), then encrypt
+# ===========================================================================
+
+
+class TestDeviceMounts(unittest.TestCase):
+    """device_mounts finds what is mounted from a device, including a whole
+    disk's partitions, since either keeps the disk exclusively claimed and
+    the service refuses to format it."""
+
+    MOUNTS = (
+        "proc /proc proc rw 0 0\n"
+        "/dev/sda1 /boot ext4 rw 0 0\n"
+        "/dev/sdb1 /media/josh/USB\\040STICK vfat rw 0 0\n"
+        "/dev/sdb10 /mnt/ten ext4 rw 0 0\n"
+        "/dev/mmcblk0p1 /media/josh/CARD exfat rw 0 0\n"
+    )
+
+    def test_whole_disk_collects_its_partitions(self):
+        self.assertEqual(
+            gui.device_mounts(self.MOUNTS, "/dev/sdb"),
+            [("/dev/sdb1", "/media/josh/USB STICK"), ("/dev/sdb10", "/mnt/ten")],
+        )
+
+    def test_partition_matches_only_itself(self):
+        # /dev/sdb10 is a sibling of /dev/sdb1, not a partition of it.
+        self.assertEqual(
+            gui.device_mounts(self.MOUNTS, "/dev/sdb1"),
+            [("/dev/sdb1", "/media/josh/USB STICK")],
+        )
+
+    def test_digit_ending_disks_use_the_p_separator(self):
+        self.assertEqual(
+            gui.device_mounts(self.MOUNTS, "/dev/mmcblk0"),
+            [("/dev/mmcblk0p1", "/media/josh/CARD")],
+        )
+        self.assertTrue(gui.is_partition_of("/dev/nvme0n1", "/dev/nvme0n1p2"))
+        self.assertFalse(gui.is_partition_of("/dev/nvme0n1", "/dev/nvme0n12"))
+        self.assertFalse(gui.is_partition_of("/dev/sda", "/dev/sdab"))
+        self.assertFalse(gui.is_partition_of("/dev/sda", "/dev/sda"))
+
+    def test_unmounted_device_has_no_mounts(self):
+        self.assertEqual(gui.device_mounts(self.MOUNTS, "/dev/sdc"), [])
+
+    def test_proc_mounts_octal_escapes_are_decoded(self):
+        self.assertEqual(
+            gui.decode_proc_mounts_field("a\\040b\\011c\\134d"), "a b\tc\\d"
+        )
+
+    def test_read_proc_mounts_tolerates_an_unreadable_table(self):
+        with mock.patch("builtins.open", side_effect=OSError("nope")):
+            self.assertEqual(gui.read_proc_mounts(), "")
+
+
+class TestUdisks2Client(unittest.TestCase):
+    """The client-side mount broker. The service cannot mount or unmount for
+    the session (private mount namespace), so udisks2 does it; these drive
+    the wrapper's call sequence against a recorded fake bus."""
+
+    class FakeClient(gui.Udisks2Client):
+        def __init__(self, reply, clock_values=None):
+            self.ticks = list(clock_values or [0.0])
+            super().__init__(
+                bus=object(), sleep=self.slept.append, clock=self._clock_value
+            )
+            self.calls = []
+            self._reply = reply
+
+        slept = []
+
+        def _clock_value(self):
+            return self.ticks.pop(0) if len(self.ticks) > 1 else self.ticks[0]
+
+        def _call(
+            self,
+            object_path,
+            interface,
+            method,
+            signature,
+            args,
+            reply_signature,
+            timeout_ms=30000,
+        ):
+            self.calls.append(
+                (object_path, interface, method, signature, reply_signature)
+            )
+            return self._reply(method, args)
+
+    BLOCK = "/org/freedesktop/UDisks2/block_devices/sdb1"
+
+    def test_unmount_resolves_the_device_then_unmounts_it(self):
+        def reply(method, args):
+            return {"ResolveDevice": ([self.BLOCK],), "Unmount": ()}[method]
+
+        client = self.FakeClient(reply)
+        client.unmount("/dev/sdb1")
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    gui.UDISKS2_MANAGER_PATH,
+                    gui.UDISKS2_MANAGER_IFACE,
+                    "ResolveDevice",
+                    "(a{sv}a{sv})",
+                    "(ao)",
+                ),
+                (self.BLOCK, gui.UDISKS2_FILESYSTEM_IFACE, "Unmount", "(a{sv})", "()"),
+            ],
+        )
+
+    def test_unmount_of_a_device_udisks2_does_not_know_raises(self):
+        client = self.FakeClient(lambda method, args: ([],))
+        with self.assertRaises(gui.Udisks2Error):
+            client.unmount("/dev/sdz9")
+        self.assertEqual([c[2] for c in client.calls], ["ResolveDevice"])
+
+    def test_mount_waits_for_the_object_and_the_probe_then_mounts(self):
+        # udisks2 exports the dm device a beat after activation, and probes
+        # the new filesystem a beat after mkfs: the first poll sees no object,
+        # the second an unprobed one, the third ext4.
+        state = {"resolve": [([],), ([self.BLOCK],)], "idtype": ["", "ext4"]}
+
+        def reply(method, args):
+            if method == "ResolveDevice":
+                return (
+                    state["resolve"].pop(0)
+                    if len(state["resolve"]) > 1
+                    else state["resolve"][0]
+                )
+            if method == "Get":
+                return (
+                    state["idtype"].pop(0)
+                    if len(state["idtype"]) > 1
+                    else state["idtype"][0],
+                )
+            if method == "Rescan":
+                return ()
+            if method == "Mount":
+                return ("/media/josh/abc",)
+            raise AssertionError(method)
+
+        client = self.FakeClient(reply, clock_values=[0.0, 0.1, 0.2, 0.3, 0.4])
+        self.assertEqual(
+            client.mount("/dev/mapper/luks-abc", "ext4"), "/media/josh/abc"
+        )
+        methods = [c[2] for c in client.calls]
+        # Resolve until found, one Rescan nudge, poll IdType, then Mount.
+        self.assertEqual(
+            methods, ["ResolveDevice", "ResolveDevice", "Rescan", "Get", "Get", "Mount"]
+        )
+        self.assertEqual(
+            client.calls[-1][:2], (self.BLOCK, gui.UDISKS2_FILESYSTEM_IFACE)
+        )
+
+    def test_mount_gives_up_when_the_filesystem_never_appears(self):
+        client = self.FakeClient(lambda method, args: ([],), clock_values=[0.0, 100.0])
+        with self.assertRaises(gui.Udisks2Error):
+            client.mount("/dev/mapper/luks-abc", "ext4", timeout=15.0)
+
+    def test_mount_treats_already_mounted_as_success(self):
+        class FakeGError(Exception):
+            pass
+
+        def reply(method, args):
+            if method == "ResolveDevice":
+                return ([self.BLOCK],)
+            if method == "Rescan":
+                return ()
+            if method == "Get":
+                iface, prop = args
+                if prop == "IdType":
+                    return ("ext4",)
+                # MountPoints is `aay`: NUL-terminated byte arrays.
+                return ([list(b"/media/josh/auto\x00")],)
+            if method == "Mount":
+                raise FakeGError("already mounted")
+            raise AssertionError(method)
+
+        client = self.FakeClient(reply)
+        with (
+            mock.patch.object(gui.GLib, "Error", FakeGError),
+            mock.patch.object(
+                gui.Gio.DBusError,
+                "get_remote_error",
+                return_value=gui.UDISKS2_ERROR_ALREADY_MOUNTED,
+            ),
+        ):
+            self.assertEqual(client.mount("/dev/mapper/luks-abc"), "/media/josh/auto")
+
+    def test_mount_reraises_other_udisks2_errors(self):
+        class FakeGError(Exception):
+            pass
+
+        def reply(method, args):
+            if method == "Mount":
+                raise FakeGError("not authorized")
+            return {"ResolveDevice": ([self.BLOCK],), "Rescan": (), "Get": ("ext4",)}[
+                method
+            ]
+
+        client = self.FakeClient(reply)
+        with (
+            mock.patch.object(gui.GLib, "Error", FakeGError),
+            mock.patch.object(
+                gui.Gio.DBusError,
+                "get_remote_error",
+                return_value="org.freedesktop.UDisks2.Error.NotAuthorized",
+            ),
+        ):
+            with self.assertRaises(FakeGError):
+                client.mount("/dev/mapper/luks-abc")
+
+    def test_rescan_is_best_effort_on_old_udisks2(self):
+        class FakeGError(Exception):
+            pass
+
+        def reply(method, args):
+            if method == "Rescan":
+                raise FakeGError("unknown method")
+            return {
+                "ResolveDevice": ([self.BLOCK],),
+                "Get": ("ext4",),
+                "Mount": ("/m",),
+            }[method]
+
+        client = self.FakeClient(reply)
+        with mock.patch.object(gui.GLib, "Error", FakeGError):
+            self.assertEqual(client.mount("/dev/mapper/luks-abc"), "/m")
+
+
+class TestEncryptDeviceWorkers(unittest.TestCase):
+    """The two worker bodies EncryptDevicePage runs off-thread, as plain
+    functions so they can be driven with fake service/udisks objects."""
+
+    class FakeGError(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            self.message = message
+
+    def setUp(self):
+        # The workers catch GLib.Error; under the mocked gi it has to be a
+        # real exception class for the except clause to be legal.
+        patcher = mock.patch.object(gui.GLib, "Error", self.FakeGError)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_unmount_sources_stops_at_the_first_refusal(self):
+        udisks = mock.MagicMock()
+        udisks.unmount.side_effect = [None, gui.Udisks2Error("target is busy")]
+        ok, _out, err = gui.unmount_sources(
+            udisks, ["/dev/sdb1", "/dev/sdb2", "/dev/sdb3"]
+        )
+        self.assertFalse(ok)
+        self.assertEqual(err, "Could not unmount /dev/sdb2: target is busy")
+        self.assertEqual(udisks.unmount.call_count, 2)
+
+    def test_unmount_sources_succeeds_when_every_unmount_does(self):
+        udisks = mock.MagicMock()
+        self.assertEqual(gui.unmount_sources(udisks, ["/dev/sdb1"]), (True, "", ""))
+
+    def _svc(self, open_ok=True, mkfs_ok=True):
+        svc = mock.MagicMock()
+        svc.get_device_info.return_value = {"uuid": "1b6e-2c3d"}
+        svc.open_volume.return_value = (
+            open_ok,
+            "luks-1b6e-2c3d",
+            "" if open_ok else "no vk",
+        )
+        svc.make_filesystem.return_value = (mkfs_ok, "" if mkfs_ok else "mke2fs: boom")
+        return svc
+
+    def test_prepare_new_volume_opens_formats_then_mounts(self):
+        svc = self._svc()
+        udisks = mock.MagicMock()
+        udisks.mount.return_value = "/media/josh/1b6e-2c3d"
+        result = gui.prepare_new_volume(svc, udisks, "/dev/sdb1")
+        self.assertEqual(result, (True, "/media/josh/1b6e-2c3d", ""))
+        # The volume key is cached from the format: no passphrase, the
+        # same OpenVolume arguments the Volume Mapping group would use.
+        svc.open_volume.assert_called_once_with(
+            "/dev/sdb1", "luks-1b6e-2c3d", "", "passphrase", ""
+        )
+        svc.make_filesystem.assert_called_once_with(
+            "/dev/sdb1", "luks-1b6e-2c3d", "ext4"
+        )
+        udisks.mount.assert_called_once_with("/dev/mapper/luks-1b6e-2c3d", "ext4")
+
+    def test_prepare_new_volume_stops_when_the_open_fails(self):
+        svc = self._svc(open_ok=False)
+        udisks = mock.MagicMock()
+        ok, _mp, err = gui.prepare_new_volume(svc, udisks, "/dev/sdb1")
+        self.assertFalse(ok)
+        self.assertEqual(err, "the volume could not be opened: no vk")
+        svc.make_filesystem.assert_not_called()
+        udisks.mount.assert_not_called()
+
+    def test_prepare_new_volume_stops_when_mkfs_fails(self):
+        svc = self._svc(mkfs_ok=False)
+        udisks = mock.MagicMock()
+        ok, _mp, err = gui.prepare_new_volume(svc, udisks, "/dev/sdb1")
+        self.assertFalse(ok)
+        self.assertEqual(err, "the filesystem could not be created: mke2fs: boom")
+        udisks.mount.assert_not_called()
+
+    def test_prepare_new_volume_reports_a_mount_refusal(self):
+        svc = self._svc()
+        udisks = mock.MagicMock()
+        udisks.mount.side_effect = gui.Udisks2Error("udisks2 did not detect ext4")
+        ok, _mp, err = gui.prepare_new_volume(svc, udisks, "/dev/sdb1")
+        self.assertFalse(ok)
+        self.assertEqual(
+            err, "the new filesystem could not be mounted: udisks2 did not detect ext4"
+        )
+
+    def test_prepare_new_volume_reports_a_udisks2_dbus_error_by_message(self):
+        # A polkit refusal from udisks2 arrives as a GLib.Error; its .message
+        # (not the repr) is what the user should read.
+        svc = self._svc()
+        udisks = mock.MagicMock()
+        udisks.mount.side_effect = self.FakeGError(
+            "Not authorized to perform operation"
+        )
+        ok, _mp, err = gui.prepare_new_volume(svc, udisks, "/dev/sdb1")
+        self.assertFalse(ok)
+        self.assertEqual(
+            err,
+            "the new filesystem could not be mounted: "
+            "Not authorized to perform operation",
+        )
+
+
+class TestEncryptDevicePageFlow(unittest.TestCase):
+    """EncryptDevicePage's submit pipeline: mounted check and unmount
+    confirmation up front, then format, then open/mkfs/mount before the
+    shared success hand-off. Source-based, like the other page tests."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        cls.methods = {
+            node.name: {
+                n.name: ast.get_source_segment(source, n)
+                for n in node.body
+                if isinstance(n, ast.FunctionDef)
+            }
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }["EncryptDevicePage"]
+
+    def test_submit_checks_for_mounts_before_encrypting(self):
+        submit = self.methods["_on_submit_clicked"]
+        self.assertIn("device_mounts(read_proc_mounts(), self.device)", submit)
+        self.assertIn("self._confirm_unmount(mounts)", submit)
+        self.assertIn("self._start_encrypt()", submit)
+
+    def test_unmount_confirmation_is_an_explicit_destructive_choice(self):
+        confirm = self.methods["_confirm_unmount"]
+        self.assertIn('add_response("cancel", "Cancel")', confirm)
+        self.assertIn('add_response("unmount", "Unmount and Encrypt")', confirm)
+        self.assertIn("Adw.ResponseAppearance.DESTRUCTIVE", confirm)
+        self.assertIn('set_default_response("cancel")', confirm)
+        self.assertIn('set_close_response("cancel")', confirm)
+
+    def test_only_the_unmount_response_proceeds_and_it_goes_via_udisks2(self):
+        response = self.methods["_on_unmount_response"]
+        self.assertIn('if response != "unmount":', response)
+        self.assertIn("unmount_sources(self._udisks, sources)", response)
+        done = self.methods["_on_unmount_done"]
+        self.assertIn("self._start_encrypt()", done)
+        self.assertIn("self._on_format_failure(stderr)", done)
+
+    def test_format_success_prepares_the_volume_before_the_handoff(self):
+        done = self.methods["_on_format_done"]
+        self.assertIn("prepare_new_volume(self.svc, self._udisks, target)", done)
+        prepared = self.methods["_on_prepare_done"]
+        # Encryption succeeded regardless: always land on the detail page,
+        # and report a failed open/mkfs/mount on top of it, never as a
+        # failed encryption.
+        self.assertIn("self._on_format_success(target)", prepared)
+        self.assertIn('heading="Encrypted, but Not Mounted"', prepared)
+        self.assertNotIn("_on_format_failure", prepared)
+
+    def test_encrypt_dialog_tells_the_user_the_volume_comes_ready_to_use(self):
+        build = self.methods["build_target_groups"]
+        self.assertIn("ext4", build)
+        self.assertIn("mounted", build)
+
+
+class TestMakeFilesystemProxyAndContract(unittest.TestCase):
+    """The new MakeFilesystem method: the proxy wrapper's wire shape, and a
+    tripwire that every method the client calls is declared in the frozen
+    D-Bus contract (dbus/net.contemno.LuksEnroll1.xml)."""
+
+    XML = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "dbus",
+        "net.contemno.LuksEnroll1.xml",
+    )
+
+    def test_make_filesystem_calls_the_path_method_with_three_strings(self):
+        proxy = gui.LuksEnrollProxy.__new__(gui.LuksEnrollProxy)
+        captured = {}
+
+        class FakeResult:
+            def unpack(self):
+                return (True, "")
+
+        class FakeProxy:
+            def call_sync(self, method, params, *args, **kwargs):
+                captured["method"] = method
+                captured["params"] = params
+                return FakeResult()
+
+        proxy.proxy = FakeProxy()
+        with mock.patch.object(
+            gui.GLib, "Variant", side_effect=lambda sig, a: (sig, a)
+        ):
+            self.assertEqual(
+                proxy.make_filesystem("/dev/sdb1", "luks-abc", "ext4"), (True, "")
+            )
+        self.assertEqual(captured["method"], "MakeFilesystem")
+        self.assertEqual(
+            captured["params"], ("(sss)", ("/dev/sdb1", "luks-abc", "ext4"))
+        )
+
+    def test_every_method_the_client_calls_is_in_the_frozen_contract(self):
+        with open(self.XML) as f:
+            declared = set(re.findall(r'<method name="([A-Za-z0-9]+)"', f.read()))
+        with open(GUI_PATH) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=GUI_PATH)
+        proxy_cls = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.ClassDef) and n.name == "LuksEnrollProxy"
+        )
+        # D-Bus method names are the only CamelCase bare string literals in
+        # the proxy class (signatures start with "(", messages have spaces).
+        called = {
+            n.value
+            for n in ast.walk(proxy_cls)
+            if isinstance(n, ast.Constant)
+            and isinstance(n.value, str)
+            and re.fullmatch(r"[A-Z][A-Za-z0-9]+", n.value)
+        }
+        self.assertIn("MakeFilesystem", called)
+        self.assertEqual(called - declared, set(), "client calls undeclared methods")
 
 
 if __name__ == "__main__":

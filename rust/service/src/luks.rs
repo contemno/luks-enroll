@@ -627,6 +627,28 @@ pub fn activate_volume(
     Ok(())
 }
 
+/// The block device under the active dm-crypt mapping `/dev/mapper/<name>`,
+/// as libcryptsetup reads it back from the device-mapper table, never from
+/// anything a caller supplied. `MakeFilesystem` compares it with the device
+/// its authorization was obtained for, so a mapping of some other volume can
+/// never be formatted under that authorization. Fails for an invalid name
+/// or when no such mapping is active.
+pub fn mapping_backing_device(name: &str) -> Result<String> {
+    if !valid_mapper_name(name) {
+        bail!("Invalid mapper name");
+    }
+    if !mapping_is_active(name) {
+        bail!("No active mapping named {name}");
+    }
+    let mut dev = CryptInit::init_by_name_and_header(name, None)
+        .map_err(|e| Error(format!("crypt_init_by_name failed: {e}")))?;
+    let mut status = dev.status_handle();
+    let path = status
+        .get_device_path()
+        .map_err(|e| Error(format!("crypt_get_device_name failed: {e}")))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// Tear down the dm-crypt mapping `/dev/mapper/<name>`. Reconstructs a device
 /// handle from the active mapping by name (no header path needed), so the
 /// caller does not have to re-identify the backing volume. Idempotent: a
