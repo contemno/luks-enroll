@@ -183,12 +183,21 @@ jobs:
       # image, and the CloseVolumeFd loop-backing discovery) are #[ignore]d
       # because they need root for loop devices + device-mapper. Run them
       # here, where sudo is available and the cache is already warm. sudo
-      # resets PATH (secure_path), so the runner's cargo is re-injected; -E
-      # keeps HOME so rustup finds the toolchain.
+      # resets PATH (secure_path) and drops the environment, so the runner's
+      # cargo shim and its rustup/cargo homes are passed explicitly: root's
+      # own $HOME has no toolchain. This used to rely on `sudo -E` keeping
+      # HOME; sudo-rs (the default sudo on Ubuntu 25.10+, so on ubuntu-latest
+      # since the 26.04 image) ignores -E with a warning, and rustup then
+      # failed with "could not choose a version of cargo to run".
+      # CARGO_INCREMENTAL=0 (rust-cache's setting for the job) is passed on
+      # too: otherwise root's build leaves incremental lock files the runner
+      # user cannot read, and the post-job cache save fails with a warning.
       - name: dm-crypt open/close roundtrips (root, loop + device-mapper)
         shell: bash
         run: |
-          sudo -E env "PATH=$PATH" \
+          sudo env "PATH=$PATH" "CARGO_INCREMENTAL=0" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             cargo test -p luks-enroll-service --test luks_image -- --ignored 2>&1 | tee /tmp/swtpm-luks-image.log
 
       # This job runs privileged (root, real TPM2/dm-crypt); a failure is

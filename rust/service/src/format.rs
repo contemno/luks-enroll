@@ -8,10 +8,13 @@
 //! Linux LUKS type GUID.
 
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd};
-use std::path::Path;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -247,10 +250,86 @@ fn wait_for_node(
     Path::new(partition).exists()
 }
 
+/// Why `format_removable_partition` refused or failed. The D-Bus layer
+/// surfaces the one case the user can act on (`InUse`: unmount, then retry)
+/// and keeps everything else the logged, generic "Operation failed" of the
+/// parity contract. `From<String>` lets the stage-wrapping
+/// `map_err(|e| format!(..))?` lines produce `Failed` unchanged.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FormatError {
+    /// Something holds the device (or a partition of it) open exclusively:
+    /// a mounted filesystem, an active dm-crypt mapping, a swap area, ...
+    /// `mounts` lists the `(source, mount_point)` pairs found in
+    /// /proc/mounts; empty when the holder is not a mount.
+    InUse {
+        mounts: Vec<(String, String)>,
+    },
+    Failed(String),
+}
+
+impl From<String> for FormatError {
+    fn from(msg: String) -> Self {
+        FormatError::Failed(msg)
+    }
+}
+
+impl fmt::Display for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FormatError::InUse { mounts } if mounts.is_empty() => f.write_str(
+                "Device is in use (opened exclusively by another program); \
+                 release it before encrypting",
+            ),
+            FormatError::InUse { mounts } => {
+                let listed: Vec<String> = mounts
+                    .iter()
+                    .map(|(src, mp)| format!("{src} is mounted at {mp}"))
+                    .collect();
+                write!(
+                    f,
+                    "Device is in use: {}. Unmount it before encrypting",
+                    listed.join(", ")
+                )
+            }
+            FormatError::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Refuse to touch a device that something else holds open exclusively: the
+/// kernel's own definition of "in use", which covers a mounted filesystem on
+/// the device *or on any of its partitions* (claiming a partition claims the
+/// whole disk too), an active dm-crypt/LVM/RAID member, and a swap area. The
+/// probe is the same `O_EXCL` open that wipefs, mkfs and libcryptsetup use.
+///
+/// It runs before the first destructive write. Without it, the signature
+/// wipe went through (the kernel allows raw writes to a mounted device) and
+/// only the later luksFormat's exclusive open failed, leaving the user with
+/// a wiped-but-unencrypted device and a generic error. Regular files (image
+/// containers) ignore `O_EXCL` without `O_CREAT`, so they pass.
+fn check_not_in_use(device: &str) -> std::result::Result<(), FormatError> {
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_EXCL)
+        .open(device)
+    {
+        Ok(_claim) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+            let mounts = std::fs::read_to_string("/proc/mounts")
+                .map(|table| devices::device_mounts(&table, device))
+                .unwrap_or_default();
+            Err(FormatError::InUse { mounts })
+        }
+        Err(e) => Err(FormatError::Failed(format!("cannot open {device}: {e}"))),
+    }
+}
+
 /// Format a removable device with LUKS2. Whole disks get GPT + one LUKS
 /// partition first; existing partitions are wiped and formatted directly.
-/// Refuses non-removable devices. Returns the LUKS partition path, or an
-/// error message (logged, not sent to clients).
+/// Refuses non-removable devices and devices in use (see `check_not_in_use`).
+/// Returns the LUKS partition path, or a `FormatError` (logged; only the
+/// in-use refusal is relayed to clients).
 ///
 /// An empty passphrase means "no passphrase keyslot": the partition is
 /// formatted with a cached volume key and the first enrollment wraps it, so
@@ -261,7 +340,7 @@ fn wait_for_node(
 pub fn format_removable_partition(
     device: &str,
     passphrase: &str,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<String, FormatError> {
     // Per-stage timing (LUKS_ENROLL_TIMING gated, like luks::Timer's other
     // users): the whole-disk delay (#84) survived three fixes to the
     // partition-node wait before per-stage timing pinned it on the
@@ -269,8 +348,13 @@ pub fn format_removable_partition(
 
     // Safety: refuse non-removable.
     if !devices::is_removable(device) {
-        return Err("Refusing to format non-removable device".to_string());
+        return Err(FormatError::Failed(
+            "Refusing to format non-removable device".to_string(),
+        ));
     }
+
+    // Safety: refuse anything mounted or otherwise held, before the wipe.
+    check_not_in_use(device)?;
 
     if devices::is_partition(device) {
         // Existing partition: wipefs + luksFormat it directly.
@@ -305,9 +389,7 @@ pub fn format_removable_partition(
     {
         let _t = Timer::new("format_removable_partition: partition-node wait");
         if !wait_for_partition_node(device, &partition) {
-            return Err(format!(
-                "Partition {partition} did not appear after formatting"
-            ));
+            return Err(format!("Partition {partition} did not appear after formatting").into());
         }
     }
 
@@ -327,6 +409,104 @@ fn format_luks2(path: &str, passphrase: &str) -> Result<()> {
     } else {
         luks::format_luks2(path, passphrase, luks::KeyslotsArea::Compact).map(|_| ())
     }
+}
+
+/// Create a filesystem on the open dm-crypt mapping `/dev/mapper/<name>` of
+/// `device`, so a freshly encrypted removable volume is usable without a
+/// trip through another tool (`MakeFilesystem`). Policy, all checked before
+/// anything is written:
+///   * `fstype` is `ext4`, the only type offered so far;
+///   * `device` is removable, the only kind `FormatPartition` creates;
+///   * the mapping is a LUKS mapping whose backing device is `device`, as
+///     read back from the device-mapper table, so the authorization the
+///     handler obtained for `device` is the one exercised: a mapping of some
+///     other volume is refused;
+///   * `device` has zero keyslots. That is this codebase's definition of a
+///     freshly (keyless-)formatted volume (#58/#82/#88); an enrolled volume
+///     can carry data, and this is for new volumes only, never a reformat;
+///   * the mapping is not mounted.
+///
+/// `owner` is the caller's (uid, gid): mke2fs creates the root directory
+/// owned by them (`-E root_owner`), so the mounted volume is writable by the
+/// user who asked for it without a chown.
+pub fn make_filesystem(
+    device: &str,
+    name: &str,
+    fstype: &str,
+    owner: Option<(u32, u32)>,
+) -> Result<()> {
+    if fstype != "ext4" {
+        bail!("Unsupported filesystem type {fstype:?}; only ext4 is supported");
+    }
+    if !devices::is_removable(device) {
+        bail!("Refusing to create a filesystem on a non-removable device");
+    }
+    let backing = luks::mapping_backing_device(name)?;
+    if devices::canonicalize_lossy(Path::new(&backing))
+        != devices::canonicalize_lossy(Path::new(device))
+    {
+        bail!("Mapping /dev/mapper/{name} is backed by {backing}, not {device}");
+    }
+    if !luks::list_keyslots(device).is_empty() {
+        bail!(
+            "Refusing to create a filesystem on a volume with enrolled keyslots; \
+             only a freshly encrypted volume qualifies"
+        );
+    }
+    if luks::mapping_is_mounted(name) {
+        bail!("The volume's filesystem is mounted");
+    }
+    mkfs_ext4(&format!("/dev/mapper/{name}"), owner)
+}
+
+/// Run mke2fs on `target`. Kept apart from the policy in `make_filesystem`
+/// so tests can exercise the real mkfs against an image file (no root) and a
+/// loop-backed mapping (root), neither of which is "removable".
+///
+/// `-F` once: a brand-new volume's plaintext is random, and a chance match
+/// against one of blkid's weak two-byte signatures would otherwise stall
+/// mke2fs on a "Proceed anyway?" prompt nobody can answer (stdin is
+/// /dev/null, so it would abort). A single `-F` skips only that
+/// plausibility prompt; mke2fs still refuses a mounted or busy target.
+pub fn mkfs_ext4(target: &str, owner: Option<(u32, u32)>) -> Result<()> {
+    let _t = Timer::new("mkfs_ext4");
+    let mut cmd = Command::new(mkfs_ext4_binary()?);
+    cmd.arg("-q").arg("-F");
+    if let Some((uid, gid)) = owner {
+        cmd.arg("-E").arg(format!("root_owner={uid}:{gid}"));
+    }
+    cmd.arg(target).stdin(Stdio::null());
+    let out = cmd
+        .output()
+        .map_err(|e| Error(format!("could not run mkfs.ext4: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr.trim();
+        bail!(
+            "mkfs.ext4 failed ({}): {}",
+            out.status,
+            if stderr.is_empty() {
+                "no error output"
+            } else {
+                stderr
+            }
+        );
+    }
+    Ok(())
+}
+
+/// e2fsprogs' mkfs.ext4, by `$PATH` (systemd's default service PATH includes
+/// the sbin directories) with the two conventional absolute locations as
+/// fallbacks for a minimal environment.
+fn mkfs_ext4_binary() -> Result<PathBuf> {
+    const FALLBACKS: [&str; 2] = ["/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4"];
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|dir| dir.join("mkfs.ext4"))
+        .chain(FALLBACKS.iter().map(PathBuf::from))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| Error("mkfs.ext4 not found (is e2fsprogs installed?)".into()))
 }
 
 /// Create a sparse image file of `size_mb` MiB (1..=8192) at `path`,
@@ -530,7 +710,103 @@ mod tests {
     #[test]
     fn format_removable_partition_refuses_non_removable() {
         let err = format_removable_partition("/nonexistent/luks-enroll-dev", "pw").unwrap_err();
-        assert_eq!(err, "Refusing to format non-removable device");
+        assert_eq!(
+            err,
+            FormatError::Failed("Refusing to format non-removable device".into())
+        );
+    }
+
+    #[test]
+    fn in_use_check_passes_a_regular_file_and_reports_a_missing_path() {
+        // O_EXCL without O_CREAT is a no-op on regular files, so image
+        // containers (and every existing image-based test) pass the guard.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("img.bin");
+        File::create(&path).unwrap().set_len(1024 * 1024).unwrap();
+        assert_eq!(check_not_in_use(path.to_str().unwrap()), Ok(()));
+
+        let err = check_not_in_use("/nonexistent/luks-enroll-dev").unwrap_err();
+        assert!(matches!(err, FormatError::Failed(ref m) if m.starts_with("cannot open")));
+    }
+
+    #[test]
+    fn in_use_refusal_names_the_mounts_for_the_user() {
+        let with_mounts = FormatError::InUse {
+            mounts: vec![
+                ("/dev/sdb1".into(), "/media/josh/USB STICK".into()),
+                ("/dev/sdb2".into(), "/mnt/data".into()),
+            ],
+        };
+        assert_eq!(
+            with_mounts.to_string(),
+            "Device is in use: /dev/sdb1 is mounted at /media/josh/USB STICK, \
+             /dev/sdb2 is mounted at /mnt/data. Unmount it before encrypting"
+        );
+        let held = FormatError::InUse { mounts: vec![] };
+        assert!(held
+            .to_string()
+            .starts_with("Device is in use (opened exclusively"));
+        // Stage failures convert via From<String> and display verbatim.
+        let failed: FormatError = "wipefs failed: boom".to_string().into();
+        assert_eq!(failed.to_string(), "wipefs failed: boom");
+    }
+
+    #[test]
+    fn make_filesystem_checks_type_then_removability_before_touching_anything() {
+        let err =
+            make_filesystem("/nonexistent/luks-enroll-dev", "luks-x", "btrfs", None).unwrap_err();
+        assert_eq!(
+            err.0,
+            "Unsupported filesystem type \"btrfs\"; only ext4 is supported"
+        );
+        let err =
+            make_filesystem("/nonexistent/luks-enroll-dev", "luks-x", "ext4", None).unwrap_err();
+        assert_eq!(
+            err.0,
+            "Refusing to create a filesystem on a non-removable device"
+        );
+    }
+
+    #[test]
+    fn mkfs_ext4_formats_an_image_and_sets_the_root_owner() {
+        // The real mke2fs against a regular file (no root needed): pins the
+        // command line, -F for the non-block-device plausibility prompt, and
+        // root_owner. The root-only roundtrip in tests/luks_image.rs covers
+        // the same call on a live dm-crypt mapping, mounted.
+        if mkfs_ext4_binary().is_err() {
+            eprintln!("mkfs.ext4 not installed; skipping mkfs coverage");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fs.img").to_string_lossy().into_owned();
+        File::create(&path)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+
+        mkfs_ext4(&path, Some((1234, 5678))).unwrap();
+
+        assert_eq!(devices::blkid_tag(&path, "TYPE").as_deref(), Some("ext4"));
+        // debugfs (also e2fsprogs) reads the root inode's owner back.
+        let out = Command::new("debugfs")
+            .args(["-R", "stat /", &path])
+            .stderr(Stdio::null())
+            .output();
+        let Ok(out) = out else {
+            eprintln!("debugfs not installed; skipping root_owner check");
+            return;
+        };
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let after = |key: &str| -> Option<String> {
+            let tokens: Vec<&str> = stat.split_whitespace().collect();
+            tokens
+                .iter()
+                .position(|t| *t == key)
+                .and_then(|i| tokens.get(i + 1))
+                .map(|t| t.to_string())
+        };
+        assert_eq!(after("User:").as_deref(), Some("1234"), "{stat}");
+        assert_eq!(after("Group:").as_deref(), Some("5678"), "{stat}");
     }
 
     // `format_removable_partition` itself can't be exercised end-to-end here

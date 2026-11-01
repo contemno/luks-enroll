@@ -10,9 +10,9 @@ Designed to run on first login, from a normal desktop session, or inside an inst
 
 - **FIDO2 enrollment** with PIN, multiple tokens per device, hotplug detection
 - **TPM2 enrollment** with optional PIN and configurable PCR selection
-- **Recovery keys** — generate one or more high-entropy passphrases per device
+- **Recovery keys** — generate one or more high-entropy passphrases per device; each is shown once, with a copy-to-clipboard button
 - **Passphrase management** — add, remove, change keyslots
-- **Encrypted USB formatting** — GPT + LUKS2 in a single workflow
+- **Encrypted USB formatting** — GPT + LUKS2, then an ext4 filesystem created inside, opened and mounted, so the drive is ready to use; a drive that is still mounted is offered an unmount first instead of a bare error
 - **Encrypted image files** — create and enroll loop-mounted LUKS containers
 - **Auto-detection** of all LUKS devices, FIDO2 tokens, and TPM2 chips
 - **Per-enrollment wipe controls** with auth-keyslot protection so you can never lock yourself out
@@ -44,6 +44,7 @@ The application is split between an unprivileged GTK client (Python) and a privi
 - **Polkit actions:** `net.contemno.luks-enroll.read` (auth-cached for inspection), `net.contemno.luks-enroll.manage` (required for any destructive change).
 - **systemd hardening:** the service unit runs with `ProtectSystem=strict`, `ProtectHome=read-only`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies=AF_UNIX`, a minimal capability bounding set, and explicit `DeviceAllow` rules for block, hidraw, tpm, and tpmrm device classes.
 - **File-descriptor passing:** operations on encrypted *file* containers under `$HOME` use the `*Fd` D-Bus methods — the unprivileged client opens the container it owns and passes the descriptor over the bus, so the header write goes through the user's writable mount while the service keeps `ProtectHome=read-only`. Block devices keep the path-based methods (the client cannot open a `/dev` descriptor).
+- **Mount side via udisks2:** unmounting a drive before it is encrypted and mounting the new filesystem afterwards are done by the client through udisks2 (`Filesystem.Unmount` / `Filesystem.Mount`), not by the service. The service's `ProtectSystem`/`ProtectHome` sandbox gives it a private mount namespace with slave propagation, so a mount or unmount it performed would never reach the user's session. The service's share of that flow is `MakeFilesystem` (runs `mkfs.ext4` on the freshly encrypted volume's mapping, root directory owned by the caller; refused for any volume that already has enrolled keyslots) and `FormatPartition`'s refusal, before any destructive write, of a device that something holds open (a mounted filesystem on it or on a partition of it), reported with the mount points so the client can offer the unmount.
 
 ## Initramfs unlock
 
@@ -153,11 +154,13 @@ scripts/                           Developer tooling (git hooks, changelog + nex
 - `libfido2-1` (FIDO2)
 - `libtss2-esys`, `libtss2-mu` (TPM2)
 - polkit (`polkitd` or `policykit-1`)
+- `e2fsprogs` (`mkfs.ext4` for freshly encrypted removable volumes)
 
 **Runtime (optional):**
 
 - `tpm2-tools` (recommended)
 - `dracut` (suggested — for initramfs unlock)
+- udisks2 (part of any udisks2-based desktop session) — mounting a freshly encrypted drive, unmounting one before encryption, and the removable-volume unlock takeover; without it those steps report what did not happen and the volume is still usable through Disks or `udisksctl`
 
 **Build (from source):**
 

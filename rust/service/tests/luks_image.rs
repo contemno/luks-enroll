@@ -547,6 +547,77 @@ fn open_close_volume_roundtrip() {
     );
 }
 
+/// MakeFilesystem's worker (`format::mkfs_ext4`) against a real dm-crypt
+/// mapping over a keyless image, the shape of a freshly encrypted removable
+/// volume: the filesystem must exist on the mapping, mount, and have its
+/// root directory owned by the requesting user (mke2fs root_owner). Also
+/// pins what the policy layer sees: the mapping reports its loop backing,
+/// and `make_filesystem` refuses the image because it is not removable.
+/// Requires root (loop-device + dm-crypt + mount); `#[ignore]`d like
+/// `open_close_volume_roundtrip` and run by the CI `swtpm` job as root.
+#[test]
+#[ignore = "requires root: loop-device + dm-crypt activation + mount"]
+fn mkfs_ext4_on_a_fresh_mapping_mounts_with_the_caller_as_root_owner() {
+    if !nix::unistd::Uid::effective().is_root() {
+        eprintln!("not root; skipping mkfs roundtrip");
+        return;
+    }
+    use luks_enroll_service::{devices, format};
+    use nix::mount::{mount, umount, MsFlags};
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tmpdir();
+    let path = dir.path().join("fresh.img").to_string_lossy().into_owned();
+    luks::clear_volume_key_cache(&path);
+    // Keyless, like FormatPartition's output: zero keyslots, cached VK.
+    let (ok, keyslot, err) = service::op_create_encrypted_image(&path, 64, "", None);
+    assert!(ok, "keyless create failed: {err}");
+    assert_eq!(keyslot, -1);
+
+    let name = format!("luks-enroll-test-mkfs-{}", std::process::id());
+    let mapper = format!("/dev/mapper/{name}");
+    let (ok, _, err) = service::op_open_volume(&path, &name, "", "passphrase", "");
+    assert!(ok, "open from the cached volume key failed: {err}");
+
+    // The policy layer compares this against the authorized device; for an
+    // image it is libcryptsetup's loop device, so the image path never
+    // matches and the removable gate refuses first anyway.
+    let backing = luks::mapping_backing_device(&name).expect("backing device");
+    assert!(backing.starts_with("/dev/loop"), "backing = {backing}");
+    let err = format::make_filesystem(&path, &name, "ext4", Some((1000, 1000))).unwrap_err();
+    assert!(err.0.contains("non-removable"), "{}", err.0);
+    assert_eq!(
+        devices::blkid_tag(&mapper, "TYPE"),
+        None,
+        "a fresh mapping carries no filesystem"
+    );
+
+    format::mkfs_ext4(&mapper, Some((1000, 1000))).expect("mkfs.ext4 on the mapping");
+    assert_eq!(devices::blkid_tag(&mapper, "TYPE").as_deref(), Some("ext4"));
+
+    // Mount it: the root directory belongs to the caller, so the user can
+    // write to the volume without a chown. While mounted, the mapping is
+    // reported as such (which is what MakeFilesystem's mounted guard and
+    // CloseVolume's refusal key off).
+    let mnt = tempfile::tempdir().unwrap();
+    mount(
+        Some(mapper.as_str()),
+        mnt.path(),
+        Some("ext4"),
+        MsFlags::empty(),
+        None::<&str>,
+    )
+    .expect("mount ext4");
+    let root = std::fs::metadata(mnt.path()).map(|md| (md.uid(), md.gid()));
+    let mounted = luks::mapping_is_mounted(&name);
+    umount(mnt.path()).expect("umount");
+    assert_eq!(root.unwrap(), (1000, 1000), "root_owner must be the caller");
+    assert!(mounted, "a mounted mapping must be seen as mounted");
+
+    let (ok, err) = service::op_close_volume(&name);
+    assert!(ok, "close failed: {err}");
+}
+
 /// The fd-only close path must select exactly the LUKS dm-crypt mappings
 /// whose loop device is backed by the target file: a different device or
 /// inode is excluded, a foreign dm holder (LVM) or a non-LUKS cryptsetup

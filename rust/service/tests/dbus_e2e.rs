@@ -174,6 +174,49 @@ async fn e2e_over_private_bus() {
         .await
         .expect("DetectDevices must succeed via the cached read auth");
 
+    // --- MakeFilesystem on the owned file: the policy order is pinned at
+    //     the bus level (filesystem type first, then the removable gate) in
+    //     the (ok, stderr) shape the client reads, with the refusal relayed
+    //     verbatim rather than as a generic failure. ---
+    let (ok, err): (bool, String) = proxy
+        .call(
+            "MakeFilesystem",
+            &(img.as_str(), "luks-enroll-e2e", "btrfs"),
+        )
+        .await
+        .expect("MakeFilesystem btrfs");
+    assert!(!ok);
+    assert!(err.contains("only ext4 is supported"), "{err}");
+    let (ok, err): (bool, String) = proxy
+        .call("MakeFilesystem", &(img.as_str(), "luks-enroll-e2e", "ext4"))
+        .await
+        .expect("MakeFilesystem ext4");
+    assert!(!ok);
+    assert!(err.contains("non-removable"), "{err}");
+
+    // --- Contract tripwire: the served interface and the frozen
+    //     dbus/net.contemno.LuksEnroll1.xml declare the same methods, so a
+    //     method added on one side only fails here instead of at runtime. ---
+    let introspectable = zbus::fdo::IntrospectableProxy::builder(&conn)
+        .destination(BUS_NAME)
+        .expect("destination")
+        .path(OBJECT_PATH)
+        .expect("path")
+        .build()
+        .await
+        .expect("introspectable proxy");
+    let served = introspectable.introspect().await.expect("Introspect");
+    let contract = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../dbus/net.contemno.LuksEnroll1.xml"
+    ))
+    .expect("read the D-Bus contract");
+    assert_eq!(
+        interface_methods(&served, INTERFACE),
+        interface_methods(&contract, INTERFACE),
+        "served methods differ from dbus/net.contemno.LuksEnroll1.xml"
+    );
+
     // --- A fresh connection is a new sender with no cached auth, and
     //     there is no polkitd on this bus: it must fail with the exact
     //     polkit error name. ---
@@ -187,6 +230,25 @@ async fn e2e_over_private_bus() {
         error_name(&err),
         Some("org.freedesktop.PolicyKit1.Error.NotAuthorized")
     );
+}
+
+/// Method names declared inside `<interface name="{interface}">` of a D-Bus
+/// introspection document, so the contract tripwire ignores the standard
+/// interfaces (Peer, Properties, Introspectable) zbus serves alongside ours.
+fn interface_methods(xml: &str, interface: &str) -> std::collections::BTreeSet<String> {
+    let open = format!("<interface name=\"{interface}\"");
+    let start = xml
+        .find(&open)
+        .unwrap_or_else(|| panic!("no {open}> in document"));
+    let body = &xml[start..];
+    let end = body.find("</interface>").expect("unterminated <interface>");
+    let body = &body[..end];
+    body.match_indices("<method name=\"")
+        .map(|(i, tag)| {
+            let rest = &body[i + tag.len()..];
+            rest[..rest.find('"').expect("unterminated method name")].to_string()
+        })
+        .collect()
 }
 
 fn error_name(e: &zbus::Error) -> Option<&str> {

@@ -123,11 +123,36 @@
       <arg direction="in" type="s" name="device"/>
       <arg direction="out" type="s" name="info_json"/>
     </method>
+    <!-- Refuses, before any destructive write, a device that something
+         holds open exclusively (a mounted filesystem on it or on any of its
+         partitions, an active mapping, ...): `ok` false with a `stderr` that
+         names the mounts, so the client can offer to unmount and retry. Any
+         other failure is the generic "Operation failed". -->
     <method name="FormatPartition">
       <arg direction="in" type="s" name="device"/>
       <arg direction="in" type="s" name="passphrase"/>
       <arg direction="out" type="b" name="ok"/>
       <arg direction="out" type="s" name="partition"/>
+      <arg direction="out" type="s" name="stderr"/>
+    </method>
+    <!--
+      Create a filesystem on the open dm-crypt mapping /dev/mapper/<name> of
+      `device`, so a freshly encrypted removable volume is usable without a
+      trip through another tool (the client then mounts it via udisks2; the
+      sandboxed service cannot mount for the session). `fstype` is "ext4"
+      (the only type accepted so far). Refused unless `device` is removable,
+      the mapping is a LUKS mapping backed by `device` (the authorization
+      obtained for `device` is the one exercised), `device` has no enrolled
+      keyslots yet (this is for new volumes only, never a reformat), and the
+      mapping is not mounted. The filesystem's root directory is owned by the
+      caller (mke2fs root_owner), so the mounted volume is writable without
+      a chown. On failure `stderr` carries the refusal or mke2fs's output.
+    -->
+    <method name="MakeFilesystem">
+      <arg direction="in" type="s" name="device"/>
+      <arg direction="in" type="s" name="name"/>
+      <arg direction="in" type="s" name="fstype"/>
+      <arg direction="out" type="b" name="ok"/>
       <arg direction="out" type="s" name="stderr"/>
     </method>
     <method name="EnrollPassphrase">
